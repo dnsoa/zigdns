@@ -2,119 +2,121 @@ const std = @import("std");
 const dns = @import("dns");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
     std.debug.print("=== DNS Response Construction ===\n\n", .{});
 
-    // Create a DNS response packet
-    var packet = dns.Packet.init(allocator);
-    defer packet.deinit();
+    // 创建 DNS 响应报文
+    var buffer: [512]u8 = undefined;
+    var builder = dns.Message.Builder.init(&buffer);
 
-    // Setup header as a response
-    packet.header.id = 1234;
-    packet.header.flags = dns.Flags{
-        .qr = true, // This is a response
-        .rd = true, // Recursion desired (copied from query)
-        .ra = true, // Recursion available
-        .aa = true, // Authoritative answer
+    // 添加问题 (模拟查询)
+    try builder.addQuestion("example.com", .A, 1);
+    std.debug.print("Added question: example.com IN A\n", .{});
+
+    // 添加 A 记录回答
+    try builder.addARecord("example.com", 3600, [_]u8{ 93, 184, 216, 34 });
+    std.debug.print("Added A record answer: 93.184.216.34\n", .{});
+
+    // 添加 AAAA 记录回答
+    try builder.addAAAARecord("example.com", 3600, [_]u8{
+        0x20, 0x01, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    });
+    std.debug.print("Added AAAA record answer: 2001:408::\n", .{});
+
+    // 添加 TXT 记录
+    try builder.addTXTRecord("example.com", 3600, "v=spf1 -all");
+    std.debug.print("Added TXT record: SPF record\n", .{});
+
+    // 构造响应头部
+    const header = dns.Header{
+        .id = 1234,
+        .rd = 1, // 递归期望 (从查询复制)
+        .tc = 0,
+        .aa = 1, // 权威回答
+        .opcode = 0,
+        .qr = 1, // 响应
+        .rcode = 0,
+        .z = 0,
+        .ra = 1, // 递归可用
+        .qdcount = 1, // 1 个问题
+        .ancount = 3, // 3 个回答
+        .nscount = 0,
+        .arcount = 0,
     };
 
-    // Add the question (mirroring what was asked)
-    try packet.addQuestion(.{
-        .name = "example.com",
-        .type = .A,
-        .class = .IN,
-    });
+    const packet = builder.finish(header);
 
-    // Add A record answer
-    try packet.addAnswer(.{
-        .A = .{
-            .name = "example.com",
-            .address = [_]u8{ 93, 184, 216, 34 }, // 93.184.216.34
-            .ttl = 3600,
-        },
-    });
+    // 打印报文内容
+    std.debug.print("\n=== Constructed DNS Response ===\n", .{});
+    std.debug.print("  ID: {d}\n", .{header.id});
+    std.debug.print("  QR: {d} (1=Response)\n", .{header.qr});
+    std.debug.print("  Opcode: {d}\n", .{header.opcode});
+    std.debug.print("  AA: {d} (Authoritative)\n", .{header.aa});
+    std.debug.print("  RD: {d} (Recursion Desired)\n", .{header.rd});
+    std.debug.print("  RA: {d} (Recursion Available)\n", .{header.ra});
+    std.debug.print("  RCODE: {d}\n", .{header.rcode});
+    std.debug.print("  QDCOUNT: {d}\n", .{header.qdcount});
+    std.debug.print("  ANCOUNT: {d}\n", .{header.ancount});
 
-    // Add AAAA record answer
-    try packet.addAnswer(.{
-        .AAAA = .{
-            .name = "example.com",
-            .address = [_]u8{ 0x20, 0x01, 0x4, 0x08, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 },
-            .ttl = 3600,
-        },
-    });
+    // 输出十六进制转储
+    std.debug.print("\nHex dump:\n", .{});
+    for (packet, 0..) |byte, i| {
+        if (i % 16 == 0) std.debug.print("\n{X:0>4}: ", .{i});
+        std.debug.print("{X:0>2} ", .{byte});
+    }
+    std.debug.print("\n\n", .{});
 
-    // Add a TXT record
-    try packet.addAnswer(.{
-        .TXT = .{
-            .name = "example.com",
-            .text = "v=spf1 -all",
-            .ttl = 3600,
-        },
-    });
+    // 解析验证
+    std.debug.print("=== Parsing Response ===\n", .{});
 
-    // Encode the packet
-    var buffer: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    try packet.encode(fbs.writer());
-    const encoded_len = fbs.pos;
+    _ = try dns.Message.parse(packet);
+    std.debug.print("Parsed header successfully\n", .{});
 
-    // Print the packet contents
-    std.debug.print("Constructed DNS Response:\n", .{});
-    std.debug.print("  ID: {d}\n", .{packet.header.id});
-    std.debug.print("  Flags: 0x{X:0>4} ", .{packet.header.flags.encodeToInt()});
-    std.debug.print("(QR={d}, AA={d}, RD={d}, RA={d})\n", .{
-        @intFromBool(packet.header.flags.qr),
-        @intFromBool(packet.header.flags.aa),
-        @intFromBool(packet.header.flags.rd),
-        @intFromBool(packet.header.flags.ra),
-    });
-    std.debug.print("  Questions: {d}\n", .{packet.header.qd});
-    std.debug.print("  Answers: {d}\n", .{packet.header.an});
+    var parser = dns.MessageParser.init(packet);
 
-    // Display each question
-    for (packet.questions.items, 0..) |question, i| {
-        const qname = try question.name.toOwnedSlice(allocator);
-        defer allocator.free(qname);
-        std.debug.print("  Question {d}: {s} {any} {any}\n", .{ i + 1, qname, question.type, question.class });
+    // 读取问题
+    if (try parser.nextQuestion()) |q| {
+        std.debug.print("  Question: Type={d}, Class={d}\n", .{
+            @intFromEnum(q.qtype),
+            q.qclass,
+        });
     }
 
-    // Display each answer
-    for (packet.answers.items, 0..) |answer, i| {
-        const aname = try answer.name.toOwnedSlice(allocator);
-        defer allocator.free(aname);
+    // 读取回答
+    var i: u32 = 1;
+    while (try parser.nextRR()) |rr| {
+        std.debug.print("  Answer {d}: ", .{i});
 
-        std.debug.print("  Answer {d}: {s} {any} TTL={d}\n", .{ i + 1, aname, answer.type, answer.ttl });
+        // 使用 RData.parse 解析 RDATA 字节
+        const rdata = dns.ResourceData.parse(rr.rtype, rr.rdata) catch |err| {
+            std.debug.print("(parse error: {}) Type={d}\n", .{ err, @intFromEnum(rr.rtype) });
+            i += 1;
+            continue;
+        };
 
-        switch (answer.rdata) {
+        switch (rdata) {
             .A => |ip| {
-                std.debug.print("    Address: {d}.{d}.{d}.{d}\n", .{ ip[0], ip[1], ip[2], ip[3] });
+                std.debug.print("A {d}.{d}.{d}.{d} TTL={d}\n", .{
+                    ip[0], ip[1], ip[2], ip[3], rr.ttl,
+                });
             },
             .AAAA => |ip| {
-                std.debug.print("    IPv6: ", .{});
-                for (0..8) |j| {
-                    const word: u16 = @as(u16, ip[j * 2]) << 8 | ip[j * 2 + 1];
-                    std.debug.print("{x}", .{word});
-                    if (j < 7) std.debug.print(":", .{});
+                std.debug.print("AAAA ", .{});
+                for (ip, 0..) |b, j| {
+                    if (j > 0 and j % 2 == 0) std.debug.print(":", .{});
+                    std.debug.print("{X:0>2}", .{b});
                 }
-                std.debug.print("\n", .{});
+                std.debug.print(" TTL={d}\n", .{rr.ttl});
             },
             .TXT => |txt| {
-                std.debug.print("    Text: \"{s}\"\n", .{txt.data});
-            },
-            .CNAME => |cname| {
-                const cn = try cname.toOwnedSlice(allocator);
-                defer allocator.free(cn);
-                std.debug.print("    Canonical Name: {s}\n", .{cn});
+                std.debug.print("TXT \"{s}\" TTL={d}\n", .{ txt, rr.ttl });
             },
             else => {
-                std.debug.print("    <Other record type>\n", .{});
+                std.debug.print("Type={d}\n", .{@intFromEnum(rr.rtype)});
             },
         }
+        i += 1;
     }
 
-    // Packet size
-    std.debug.print("\nEncoded packet size: {d} bytes\n", .{encoded_len});
+    std.debug.print("\nTotal encoded packet size: {d} bytes\n", .{packet.len});
 }

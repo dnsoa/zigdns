@@ -1,9 +1,14 @@
-pub const ParseError = error{
-    InvalidHeaderLength,
-    InvalidLabelLength,
-    InvalidTotalLength,
-    EndOfStream,
-    CompressionLoopDetected,
-    PointerLimitReached,
-    PointerOutOfBounds,
+/// DNS 解析和编码错误
+pub const Error = error{
+    PacketTooShort,
+    MalformedName,
+    LabelTooLong,
+    NameTooLong,
+    InvalidRData,
+    InvalidType,
+    InvalidClass,
+    BufferTooSmall,
+    UnknownType,
+    UnknownClass,
+    InvalidOffset,
 };

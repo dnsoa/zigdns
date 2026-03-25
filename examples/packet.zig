@@ -1,56 +1,63 @@
 const std = @import("std");
+const mem = std.mem;
 const dns = @import("dns");
+const Message = dns.Message;
+const Builder = Message.Builder;
+const Type = dns.Type;
 
 pub fn main() !void {
-    // Create a simple DNS query packet
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Create a new DNS packet
-    var packet = dns.Packet.init(allocator);
-    defer packet.deinit();
-
-    // Set up header with query parameters
-    packet.header.id = 1234;
-    packet.header.flags = dns.Flags{ .rd = true }; // Recursion desired
-
-    // Add a question for example.com
-    try packet.addQuestion(.{
-        .name = "example.com",
-        .type = .A,
-        .class = .IN,
-    });
-
-    // Encode the packet into a binary buffer
+    // 创建 DNS 查询报文
     var buffer: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buffer);
-    const writer = fbs.writer();
-    try packet.encode(writer);
-    const encoded_len = fbs.pos;
+    var builder = Builder.init(&buffer);
 
-    // Output the encoded packet (hexdump)
-    std.debug.print("Encoded packet ({d} bytes):\n", .{encoded_len});
-    for (buffer[0..encoded_len], 0..) |byte, i| {
+    // 添加问题: example.com A 记录
+    try builder.addQuestion("example.com", .A, 1);
+
+    // 构造头部
+    const header = dns.Header{
+        .id = 1234,
+        .rd = 1, // 期望递归
+        .tc = 0,
+        .aa = 0,
+        .opcode = 0,
+        .qr = 0, // 查询
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 1,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
+    };
+
+    const packet = builder.finish(header);
+
+    // 输出编码后的报文 (hexdump)
+    std.debug.print("Encoded packet ({d} bytes):\n", .{packet.len});
+    for (packet, 0..) |byte, i| {
         if (i % 16 == 0) std.debug.print("\n{X:0>4}: ", .{i});
         std.debug.print("{X:0>2} ", .{byte});
     }
     std.debug.print("\n\n", .{});
 
-    // Now decode the packet from the buffer
-    var reader = dns.PacketReader.init(buffer[0..encoded_len]);
+    // 解析报文
+    const parsed = try Message.parse(packet);
 
-    var decoded = try dns.Packet.decode(allocator, &reader);
-    defer decoded.deinit();
-
-    // Print the decoded packet information
-    const first_question = decoded.questions.items[0];
-    const name = try first_question.name.toOwnedSlice(allocator);
-    defer allocator.free(name);
-
+    // 打印解析后的信息
     std.debug.print("Decoded Packet:\n", .{});
-    std.debug.print("  ID: {d}\n", .{decoded.header.id});
-    std.debug.print("  Flags: {b:0>16}\n", .{decoded.header.flags.encodeToInt()});
-    std.debug.print("  Questions: {d}\n", .{decoded.header.qd});
-    std.debug.print("  First question: {d} {any} {any}\n", .{ name, first_question.type, first_question.class });
+    std.debug.print("  ID: {d}\n", .{parsed.header.id});
+    std.debug.print("  QR: {d} (0=Query, 1=Response)\n", .{parsed.header.qr});
+    std.debug.print("  Opcode: {d}\n", .{parsed.header.opcode});
+    std.debug.print("  RD: {d} (Recursion Desired)\n", .{parsed.header.rd});
+    std.debug.print("  QDCOUNT: {d}\n", .{parsed.header.qdcount});
+    std.debug.print("  ANCOUNT: {d}\n", .{parsed.header.ancount});
+
+    // 使用解析器读取问题
+    var parser = dns.MessageParser.init(packet);
+    if (try parser.nextQuestion()) |q| {
+        std.debug.print("\n  Question:\n", .{});
+        std.debug.print("    Name end position: {d}\n", .{q.qname_end_pos});
+        std.debug.print("    Type: {d}\n", .{@intFromEnum(q.qtype)});
+        std.debug.print("    Class: {d}\n", .{q.qclass});
+    }
 }

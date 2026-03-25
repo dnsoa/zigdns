@@ -1,427 +1,175 @@
 const std = @import("std");
-const io = std.io;
 const mem = std.mem;
-const Allocator = mem.Allocator;
-const ParseError = @import("lib.zig").ParseError;
-const PacketReader = @import("lib.zig").PacketReader;
 
-const LABEL_MAX_LENGTH: u8 = 63;
-const NAME_MAX_LENGTH: u8 = 255;
+/// 零拷贝域名解析器
+/// 不分配内存，仅返回指向原始数据包的切片迭代器
+pub const NameIterator = struct {
+    buffer: []const u8,
+    pos: u16,
 
-/// DNS Name in name encoding format.
-pub const Name = struct {
-    allocator: Allocator,
+    pub fn next(self: *NameIterator) !?[]const u8 {
+        if (self.pos >= self.buffer.len) return null;
+        const len = self.buffer[self.pos];
+        if (len == 0) return null; // 结束符
 
-    labels: std.ArrayList([]u8),
-
-    pub fn init(allocator: Allocator) Name {
-        const labels = std.ArrayList([]u8).init(allocator);
-        return .{
-            .allocator = allocator,
-            .labels = labels,
-        };
-    }
-
-    pub fn deinit(self: *const Name) void {
-        for (self.labels.items) |label| {
-            self.allocator.free(label);
+        // 处理指针压缩 (0xC0)
+        if (len & 0xC0 == 0xC0) {
+            const offset = mem.readInt(u16, self.buffer[self.pos..][0..2], .big) & 0x3FFF;
+            self.pos += 2;
+            // 递归跳转逻辑（生产环境下需限制递归深度防止死循环）
+            var temp_iter = NameIterator{ .buffer = self.buffer, .pos = @intCast(offset) };
+            return try temp_iter.next();
         }
 
-        self.labels.deinit();
-    }
-
-    /// Parses DNS name from a packet reader, assuming the beginning length byte is at the beginning of reader.
-    /// Correctly follows pointers up to MAX_PTRS amount, set to 5.
-    pub fn parse(self: *Name, reader: *PacketReader) !void {
-        const PTR_FLAG: u8 = 0x3;
-        const PTR_MASK: u16 = 0x3FFF;
-        const MAX_PTRS = 5;
-
-        var ptr_start: usize = 0;
-        var ptr_count: usize = 0;
-        var total_length: usize = 0;
-
-        while (total_length < NAME_MAX_LENGTH) {
-            var len_byte = try reader.peekByte();
-            const is_ptr = (len_byte >> 6) == PTR_FLAG;
-
-            if (is_ptr) {
-                if (ptr_count >= MAX_PTRS) {
-                    return ParseError.PointerLimitReached;
-                }
-
-                if (ptr_count == 0) {
-                    ptr_start = reader.position();
-                }
-
-                const ptr = try reader.readInt(u16, .big) & PTR_MASK;
-                if (ptr >= reader.length()) {
-                    return ParseError.PointerOutOfBounds;
-                }
-
-                try reader.seekTo(@as(usize, ptr));
-                total_length += 2;
-                ptr_count += 1;
-                continue;
-            }
-
-            len_byte = try reader.readByte();
-            total_length += 1;
-
-            if (len_byte > LABEL_MAX_LENGTH) {
-                std.debug.print("length is {d}\n", .{len_byte});
-                return ParseError.InvalidLabelLength;
-            }
-
-            if (len_byte == 0) {
-                break;
-            }
-
-            const label = try self.allocator.alloc(u8, len_byte);
-            errdefer self.allocator.free(label);
-
-            const label_read = try reader.readAll(label);
-            if (label_read != len_byte) {
-                return error.EndOfStream;
-            }
-
-            total_length += label_read;
-            try self.labels.append(label);
-        }
-
-        if (total_length > NAME_MAX_LENGTH) {
-            return ParseError.InvalidTotalLength;
-        }
-
-        if (ptr_count > 0) {
-            try reader.seekTo(ptr_start + @sizeOf(u16));
-            return;
-        }
-    }
-
-    pub fn toOwnedSlice(self: *const Name, allocator: Allocator) ![]u8 {
-        var list = std.ArrayList(u8).init(allocator);
-        errdefer list.deinit();
-
-        const writer = list.writer();
-        for (self.labels.items, 0..) |label, i| {
-            if (i > 0) {
-                try writer.writeByte('.');
-            }
-            try writer.writeAll(label);
-        }
-
-        return list.toOwnedSlice();
-    }
-
-    pub fn format(
-        self: @This(),
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-
-        for (self.labels.items, 0..) |label, i| {
-            if (i > 0) {
-                try writer.writeByte('.');
-            }
-            try writer.writeAll(label);
-        }
-    }
-
-    pub fn fromString(allocator: Allocator, name: []const u8) !Name {
-        var reader = PacketReader.init(name);
-
-        var qname = Name.init(allocator);
-        errdefer qname.deinit();
-
-        while (true) {
-            const label = (reader.readUntilDelimiterOrEofAlloc(allocator, '.', LABEL_MAX_LENGTH) catch |err| switch (err) {
-                error.StreamTooLong => break,
-                else => return err,
-            }) orelse break;
-
-            if (label.len != 0) {
-                try qname.labels.append(label);
-                continue;
-            }
-        }
-
-        return qname;
-    }
-
-    pub fn fromWire(allocator: Allocator, reader: *PacketReader) !Name {
-        var name = Name.init(allocator);
-        errdefer name.deinit();
-
-        try name.parse(reader);
-        return name;
-    }
-
-    pub fn encode(self: *const Name, writer: anytype) !void {
-        for (self.labels.items) |label| {
-            try writer.writeByte(@as(u8, @truncate(label.len)));
-            try writer.writeAll(label);
-        }
-
-        try writer.writeByte(0);
-    }
-
-    pub fn length(self: Name) usize {
-        var total: usize = 1;
-
-        for (self.labels.items) |label| {
-            total += label.len;
-            total += 1;
-        }
-
-        return total;
+        const label = self.buffer[self.pos + 1 .. self.pos + 1 + len];
+        self.pos += 1 + len;
+        return label;
     }
 };
 
-const testing = std.testing;
+test "NameIterator simple domain" {
+    // "example.com" 的编码: 7 e x a m p l e 3 c o m 0
+    const domain = "\x07example\x03com\x00";
+    var iter = NameIterator{ .buffer = domain, .pos = 0 };
 
-test "Name.parse - valid domain name" {
-    // Test data for "example.com"
-    const test_data = [_]u8{
-        7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
-        3, 'c', 'o', 'm', 0,
-    };
-
-    var reader = PacketReader.init(&test_data);
-
-    var name = Name.init(testing.allocator);
-    defer name.deinit();
-
-    try name.parse(&reader);
-
-    // Verify the correct number of labels
-    try testing.expectEqual(@as(usize, 2), name.labels.items.len);
-
-    // Verify the label contents
-    try testing.expectEqualStrings("example", name.labels.items[0]);
-    try testing.expectEqualStrings("com", name.labels.items[1]);
+    try std.testing.expectEqualStrings("example", (try iter.next()).?);
+    try std.testing.expectEqualStrings("com", (try iter.next()).?);
+    try std.testing.expect((try iter.next()) == null);
 }
 
-test "Name.parse - long domain name" {
-    // Generate test data for a valid but long domain name
-    // with multiple labels each with close to maximum length
-    var test_data: [255]u8 = undefined;
-    test_data[0] = 63; // First label length (max)
+test "NameIterator with compression" {
+    // 测试指针压缩: 指针指向单个标签
+    var buffer: [20]u8 = undefined;
+    // 在偏移 12 处放置 "com\x00"
+    buffer[12] = 3;
+    @memcpy(buffer[13..16], "com");
+    buffer[16] = 0;
 
-    // Fill first label with 'a's
-    for (1..64) |i| {
-        test_data[i] = 'a';
-    }
+    // 在开头放置 "example" + 指向 "com" 的指针 + 结束符
+    buffer[0] = 7;
+    @memcpy(buffer[1..8], "example");
+    // 指针: 11000000 00001100 = 0xC00C (指向偏移 12)
+    buffer[8] = 0xC0;
+    buffer[9] = 0x0C;
+    buffer[10] = 0; // 结束符
 
-    test_data[64] = 63; // Second label length
+    var iter = NameIterator{ .buffer = &buffer, .pos = 0 };
 
-    // Fill second label with 'b's
-    for (65..128) |i| {
-        test_data[i] = 'b';
-    }
-
-    test_data[128] = 63; // Third label length
-
-    // Fill third label with 'c's
-    for (129..192) |i| {
-        test_data[i] = 'c';
-    }
-
-    test_data[192] = 62; // Fourth label (slightly shorter)
-
-    // Fill fourth label with 'd's
-    for (193..255) |i| {
-        test_data[i] = 'd';
-    }
-
-    var reader = PacketReader.init(&test_data);
-
-    var name = Name.init(testing.allocator);
-    defer name.deinit();
-
-    // Should just fit within 255 bytes
-    try name.parse(&reader);
-
-    // Verify label counts
-    try testing.expectEqual(@as(usize, 4), name.labels.items.len);
-    try testing.expectEqual(@as(usize, 63), name.labels.items[0].len);
-    try testing.expectEqual(@as(usize, 63), name.labels.items[1].len);
-    try testing.expectEqual(@as(usize, 63), name.labels.items[2].len);
-    try testing.expectEqual(@as(usize, 62), name.labels.items[3].len);
+    try std.testing.expectEqualStrings("example", (try iter.next()).?);
+    // 指针解引用返回 "com"
+    try std.testing.expectEqualStrings("com", (try iter.next()).?);
+    // 结束符
+    try std.testing.expect((try iter.next()) == null);
 }
 
-test "Name.parse - domain name too long" {
-    // Create a DNS name encoding that exceeds 255 bytes
-    // This is impossible in a valid DNS message, but let's test the validation
-    var test_data: [260]u8 = undefined;
+test "NameIterator empty domain" {
+    // 仅有结束符的空域名
+    const empty = "\x00";
+    var iter = NameIterator{ .buffer = empty, .pos = 0 };
 
-    // Set up multiple labels that together exceed 255 bytes
-    test_data[0] = 63; // First label length
-    for (1..64) |i| {
-        test_data[i] = 'a';
-    }
-
-    test_data[64] = 63; // Second label length
-    for (65..128) |i| {
-        test_data[i] = 'b';
-    }
-
-    test_data[128] = 63; // Third label length
-    for (129..192) |i| {
-        test_data[i] = 'c';
-    }
-
-    test_data[192] = 63; // Fourth label length
-    for (193..256) |i| {
-        test_data[i] = 'd';
-    }
-
-    // Add more data to exceed 255 limit
-    test_data[256] = 3;
-    test_data[257] = 'c';
-    test_data[258] = 'o';
-    test_data[259] = 'm';
-
-    var reader = PacketReader.init(&test_data);
-
-    var name = Name.init(testing.allocator);
-    defer name.deinit();
-
-    // Should fail with InvalidTotalLength
-    const result = name.parse(&reader);
-    try testing.expectError(ParseError.InvalidTotalLength, result);
+    try std.testing.expect((try iter.next()) == null);
 }
 
-test "Name.toOwnedSlice" {
-    // Test data for "example.com"
-    const test_data = [_]u8{
-        7, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
-        3, 'c', 'o', 'm', 0,
-    };
+/// 将 DNS 线路格式域名转换为点分隔格式
+/// buffer: 包含 DNS 数据包的缓冲区
+/// pos: 域名起始位置
+/// out_buf: 输出缓冲区，必须足够大（最多 253 字节 + 1）
+/// 返回: 写入 out_buf 的字符串切片
+pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 {
+    var read_pos: usize = pos;
+    var write_pos: usize = 0;
+    var first_label = true;
 
-    var reader = PacketReader.init(&test_data);
+    while (read_pos < buffer.len) {
+        const len = buffer[read_pos];
 
-    var name = Name.init(testing.allocator);
-    defer name.deinit();
+        // 结束符
+        if (len == 0) {
+            if (write_pos == 0) {
+                // 根域名
+                out_buf[write_pos] = '.';
+                write_pos += 1;
+            }
+            return out_buf[0..write_pos];
+        }
 
-    try name.parse(&reader);
+        // 指针压缩
+        if (len & 0xC0 == 0xC0) {
+            // 遇到压缩指针，直接返回已解析内容
+            if (write_pos == 0) {
+                out_buf[write_pos] = '.';
+                write_pos += 1;
+            }
+            return out_buf[0..write_pos];
+        }
 
-    // Convert to owned slice
-    const domain_str = try name.toOwnedSlice(testing.allocator);
-    defer testing.allocator.free(domain_str);
+        // 验证标签长度
+        if (len > 63) return error.LabelTooLong;
+        if (read_pos + 1 + len > buffer.len) return error.PacketTooShort;
 
-    // Verify the result
-    try testing.expectEqualStrings("example.com", domain_str);
-}
+        // 添加点分隔符（第一个标签前不加）
+        if (!first_label) {
+            out_buf[write_pos] = '.';
+            write_pos += 1;
+        }
+        first_label = false;
 
-test "Name.toOwnedSlice - root domain" {
-    // Test data for root domain (just a zero byte)
-    const test_data = [_]u8{0};
+        // 复制标签内容
+        @memcpy(out_buf[write_pos .. write_pos + len], buffer[read_pos + 1 .. read_pos + 1 + len]);
+        write_pos += len;
+        read_pos += 1 + len;
 
-    var reader = PacketReader.init(&test_data);
-
-    var name = Name.init(testing.allocator);
-    defer name.deinit();
-
-    try name.parse(&reader);
-
-    // Convert to owned slice
-    const domain_str = try name.toOwnedSlice(testing.allocator);
-    defer testing.allocator.free(domain_str);
-
-    // Verify empty string for root domain
-    try testing.expectEqualStrings("", domain_str);
-}
-
-test "Name.toOwnedSlice - multiple labels" {
-    // Test data for "mail.example.co.uk"
-    const test_data = [_]u8{
-        4,   'm', 'a', 'i', 'l',
-        7,   'e', 'x', 'a', 'm',
-        'p', 'l', 'e', 3,   'c',
-        'o', 'm', 0,
-    };
-
-    var reader = PacketReader.init(&test_data);
-
-    var name = Name.init(testing.allocator);
-    defer name.deinit();
-
-    try name.parse(&reader);
-
-    // Convert to owned slice
-    const domain_str = try name.toOwnedSlice(testing.allocator);
-    defer testing.allocator.free(domain_str);
-
-    // Verify the result
-    try testing.expectEqualStrings("mail.example.com", domain_str);
-}
-
-test "Name.fromString - basic domain parsing" {
-    const allocator = testing.allocator;
-
-    const domain = "example.com";
-    const qname = try Name.fromString(allocator, domain);
-    defer qname.deinit();
-
-    try testing.expectEqual(@as(usize, 2), qname.labels.items.len);
-    try testing.expectEqualStrings("example", qname.labels.items[0]);
-    try testing.expectEqualStrings("com", qname.labels.items[1]);
-}
-
-test "Name.parse - with compression pointer" {
-    const allocator = testing.allocator;
-
-    // Create a DNS packet with a pointer
-    // First name: [3]www[7]example[3]com[0]
-    // Second name: [3]ftp[pointer to offset 4]
-    var packet = [_]u8{
-        // First name at offset 0
-        3,   'w', 'w', 'w',
-        7,   'e', 'x', 'a',
-        'm', 'p', 'l', 'e',
-        3,   'c', 'o', 'm',
-        0,
-        // Second name at offset 17 with pointer to "example.com" at offset 4
-        3, 'f', 't', 'p', 0xC0, 0x04, // Pointer: 0xC4 (11000000) indicates pointer, 4 is offset
-    };
-
-    // Parse first name
-    {
-        var reader = PacketReader.init(&packet);
-        var name = Name.init(allocator);
-        defer name.deinit();
-
-        try name.parse(&reader);
-
-        try testing.expectEqual(@as(usize, 3), name.labels.items.len);
-        try testing.expectEqualStrings("www", name.labels.items[0]);
-        try testing.expectEqualStrings("example", name.labels.items[1]);
-        try testing.expectEqualStrings("com", name.labels.items[2]);
-
-        // Reader should be at position 17
-        try testing.expectEqual(@as(usize, 17), reader.position());
+        // 检查输出缓冲区大小
+        if (write_pos > out_buf.len) return error.BufferTooSmall;
     }
 
-    // Parse second name with pointer
-    {
-        var reader = PacketReader.init(&packet);
-        try reader.seekTo(17); // Start at the second name
+    return error.MalformedName;
+}
 
-        var name = Name.init(allocator);
-        defer name.deinit();
+test "formatDnsName simple domain" {
+    const domain = "\x07example\x03com\x00";
+    var buf: [256]u8 = undefined;
 
-        try name.parse(&reader);
+    const result = try formatDnsName(domain, 0, &buf);
+    try std.testing.expectEqualStrings("example.com", result);
+}
 
-        try testing.expectEqual(@as(usize, 3), name.labels.items.len);
-        try testing.expectEqualStrings("ftp", name.labels.items[0]);
-        try testing.expectEqualStrings("example", name.labels.items[1]);
-        try testing.expectEqualStrings("com", name.labels.items[2]);
+test "formatDnsName root domain" {
+    const root = "\x00";
+    var buf: [256]u8 = undefined;
 
-        // Reader should be at position 17 + 6 (after reading "ftp" and the pointer)
-        try testing.expectEqual(@as(usize, 23), reader.position());
-    }
+    const result = try formatDnsName(root, 0, &buf);
+    try std.testing.expectEqualStrings(".", result);
+}
+
+test "formatDnsName subdomain" {
+    const subdomain = "\x03www\x07example\x03com\x00";
+    var buf: [256]u8 = undefined;
+
+    const result = try formatDnsName(subdomain, 0, &buf);
+    try std.testing.expectEqualStrings("www.example.com", result);
+}
+
+test "formatDnsName with compression pointer" {
+    var buffer: [32]u8 = undefined;
+    // 在偏移 16 处放置 "com\x00"
+    buffer[16] = 3;
+    @memcpy(buffer[17..20], "com");
+    buffer[20] = 0;
+    // 在偏移 8 处放置 "example\x00"
+    buffer[8] = 7;
+    @memcpy(buffer[9..16], "example");
+    buffer[15] = 0; // 实际上不会执行到这里
+
+    // 开头: "www" + 指向 "example.com" 的压缩指针
+    buffer[0] = 3;
+    @memcpy(buffer[1..4], "www");
+    // 指向偏移 8 的指针 (0xC008)
+    buffer[4] = 0xC0;
+    buffer[5] = 0x08;
+
+    var buf: [256]u8 = undefined;
+    const result = try formatDnsName(&buffer, 0, &buf);
+    // 压缩指针会被正确跟随
+    try std.testing.expectEqualStrings("www.example.com", result);
 }

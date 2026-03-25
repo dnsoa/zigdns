@@ -1,2 +1,11 @@
 .zig-cache/
 zig-out/
+.claude/
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+*.swp
+*.o
+.DS_Store

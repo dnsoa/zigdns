@@ -2,11 +2,6 @@ const std = @import("std");
 const dns = @import("dns");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Create a DNS name from string
     std.debug.print("=== DNS Name Handling ===\n\n", .{});
 
     const domains = [_][]const u8{
@@ -14,52 +9,73 @@ pub fn main() !void {
         "mail.example.com",
         "sub.domain.example.com",
         "localhost",
-        "", // Root domain
     };
 
     for (domains) |domain| {
         std.debug.print("Domain: '{s}'\n", .{domain});
 
-        var name = try dns.Name.fromString(allocator, domain);
-        defer name.deinit();
-
-        const name_str = try name.toOwnedSlice(allocator);
-        defer allocator.free(name_str);
-        std.debug.print("  Converted back: '{s}'\n", .{name_str});
-
-        std.debug.print("  Labels: {d}\n", .{name.labels.items.len});
-        for (name.labels.items, 0..) |label, i| {
-            std.debug.print("    {d}: '{s}'\n", .{ i, label });
-        }
-
-        // Encode to wire format
+        // 使用 Message.Builder 编码域名
         var buffer: [256]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buffer);
-        const writer = fbs.writer();
-        try name.encode(writer);
-        const encoded_len = fbs.pos;
+        var builder = dns.Message.Builder.init(&buffer);
+        try builder.addQuestion(domain, .A, 1);
+        const packet = builder.finish(dns.Header{
+            .id = 0,
+            .rd = 0,
+            .tc = 0,
+            .aa = 0,
+            .opcode = 0,
+            .qr = 0,
+            .rcode = 0,
+            .z = 0,
+            .ra = 0,
+            .qdcount = 1,
+            .ancount = 0,
+            .nscount = 0,
+            .arcount = 0,
+        });
 
-        // Display wire format
-        std.debug.print("  Wire format ({d} bytes): ", .{encoded_len});
-        for (buffer[0..encoded_len]) |byte| {
+        // 跳过头部 (12 字节) 获取域名部分
+        const name_data = packet[12..];
+
+        // 显示线缆格式
+        std.debug.print("  Wire format ({d} bytes): ", .{name_data.len});
+        for (name_data) |byte| {
             if (byte >= 32 and byte <= 126) {
                 std.debug.print("{c}", .{byte});
             } else {
                 std.debug.print("\\x{X:0>2}", .{byte});
             }
         }
-        std.debug.print("\n\n", .{});
+        std.debug.print("\n", .{});
 
-        // Decode from wire format
-        var reader = dns.PacketReader.init(buffer[0..encoded_len]);
+        // 使用 NameIterator 解析域名
+        var iter = dns.NameIterator{ .buffer = packet, .pos = 12 };
+        var label_count: usize = 0;
+        std.debug.print("  Labels: ", .{});
 
-        var decoded_name = dns.Name.init(allocator);
-        defer decoded_name.deinit();
-        try decoded_name.parse(&reader);
-
-        const decoded_str = try decoded_name.toOwnedSlice(allocator);
-        defer allocator.free(decoded_str);
-        std.debug.print("  Decoded from wire: '{s}'\n", .{decoded_str});
+        while (try iter.next()) |label| {
+            if (label_count > 0) std.debug.print(".", .{});
+            std.debug.print("{s}", .{label});
+            label_count += 1;
+        }
+        std.debug.print("\n  Total labels: {d}\n", .{label_count});
         std.debug.print("---\n\n", .{});
     }
+
+    // 测试压缩指针
+    std.debug.print("=== Testing Compression Pointer ===\n\n", .{});
+
+    var buffer: [512]u8 = undefined;
+    var builder = dns.Message.Builder.init(&buffer);
+
+    // 添加多个相同域名的记录，第二次应使用压缩指针
+    try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 1 });
+    const pos1 = builder.pos;
+    try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 2 });
+    const pos2 = builder.pos;
+
+    const saved_bytes = pos2 - pos1;
+    std.debug.print("First record size: {d} bytes\n", .{pos1 - 12});
+    std.debug.print("Second record size: {d} bytes\n", .{saved_bytes});
+    std.debug.print("Saved by compression: {d} bytes\n", .{13 - 2 + 10});
 }

@@ -1,13 +1,14 @@
 .{
     .name = .dns,
-    .version = "0.3.2",
-    .fingerprint = 0x82eddc4110626e35, 
-    .minimum_zig_version = "0.14.0",
+    .version = "0.0.1",
+    .fingerprint = 0x82eddc4110626e35,
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "README.md",
+        "examples",
     },
 }
