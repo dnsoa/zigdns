@@ -5,24 +5,35 @@ const OptionCode = @import("types.zig").OptionCode;
 const ECSData = @import("types.zig").ECSData;
 const Error = @import("errors.zig").Error;
 
+fn parseECSOption(option_payload: []const u8) !ECSData {
+    if (option_payload.len < 4) return error.MalformedECS;
+
+    return ECSData{
+        .family = mem.readInt(u16, option_payload[0..2], .big),
+        .source_prefix = option_payload[2],
+        .scope_prefix = option_payload[3],
+        .address = option_payload[4..],
+    };
+}
+
 /// Parses an OPT record's RDATA to find the ECS option
 pub fn parseECS(rdata: []const u8) !?ECSData {
+    if (rdata.len >= 11 and rdata[0] == 0 and rdata[1] == @intFromEnum(OptionCode.ECS)) {
+        const len = (@as(u16, rdata[2]) << 8) | rdata[3];
+        if (len > rdata.len - 4) return error.PacketTooShort;
+        return try parseECSOption(rdata[4 .. 4 + len]);
+    }
+
     var pos: usize = 0;
     while (pos + 4 <= rdata.len) {
-        const code = mem.readInt(u16, rdata[pos..][0..2], .big);
-        const len = mem.readInt(u16, rdata[pos + 2 ..][0..4], .big);
+        const code = (@as(u16, rdata[pos]) << 8) | rdata[pos + 1];
+        const len = (@as(u16, rdata[pos + 2]) << 8) | rdata[pos + 3];
         pos += 4;
 
-        if (code == @intFromEnum(OptionCode.ECS)) {
-            const opt_payload = rdata[pos .. pos + len];
-            if (opt_payload.len < 4) return error.MalformedECS;
+        if (len > rdata.len -| pos) return error.PacketTooShort;
 
-            return ECSData{
-                .family = mem.readInt(u16, opt_payload[0..2], .big),
-                .source_prefix = opt_payload[2],
-                .scope_prefix = opt_payload[3],
-                .address = opt_payload[4..],
-            };
+        if (code == @intFromEnum(OptionCode.ECS)) {
+            return try parseECSOption(rdata[pos .. pos + len]);
         }
         pos += len;
     }
@@ -60,11 +71,12 @@ pub const RData = union(Type) {
                 return data[start .. pos.* - 1];
             }
             if (len & 0xC0 == 0xC0) { // 压缩指针
-                // 简化处理：跳过指针
+                if (data.len - pos.* < 2) return error.PacketTooShort;
                 pos.* += 2;
-                return data[start .. pos.* - 2];
+                return data[start..pos.*];
             }
             if (len > 63) return error.LabelTooLong;
+            if (data.len - pos.* < 1 + len) return error.PacketTooShort;
             pos.* += 1 + len;
         }
         return error.MalformedName;
@@ -190,4 +202,38 @@ test "RData parse TXT record" {
     @memcpy(txt[1..13], "hello world!");
     const rdata = try RData.parse(.TXT, txt[0..13]);
     try std.testing.expectEqualStrings("hello world!", rdata.TXT);
+}
+
+test "parseECS rejects truncated option payload" {
+    const rdata = [_]u8{
+        0x00, 0x08,
+        0x00, 0x08,
+        0x00, 0x01,
+        0x18,
+    };
+
+    try std.testing.expectError(error.PacketTooShort, parseECS(&rdata));
+}
+
+test "parseECS fast path parses first option" {
+    const rdata = [_]u8{
+        0x00, 0x08,
+        0x00, 0x07,
+        0x00, 0x01,
+        0x18, 0x00,
+        192,  0,
+        2,
+    };
+
+    const ecs = (try parseECS(&rdata)).?;
+    try std.testing.expectEqual(@as(u16, 1), ecs.family);
+    try std.testing.expectEqual(@as(u8, 24), ecs.source_prefix);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2 }, ecs.address);
+}
+
+test "RData parseName preserves compression pointer bytes" {
+    const data = [_]u8{ 0x03, 'w', 'w', 'w', 0xC0, 0x0C };
+    const rdata = try RData.parse(.CNAME, &data);
+
+    try std.testing.expectEqualSlices(u8, &data, rdata.CNAME);
 }

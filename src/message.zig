@@ -5,6 +5,7 @@ const Type = @import("types.zig").Type;
 const Error = @import("errors.zig").Error;
 
 const MAX_COMPRESSION = 32; // 最多追踪 32 个域名
+const MAX_NAME_LENGTH = 255;
 
 /// 核心解析/构造器
 pub const Message = struct {
@@ -32,6 +33,50 @@ pub const Message = struct {
                 .pos = 12, // 跳过 header 空间
                 .compression_table = undefined,
                 .compression_count = 0,
+            };
+        }
+
+        fn ensureCapacity(self: *Builder, need: usize) !void {
+            if (need > self.buf.len -| self.pos) return Error.BufferTooSmall;
+        }
+
+        fn canonicalizeName(name: []const u8) []const u8 {
+            if (name.len > 1 and name[name.len - 1] == '.') {
+                return name[0 .. name.len - 1];
+            }
+            return name;
+        }
+
+        fn validateName(name: []const u8) ![]const u8 {
+            const canonical = canonicalizeName(name);
+            var total_len: usize = 1; // root terminator
+            var label_len: usize = 0;
+
+            for (canonical) |byte| {
+                if (byte == '.') {
+                    if (label_len == 0) return Error.MalformedName;
+                    if (label_len > 63) return Error.LabelTooLong;
+                    total_len += 1 + label_len;
+                    if (total_len > MAX_NAME_LENGTH) return Error.NameTooLong;
+                    label_len = 0;
+                } else {
+                    label_len += 1;
+                }
+            }
+
+            if (label_len == 0) return Error.MalformedName;
+            if (label_len > 63) return Error.LabelTooLong;
+            total_len += 1 + label_len;
+            if (total_len > MAX_NAME_LENGTH) return Error.NameTooLong;
+
+            return canonical;
+        }
+
+        fn analyzeName(name: []const u8) !struct { canonical: []const u8, hash: u64 } {
+            const canonical = try validateName(name);
+            return .{
+                .canonical = canonical,
+                .hash = std.hash.Wyhash.hash(0, canonical),
             };
         }
 
@@ -118,6 +163,7 @@ pub const Message = struct {
             try self.writeU32(ttl);
             if (txt.len > 255) return Error.LabelTooLong;
             try self.writeU16(@intCast(txt.len + 1)); // RDLength
+            try self.ensureCapacity(txt.len + 1);
             self.buf[self.pos] = @intCast(txt.len);
             self.pos += 1;
             @memcpy(self.buf[self.pos..][0..txt.len], txt);
@@ -187,7 +233,16 @@ pub const Message = struct {
 
         /// 写入域名，支持压缩指针
         fn writeName(self: *Builder, name: []const u8) !void {
-            const hash = std.hash.Wyhash.hash(0, name);
+            if (name.len == 0 or mem.eql(u8, name, ".")) {
+                try self.ensureCapacity(1);
+                self.buf[self.pos] = 0;
+                self.pos += 1;
+                return;
+            }
+
+            const analyzed = try analyzeName(name);
+            const canonical = analyzed.canonical;
+            const hash = analyzed.hash;
 
             // 检查是否可以使用压缩指针
             if (self.compression_count > 0) {
@@ -195,6 +250,7 @@ pub const Message = struct {
                     if (entry.hash == hash) {
                         // 使用压缩指针
                         if (entry.pos < 0x3FFF) {
+                            try self.ensureCapacity(2);
                             self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
                             self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
                             self.pos += 2;
@@ -206,21 +262,23 @@ pub const Message = struct {
 
             // 写入完整域名
             const start = self.pos;
-            var it = mem.splitScalar(u8, name, '.');
+            var it = mem.splitScalar(u8, canonical, '.');
             while (it.next()) |label| {
+                try self.ensureCapacity(1 + label.len);
                 self.buf[self.pos] = @intCast(label.len);
                 @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
                 self.pos += 1 + label.len;
             }
+            try self.ensureCapacity(1);
             self.buf[self.pos] = 0;
             self.pos += 1;
 
             // 记录到压缩表（追踪后缀域名）
             if (self.compression_count < MAX_COMPRESSION) {
-                var label_it = mem.splitScalar(u8, name, '.');
+                var label_it = mem.splitScalar(u8, canonical, '.');
                 var suffix_offset: usize = 0;
                 while (label_it.next()) |label| {
-                    const suffix = name[suffix_offset..];
+                    const suffix = canonical[suffix_offset..];
                     const suffix_hash = std.hash.Wyhash.hash(0, suffix);
                     self.compression_table[self.compression_count] = .{
                         .hash = suffix_hash,
@@ -235,22 +293,34 @@ pub const Message = struct {
 
         /// 写入原始域名（不压缩，用于 rdata 中的域名）
         fn writeNameRaw(self: *Builder, name: []const u8) !void {
-            var it = mem.splitScalar(u8, name, '.');
+            if (name.len == 0 or mem.eql(u8, name, ".")) {
+                try self.ensureCapacity(1);
+                self.buf[self.pos] = 0;
+                self.pos += 1;
+                return;
+            }
+
+            const canonical = try validateName(name);
+            var it = mem.splitScalar(u8, canonical, '.');
             while (it.next()) |label| {
+                try self.ensureCapacity(1 + label.len);
                 self.buf[self.pos] = @intCast(label.len);
                 @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
                 self.pos += 1 + label.len;
             }
+            try self.ensureCapacity(1);
             self.buf[self.pos] = 0;
             self.pos += 1;
         }
 
         fn writeU16(self: *Builder, val: u16) !void {
+            try self.ensureCapacity(2);
             mem.writeInt(u16, self.buf[self.pos..][0..2], val, .big);
             self.pos += 2;
         }
 
         fn writeU32(self: *Builder, val: u32) !void {
+            try self.ensureCapacity(4);
             mem.writeInt(u32, self.buf[self.pos..][0..4], val, .big);
             self.pos += 4;
         }
@@ -315,4 +385,11 @@ test "Message.Builder addMXRecord" {
 
     // 12 + 13 (example.com) + 10 (fixed) + 2 (pref) + 18 (mail.example.com) = 55
     try std.testing.expectEqual(@as(usize, 55), packet.len);
+}
+
+test "Message.Builder returns BufferTooSmall on short destination" {
+    var buf: [20]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    try std.testing.expectError(error.BufferTooSmall, builder.addQuestion("example.com", .A, 1));
 }

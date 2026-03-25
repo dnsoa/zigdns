@@ -8,22 +8,39 @@ pub const NameIterator = struct {
     pos: u16,
 
     pub fn next(self: *NameIterator) !?[]const u8 {
-        if (self.pos >= self.buffer.len) return null;
-        const len = self.buffer[self.pos];
-        if (len == 0) return null; // 结束符
+        var visited_offsets: [16]u16 = undefined;
+        var visited_count: usize = 0;
 
-        // 处理指针压缩 (0xC0)
-        if (len & 0xC0 == 0xC0) {
-            const offset = mem.readInt(u16, self.buffer[self.pos..][0..2], .big) & 0x3FFF;
-            self.pos += 2;
-            // 递归跳转逻辑（生产环境下需限制递归深度防止死循环）
-            var temp_iter = NameIterator{ .buffer = self.buffer, .pos = @intCast(offset) };
-            return try temp_iter.next();
+        while (true) {
+            if (self.pos >= self.buffer.len) return error.PacketTooShort;
+
+            const len = self.buffer[self.pos];
+            if (len == 0) return null; // 结束符
+
+            // 处理指针压缩 (0xC0)
+            if (len & 0xC0 == 0xC0) {
+                if (self.pos + 1 >= self.buffer.len) return error.PacketTooShort;
+
+                const offset = mem.readInt(u16, self.buffer[self.pos..][0..2], .big) & 0x3FFF;
+                if (offset >= self.buffer.len) return error.InvalidOffset;
+
+                for (visited_offsets[0..visited_count]) |visited| {
+                    if (visited == offset) return error.MalformedName;
+                }
+                if (visited_count >= visited_offsets.len) return error.MalformedName;
+                visited_offsets[visited_count] = @intCast(offset);
+                visited_count += 1;
+                self.pos = @intCast(offset);
+                continue;
+            }
+
+            if (len > 63) return error.LabelTooLong;
+            if (@as(usize, self.pos) + 1 + len > self.buffer.len) return error.PacketTooShort;
+
+            const label = self.buffer[self.pos + 1 .. self.pos + 1 + len];
+            self.pos += 1 + len;
+            return label;
         }
-
-        const label = self.buffer[self.pos + 1 .. self.pos + 1 + len];
-        self.pos += 1 + len;
-        return label;
     }
 };
 
@@ -79,6 +96,8 @@ pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 
     var read_pos: usize = pos;
     var write_pos: usize = 0;
     var first_label = true;
+    var visited_offsets: [16]usize = undefined;
+    var visited_count: usize = 0;
 
     while (read_pos < buffer.len) {
         const len = buffer[read_pos];
@@ -87,6 +106,7 @@ pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 
         if (len == 0) {
             if (write_pos == 0) {
                 // 根域名
+                if (out_buf.len == 0) return error.BufferTooSmall;
                 out_buf[write_pos] = '.';
                 write_pos += 1;
             }
@@ -95,12 +115,18 @@ pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 
 
         // 指针压缩
         if (len & 0xC0 == 0xC0) {
-            // 遇到压缩指针，直接返回已解析内容
-            if (write_pos == 0) {
-                out_buf[write_pos] = '.';
-                write_pos += 1;
+            if (read_pos + 1 >= buffer.len) return error.PacketTooShort;
+            const offset = mem.readInt(u16, buffer[read_pos..][0..2], .big) & 0x3FFF;
+            if (offset >= buffer.len) return error.InvalidOffset;
+
+            for (visited_offsets[0..visited_count]) |visited| {
+                if (visited == offset) return error.MalformedName;
             }
-            return out_buf[0..write_pos];
+            if (visited_count >= visited_offsets.len) return error.MalformedName;
+            visited_offsets[visited_count] = offset;
+            visited_count += 1;
+            read_pos = offset;
+            continue;
         }
 
         // 验证标签长度
@@ -109,18 +135,19 @@ pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 
 
         // 添加点分隔符（第一个标签前不加）
         if (!first_label) {
+            if (write_pos >= out_buf.len) return error.BufferTooSmall;
             out_buf[write_pos] = '.';
             write_pos += 1;
         }
         first_label = false;
 
+        // 检查输出缓冲区大小
+        if (write_pos + len > out_buf.len) return error.BufferTooSmall;
+
         // 复制标签内容
         @memcpy(out_buf[write_pos .. write_pos + len], buffer[read_pos + 1 .. read_pos + 1 + len]);
         write_pos += len;
         read_pos += 1 + len;
-
-        // 检查输出缓冲区大小
-        if (write_pos > out_buf.len) return error.BufferTooSmall;
     }
 
     return error.MalformedName;
@@ -159,7 +186,9 @@ test "formatDnsName with compression pointer" {
     // 在偏移 8 处放置 "example\x00"
     buffer[8] = 7;
     @memcpy(buffer[9..16], "example");
-    buffer[15] = 0; // 实际上不会执行到这里
+    buffer[16] = 3;
+    @memcpy(buffer[17..20], "com");
+    buffer[20] = 0;
 
     // 开头: "www" + 指向 "example.com" 的压缩指针
     buffer[0] = 3;
@@ -172,4 +201,11 @@ test "formatDnsName with compression pointer" {
     const result = try formatDnsName(&buffer, 0, &buf);
     // 压缩指针会被正确跟随
     try std.testing.expectEqualStrings("www.example.com", result);
+}
+
+test "NameIterator detects invalid pointer offset" {
+    const buffer = [_]u8{ 0xC0, 0x10 };
+    var iter = NameIterator{ .buffer = &buffer, .pos = 0 };
+
+    try std.testing.expectError(error.InvalidOffset, iter.next());
 }

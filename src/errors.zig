@@ -2,6 +2,7 @@
 pub const Error = error{
     PacketTooShort,
     MalformedName,
+    MalformedECS,
     LabelTooLong,
     NameTooLong,
     InvalidRData,

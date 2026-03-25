@@ -136,16 +136,18 @@ pub fn parseDnsPacket(buffer: []const u8) !void {
     // Parse questions and records
     var parser = dns.MessageParser.init(buffer);
 
-    // Read questions
-    while (try parser.nextQuestion()) |q| {
+    // Read exactly qdcount questions
+    var questions = parser.questions(message.header.qdcount);
+    while (try questions.next()) |q| {
         std.debug.print("Question: Type={d}, Class={d}\n", .{
             @intFromEnum(q.qtype),
             q.qclass,
         });
     }
 
-    // Read resource records
-    while (try parser.nextRR()) |rr| {
+    // Then read the answer section explicitly
+    var answers = parser.resourceRecords(message.header.ancount);
+    while (try answers.next()) |rr| {
         // Parse RDATA based on type
         const rdata = try dns.ResourceData.parse(rr.rtype, rr.rdata);
 
@@ -166,6 +168,36 @@ pub fn parseDnsPacket(buffer: []const u8) !void {
             else => {},
         }
     }
+}
+```
+
+For server paths that only need a later section, you can skip the parts you already know how to account for:
+
+```zig
+var parser = dns.MessageParser.init(buffer);
+
+// Skip the question section and jump directly to answers
+try parser.skipQuestions(message.header.qdcount);
+
+var answers = parser.resourceRecords(message.header.ancount);
+while (try answers.next()) |rr| {
+    _ = rr;
+}
+```
+
+To inspect EDNS without consuming the parser cursor, scan the additional section directly:
+
+```zig
+var parser = dns.MessageParser.init(buffer);
+try parser.skipQuestions(message.header.qdcount);
+try parser.skipResourceRecords(message.header.ancount + message.header.nscount);
+
+if (try parser.findOptRecord(message.header.arcount)) |opt| {
+    std.debug.print("EDNS UDP size: {d}\n", .{opt.class});
+}
+
+if (try parser.findECS(message.header.arcount)) |ecs| {
+    std.debug.print("ECS family={d} prefix={d}\n", .{ ecs.family, ecs.source_prefix });
 }
 ```
 
