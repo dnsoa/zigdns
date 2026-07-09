@@ -153,6 +153,49 @@ pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 
     return error.MalformedName;
 }
 
+/// 自包含的域名引用：{完整报文缓冲区, 域名起始偏移}。
+/// 携带完整报文，因此可独立跟随压缩指针解析，无需指针算术或调用方隐式不变量。
+/// RData 中的域名字段即为此类型。
+pub const Name = struct {
+    /// 完整 DNS 报文缓冲区（压缩指针可指向其中任意更早位置）
+    buffer: []const u8,
+    /// 域名在报文中的起始偏移
+    offset: usize,
+
+    /// 解析为点分格式写入 out_buf（跟随压缩指针，带循环检测）。
+    /// 返回指向 out_buf 的切片。
+    pub fn str(self: Name, out_buf: []u8) ![]const u8 {
+        return formatDnsName(self.buffer, self.offset, out_buf);
+    }
+};
+
+test "Name.str resolves uncompressed name" {
+    const domain = "\x03www\x07example\x03com\x00";
+    const name = Name{ .buffer = domain, .offset = 0 };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com", try name.str(&buf));
+}
+
+test "Name.str follows compression pointer" {
+    var msg: [64]u8 = undefined;
+    @memset(&msg, 0);
+    // "example.com\0" 位于偏移 4
+    msg[4] = 7;
+    @memcpy(msg[5..12], "example");
+    msg[12] = 3;
+    @memcpy(msg[13..16], "com");
+    msg[16] = 0;
+    // 偏移 20: "www" + 指向偏移 4 的压缩指针
+    msg[20] = 3;
+    @memcpy(msg[21..24], "www");
+    msg[24] = 0xC0;
+    msg[25] = 0x04;
+
+    const name = Name{ .buffer = &msg, .offset = 20 };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com", try name.str(&buf));
+}
+
 test "formatDnsName simple domain" {
     const domain = "\x07example\x03com\x00";
     var buf: [256]u8 = undefined;

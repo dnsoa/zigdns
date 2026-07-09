@@ -12,4 +12,5 @@ pub const Error = error{
     UnknownType,
     UnknownClass,
     InvalidOffset,
+    MessageTooLong,
 };

@@ -7,6 +7,9 @@ const Error = @import("errors.zig").Error;
 const MAX_COMPRESSION = 32; // 最多追踪 32 个域名
 const MAX_NAME_LENGTH = 255;
 
+/// DNS 报文分区（RFC 1035 4.1）。构造时记录必须按此顺序添加。
+pub const Section = enum { question, answer, authority, additional };
+
 /// 核心解析/构造器
 pub const Message = struct {
     header: Header,
@@ -19,21 +22,106 @@ pub const Message = struct {
         return Message{ .header = header, .buffer = raw };
     }
 
+    /// 解析 TCP 组帧报文：2 字节大端长度前缀 + DNS 报文（RFC 1035 4.2.2）。
+    /// buffer 引用去除前缀后的 DNS 报文切片（零拷贝）。
+    pub fn parseTcp(raw: []const u8) !Message {
+        if (raw.len < 2) return error.PacketTooShort;
+        const msg_len = mem.readInt(u16, raw[0..2], .big);
+        if (raw.len < 2 + @as(usize, msg_len)) return error.PacketTooShort;
+        return Message.parse(raw[2 .. 2 + msg_len]);
+    }
+
     /// 高性能响应构造器
     pub const Builder = struct {
-        buf: []u8,
+        buf: []u8, // DNS 报文区域（TCP 时为 dest[2..]）
+        dest: []u8, // 完整目标缓冲区（含可能的 2 字节 TCP 长度前缀）
+        prefix_len: usize, // DNS 报文前保留字节数：0=UDP, 2=TCP
         pos: usize,
         // 压缩指针表：域名哈希 -> 位置
         compression_table: [MAX_COMPRESSION]struct { hash: u64, pos: u16 },
         compression_count: u8,
+        section: Section, // 当前分区，用于自动计数
+        qd: u16,
+        an: u16,
+        ns: u16,
+        ar: u16,
 
         pub fn init(dest: []u8) Builder {
+            return initFramed(dest, 0);
+        }
+
+        /// 构造 TCP 报文：预留 2 字节长度前缀，DNS 报文写入 dest[2..]，用 finishTcp 收尾。
+        pub fn initTcp(dest: []u8) !Builder {
+            if (dest.len < 2) return Error.BufferTooSmall;
+            return initFramed(dest, 2);
+        }
+
+        fn initFramed(dest: []u8, prefix_len: usize) Builder {
             return .{
-                .buf = dest,
-                .pos = 12, // 跳过 header 空间
+                .buf = dest[prefix_len..],
+                .dest = dest,
+                .prefix_len = prefix_len,
+                .pos = 12, // 跳过 header 空间（相对 DNS 报文起始）
                 .compression_table = undefined,
                 .compression_count = 0,
+                .section = .answer, // RR 默认写入回答区
+                .qd = 0,
+                .an = 0,
+                .ns = 0,
+                .ar = 0,
             };
+        }
+
+        const Snapshot = struct { pos: usize, compression_count: u8 };
+
+        fn snapshot(self: *const Builder) Snapshot {
+            return .{ .pos = self.pos, .compression_count = self.compression_count };
+        }
+
+        /// 回滚到快照（用于 add* 失败时保持原子性，使截断可安全恢复）。
+        fn restore(self: *Builder, s: Snapshot) void {
+            self.pos = s.pos;
+            self.compression_count = s.compression_count;
+        }
+
+        /// 切换当前分区（后续 RR 计入 authority/additional）。分区只能向后推进。
+        pub fn setSection(self: *Builder, s: Section) void {
+            std.debug.assert(@intFromEnum(s) >= @intFromEnum(self.section));
+            self.section = s;
+        }
+
+        /// 校验 buf[pos..] 处已写入的（展开的）线格式域名是否等于 canonical 点分名。
+        /// 用于压缩指针复用前的字节级确认，防止 64 位 hash 碰撞导致指向错误域名。
+        fn nameMatchesAt(self: *const Builder, pos: u16, canonical: []const u8) bool {
+            var read: usize = pos;
+            var exp: usize = 0;
+            var first = true;
+            while (read < self.pos) {
+                const len = self.buf[read];
+                if (len == 0) return exp == canonical.len;
+                if (len & 0xC0 == 0xC0) return false; // 压缩表仅记录展开写入的名字，不应出现指针
+                if (len > 63) return false;
+                if (read + 1 + len > self.pos) return false;
+                if (!first) {
+                    if (exp >= canonical.len or canonical[exp] != '.') return false;
+                    exp += 1;
+                }
+                first = false;
+                if (exp + len > canonical.len) return false;
+                if (!mem.eql(u8, self.buf[read + 1 .. read + 1 + len], canonical[exp .. exp + len])) return false;
+                exp += len;
+                read += 1 + len;
+            }
+            return false;
+        }
+
+        fn countRecord(self: *Builder) void {
+            switch (self.section) {
+                .question => self.qd += 1,
+                .answer => self.an += 1,
+                .authority => self.ns += 1,
+                .additional => self.ar += 1,
+            }
         }
 
         fn ensureCapacity(self: *Builder, need: usize) !void {
@@ -82,28 +170,38 @@ pub const Message = struct {
 
         /// 写入 A 记录
         pub fn addARecord(self: *Builder, name: []const u8, ttl: u32, ip: [4]u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.A));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             try self.writeU16(4); // RDLength
+            try self.ensureCapacity(4);
             @memcpy(self.buf[self.pos..][0..4], &ip);
             self.pos += 4;
+            self.countRecord();
         }
 
         /// 写入 AAAA 记录
         pub fn addAAAARecord(self: *Builder, name: []const u8, ttl: u32, ip: [16]u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.AAAA));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             try self.writeU16(16); // RDLength
+            try self.ensureCapacity(16);
             @memcpy(self.buf[self.pos..][0..16], &ip);
             self.pos += 16;
+            self.countRecord();
         }
 
         /// 写入 CNAME 记录
         pub fn addCNAMERecord(self: *Builder, name: []const u8, ttl: u32, cname: []const u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.CNAME));
             try self.writeU16(1); // Class IN
@@ -113,10 +211,13 @@ pub const Message = struct {
             try self.writeNameRaw(cname);
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
         }
 
         /// 写入 MX 记录
         pub fn addMXRecord(self: *Builder, name: []const u8, ttl: u32, preference: u16, exchange: []const u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.MX));
             try self.writeU16(1); // Class IN
@@ -127,10 +228,13 @@ pub const Message = struct {
             try self.writeNameRaw(exchange);
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
         }
 
         /// 写入 NS 记录
         pub fn addNSRecord(self: *Builder, name: []const u8, ttl: u32, nsdname: []const u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.NS));
             try self.writeU16(1); // Class IN
@@ -140,10 +244,13 @@ pub const Message = struct {
             try self.writeNameRaw(nsdname);
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
         }
 
         /// 写入 PTR 记录
         pub fn addPTRRecord(self: *Builder, name: []const u8, ttl: u32, ptrdname: []const u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.PTR));
             try self.writeU16(1); // Class IN
@@ -153,10 +260,13 @@ pub const Message = struct {
             try self.writeNameRaw(ptrdname);
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
         }
 
         /// 写入 TXT 记录
         pub fn addTXTRecord(self: *Builder, name: []const u8, ttl: u32, txt: []const u8) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.TXT));
             try self.writeU16(1); // Class IN
@@ -168,6 +278,7 @@ pub const Message = struct {
             self.pos += 1;
             @memcpy(self.buf[self.pos..][0..txt.len], txt);
             self.pos += txt.len;
+            self.countRecord();
         }
 
         /// 写入 SOA 记录
@@ -183,6 +294,8 @@ pub const Message = struct {
             expire: u32,
             minimum: u32,
         ) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.SOA));
             try self.writeU16(1); // Class IN
@@ -198,6 +311,7 @@ pub const Message = struct {
             try self.writeU32(minimum);
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
         }
 
         /// 写入 SRV 记录
@@ -210,6 +324,8 @@ pub const Message = struct {
             port: u16,
             target: []const u8,
         ) !void {
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(name);
             try self.writeU16(@intFromEnum(Type.SRV));
             try self.writeU16(1); // Class IN
@@ -222,13 +338,18 @@ pub const Message = struct {
             try self.writeNameRaw(target);
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
         }
 
-        /// 写入 Question
+        /// 写入 Question（必须先于所有 RR 添加）
         pub fn addQuestion(self: *Builder, qname: []const u8, qtype: Type, qclass: u16) !void {
+            std.debug.assert(self.an == 0 and self.ns == 0 and self.ar == 0);
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
             try self.writeName(qname);
             try self.writeU16(@intFromEnum(qtype));
             try self.writeU16(qclass);
+            self.qd += 1;
         }
 
         /// 写入域名，支持压缩指针
@@ -244,18 +365,15 @@ pub const Message = struct {
             const canonical = analyzed.canonical;
             const hash = analyzed.hash;
 
-            // 检查是否可以使用压缩指针
+            // 检查是否可以使用压缩指针（hash 命中后必须字节级确认，避免碰撞指向错误域名）
             if (self.compression_count > 0) {
                 for (self.compression_table[0..self.compression_count]) |entry| {
-                    if (entry.hash == hash) {
-                        // 使用压缩指针
-                        if (entry.pos < 0x3FFF) {
-                            try self.ensureCapacity(2);
-                            self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
-                            self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
-                            self.pos += 2;
-                            return;
-                        }
+                    if (entry.hash == hash and entry.pos < 0x3FFF and self.nameMatchesAt(entry.pos, canonical)) {
+                        try self.ensureCapacity(2);
+                        self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
+                        self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
+                        self.pos += 2;
+                        return;
                     }
                 }
             }
@@ -325,10 +443,31 @@ pub const Message = struct {
             self.pos += 4;
         }
 
+        /// 收尾：自动回填 header 的四个分区计数（防止 desync），返回 DNS 报文。
         pub fn finish(self: *Builder, header: Header) []u8 {
+            var h = header;
+            h.qdcount = self.qd;
+            h.ancount = self.an;
+            h.nscount = self.ns;
+            h.arcount = self.ar;
+            return self.finishRaw(h);
+        }
+
+        /// 收尾但原样使用调用方 header 的计数（不自动回填）。
+        pub fn finishRaw(self: *Builder, header: Header) []u8 {
             const h_bytes = header.encode();
             @memcpy(self.buf[0..12], &h_bytes);
             return self.buf[0..self.pos];
+        }
+
+        /// TCP 收尾：写入 2 字节大端长度前缀（RFC 1035 4.2.2），返回含前缀的完整帧。
+        /// 必须由 initTcp 创建。计数同样自动回填。
+        pub fn finishTcp(self: *Builder, header: Header) Error![]u8 {
+            std.debug.assert(self.prefix_len == 2);
+            const msg = self.finish(header);
+            if (msg.len > 0xFFFF) return Error.MessageTooLong;
+            mem.writeInt(u16, self.dest[0..2], @intCast(msg.len), .big);
+            return self.dest[0 .. 2 + msg.len];
         }
     };
 };
@@ -392,4 +531,141 @@ test "Message.Builder returns BufferTooSmall on short destination" {
     var builder = Message.Builder.init(&buf);
 
     try std.testing.expectError(error.BufferTooSmall, builder.addQuestion("example.com", .A, 1));
+}
+
+test "Message.Builder finish auto-counts sections" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    try builder.addQuestion("example.com", .A, 1);
+    try builder.addARecord("example.com", 60, .{ 1, 2, 3, 4 });
+    try builder.addARecord("example.com", 60, .{ 5, 6, 7, 8 });
+    builder.setSection(.authority);
+    try builder.addNSRecord("example.com", 60, "ns1.example.com");
+    builder.setSection(.additional);
+    try builder.addARecord("ns1.example.com", 60, .{ 9, 9, 9, 9 });
+
+    // 传入全 0 计数，finish 应自动回填正确值
+    const packet = builder.finish(.{
+        .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
+        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+    });
+
+    const msg = try Message.parse(packet);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 2), msg.header.ancount);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.nscount);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.arcount);
+
+    // 结构可被完整遍历
+    var parser = MessageParser.init(packet);
+    try parser.skipQuestions(msg.header.qdcount);
+    try parser.skipResourceRecords(msg.header.ancount + msg.header.nscount);
+    const rr = (try parser.nextRR()).?;
+    try std.testing.expectEqual(@as(u32, 60), rr.ttl);
+}
+
+test "Message.Builder failed add is atomic (enables TC truncation)" {
+    // 缓冲区仅够放下 question + 第一条 A 记录，第二条应失败且不破坏已写内容。
+    var buf: [45]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    try builder.addQuestion("example.com", .A, 1); // 12 + 13 + 4 = 29
+    try builder.addARecord("example.com", 60, .{ 1, 2, 3, 4 }); // 压缩后 2 + 12 = 14 -> pos=43
+
+    const pos_before = builder.pos;
+    const an_before = builder.an;
+
+    // 第二条放不下 -> BufferTooSmall，且必须原子回滚
+    try std.testing.expectError(error.BufferTooSmall, builder.addARecord("example.com", 60, .{ 5, 6, 7, 8 }));
+    try std.testing.expectEqual(pos_before, builder.pos);
+    try std.testing.expectEqual(an_before, builder.an);
+
+    // 服务器此时置 TC=1 并正常收尾，得到有效的截断报文
+    const packet = builder.finish(.{
+        .id = 1, .rd = 0, .tc = 1, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
+        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+    });
+    const msg = try Message.parse(packet);
+    try std.testing.expectEqual(@as(u1, 1), msg.header.tc);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.ancount);
+}
+
+test "Message TCP framing round-trip" {
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.initTcp(&buf);
+
+    try builder.addQuestion("example.com", .A, 1);
+    try builder.addARecord("example.com", 60, .{ 93, 184, 216, 34 });
+
+    const frame = try builder.finishTcp(.{
+        .id = 0x1234, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
+        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+    });
+
+    // 前 2 字节为大端长度前缀，等于其后 DNS 报文长度
+    const prefix_len = mem.readInt(u16, frame[0..2], .big);
+    try std.testing.expectEqual(@as(usize, prefix_len), frame.len - 2);
+
+    // parseTcp 应剥离前缀并正确解析
+    const msg = try Message.parseTcp(frame);
+    try std.testing.expectEqual(@as(u16, 0x1234), msg.header.id);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.ancount);
+}
+
+test "Message.parseTcp rejects truncated frame" {
+    // 前缀声称 100 字节，实际不足
+    var buf: [10]u8 = undefined;
+    mem.writeInt(u16, buf[0..2], 100, .big);
+    try std.testing.expectError(error.PacketTooShort, Message.parseTcp(&buf));
+}
+
+test "Message.Builder compression verifies bytes on hash collision" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    // 第一条：owner "foo.example" 展开写入（偏移 12），记录压缩项
+    try builder.addARecord("foo.example", 60, .{ 1, 1, 1, 1 });
+
+    // 伪造 hash 碰撞：把所有压缩项的 hash 改成 "bar.example" 的 hash，
+    // 但它们的 pos 仍指向 "foo.example"/"example"。
+    const collide = std.hash.Wyhash.hash(0, "bar.example");
+    for (builder.compression_table[0..builder.compression_count]) |*e| e.hash = collide;
+
+    // 第二条：owner "bar.example" —— hash 命中被篡改项，但字节不符，
+    // 必须写完整名字而非坏指针（偏移 39 开始）。
+    try builder.addARecord("bar.example", 60, .{ 2, 2, 2, 2 });
+
+    const packet = builder.finish(.{
+        .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
+        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+    });
+
+    var parser = MessageParser.init(packet);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("foo.example", try parser.formatNameAt(12, &nbuf));
+    // 若压缩守卫失效，此处会跟随坏指针得到 "foo.example"
+    try std.testing.expectEqualStrings("bar.example", try parser.formatNameAt(39, &nbuf));
+}
+
+test "Message.Builder addARecord guards final RDATA copy" {
+    // "example.com" A 记录需要 39 字节；所有带守卫的写入到 pos=35。
+    // 36 字节缓冲区恰好让守卫写入通过，仅最后 4 字节 RDATA 拷贝越界。
+    // 修复前：Debug 下 panic，ReleaseFast 下静默越界写。
+    var buf: [36]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+    try std.testing.expectError(error.BufferTooSmall, builder.addARecord("example.com", 3600, .{ 1, 2, 3, 4 }));
+}
+
+test "Message.Builder addAAAARecord guards final RDATA copy" {
+    // AAAA RDATA 为 16 字节；48 字节缓冲区让守卫写入通过（到 pos=35），
+    // 仅 16 字节 RDATA 拷贝越界 (35+16=51 > 48)。
+    var buf: [48]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+    const ip = [_]u8{0} ** 16;
+    try std.testing.expectError(error.BufferTooSmall, builder.addAAAARecord("example.com", 3600, ip));
 }

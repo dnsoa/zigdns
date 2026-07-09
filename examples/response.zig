@@ -87,8 +87,8 @@ pub fn main() !void {
     while (try parser.nextRR()) |rr| {
         std.debug.print("  Answer {d}: ", .{i});
 
-        // 使用 RData.parse 解析 RDATA 字节
-        const rdata = dns.ResourceData.parse(rr.rtype, rr.rdata) catch |err| {
+        // 使用 parseRData 解析 RDATA
+        const rdata = parser.parseRData(rr) catch |err| {
             std.debug.print("(parse error: {}) Type={d}\n", .{ err, @intFromEnum(rr.rtype) });
             i += 1;
             continue;

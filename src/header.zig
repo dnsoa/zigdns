@@ -20,13 +20,45 @@ pub const Header = packed struct(u96) {
     nscount: u16, // 权威记录数
     arcount: u16, // 附加记录数
 
+    // 显式按线格式字节解码，不依赖 packed struct 的隐式位序。
+    // RFC 1035 4.1.1:
+    //   byte2: QR(1) Opcode(4) AA(1) TC(1) RD(1)
+    //   byte3: RA(1) Z(3) RCODE(4)   (Z 高位在 RFC 2535 起细分为 Z/AD/CD，此处合并为 z:u3)
     pub fn decode(data: *const [12]u8) Header {
-        return @bitCast(mem.readInt(u96, data, .big));
+        const b2 = data[2];
+        const b3 = data[3];
+        return .{
+            .id = mem.readInt(u16, data[0..2], .big),
+            .qr = @truncate(b2 >> 7),
+            .opcode = @truncate(b2 >> 3),
+            .aa = @truncate(b2 >> 2),
+            .tc = @truncate(b2 >> 1),
+            .rd = @truncate(b2),
+            .ra = @truncate(b3 >> 7),
+            .z = @truncate(b3 >> 4),
+            .rcode = @truncate(b3),
+            .qdcount = mem.readInt(u16, data[4..6], .big),
+            .ancount = mem.readInt(u16, data[6..8], .big),
+            .nscount = mem.readInt(u16, data[8..10], .big),
+            .arcount = mem.readInt(u16, data[10..12], .big),
+        };
     }
 
     pub fn encode(self: Header) [12]u8 {
         var buf: [12]u8 = undefined;
-        mem.writeInt(u96, &buf, @bitCast(self), .big);
+        mem.writeInt(u16, buf[0..2], self.id, .big);
+        buf[2] = (@as(u8, self.qr) << 7) |
+            (@as(u8, self.opcode) << 3) |
+            (@as(u8, self.aa) << 2) |
+            (@as(u8, self.tc) << 1) |
+            @as(u8, self.rd);
+        buf[3] = (@as(u8, self.ra) << 7) |
+            (@as(u8, self.z) << 4) |
+            @as(u8, self.rcode);
+        mem.writeInt(u16, buf[4..6], self.qdcount, .big);
+        mem.writeInt(u16, buf[6..8], self.ancount, .big);
+        mem.writeInt(u16, buf[8..10], self.nscount, .big);
+        mem.writeInt(u16, buf[10..12], self.arcount, .big);
         return buf;
     }
 };
@@ -64,4 +96,96 @@ test "Header encode/decode" {
     try std.testing.expectEqual(original.ancount, decoded.ancount);
     try std.testing.expectEqual(original.nscount, decoded.nscount);
     try std.testing.expectEqual(original.arcount, decoded.arcount);
+}
+
+// 真实线格式向量测试：断言具体字节 <-> 具体字段，而非往返恒等。
+// 往返测试无法发现字节序错误（readInt/writeInt 与 bitCast 各自互逆），必须用固定向量锁定。
+
+test "Header decode real query wire bytes" {
+    // 标准查询: ID=0x1234, RD=1, QDCOUNT=1, 其余为 0
+    // byte2=0x01 -> RD=1; byte3=0x00
+    const wire = [_]u8{ 0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const h = Header.decode(&wire);
+
+    try std.testing.expectEqual(@as(u16, 0x1234), h.id);
+    try std.testing.expectEqual(@as(u1, 0), h.qr);
+    try std.testing.expectEqual(@as(u4, 0), h.opcode);
+    try std.testing.expectEqual(@as(u1, 0), h.aa);
+    try std.testing.expectEqual(@as(u1, 0), h.tc);
+    try std.testing.expectEqual(@as(u1, 1), h.rd);
+    try std.testing.expectEqual(@as(u1, 0), h.ra);
+    try std.testing.expectEqual(@as(u3, 0), h.z);
+    try std.testing.expectEqual(@as(u4, 0), h.rcode);
+    try std.testing.expectEqual(@as(u16, 1), h.qdcount);
+    try std.testing.expectEqual(@as(u16, 0), h.ancount);
+    try std.testing.expectEqual(@as(u16, 0), h.nscount);
+    try std.testing.expectEqual(@as(u16, 0), h.arcount);
+}
+
+test "Header decode real response wire bytes" {
+    // 递归响应: ID=0x1234, byte2=0x81 (QR=1,RD=1), byte3=0x80 (RA=1),
+    // QDCOUNT=1, ANCOUNT=1, NSCOUNT=0, ARCOUNT=1
+    const wire = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01 };
+    const h = Header.decode(&wire);
+
+    try std.testing.expectEqual(@as(u16, 0x1234), h.id);
+    try std.testing.expectEqual(@as(u1, 1), h.qr);
+    try std.testing.expectEqual(@as(u1, 1), h.rd);
+    try std.testing.expectEqual(@as(u1, 1), h.ra);
+    try std.testing.expectEqual(@as(u4, 0), h.rcode);
+    try std.testing.expectEqual(@as(u16, 1), h.qdcount);
+    try std.testing.expectEqual(@as(u16, 1), h.ancount);
+    try std.testing.expectEqual(@as(u16, 0), h.nscount);
+    try std.testing.expectEqual(@as(u16, 1), h.arcount);
+}
+
+test "Header decode packs opcode/rcode/flags into correct bits" {
+    // byte2=0x96 -> QR=1, Opcode=2(STATUS), AA=1, TC=1, RD=0
+    // byte3=0x83 -> RA=1, Z=0, RCODE=3(NXDOMAIN)
+    const wire = [_]u8{ 0xAB, 0xCD, 0x96, 0x83, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 };
+    const h = Header.decode(&wire);
+
+    try std.testing.expectEqual(@as(u16, 0xABCD), h.id);
+    try std.testing.expectEqual(@as(u1, 1), h.qr);
+    try std.testing.expectEqual(@as(u4, 2), h.opcode);
+    try std.testing.expectEqual(@as(u1, 1), h.aa);
+    try std.testing.expectEqual(@as(u1, 1), h.tc);
+    try std.testing.expectEqual(@as(u1, 0), h.rd);
+    try std.testing.expectEqual(@as(u1, 1), h.ra);
+    try std.testing.expectEqual(@as(u3, 0), h.z);
+    try std.testing.expectEqual(@as(u4, 3), h.rcode);
+    try std.testing.expectEqual(@as(u16, 0x1234), h.qdcount);
+    try std.testing.expectEqual(@as(u16, 0x5678), h.ancount);
+    try std.testing.expectEqual(@as(u16, 0x9ABC), h.nscount);
+    try std.testing.expectEqual(@as(u16, 0xDEF0), h.arcount);
+}
+
+test "Header encode produces exact wire bytes" {
+    const h = Header{
+        .id = 0x1234,
+        .rd = 1,
+        .tc = 0,
+        .aa = 0,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 1,
+        .qdcount = 1,
+        .ancount = 1,
+        .nscount = 0,
+        .arcount = 1,
+    };
+    const expected = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01 };
+    try std.testing.expectEqualSlices(u8, &expected, &h.encode());
+}
+
+test "Header decode matches parser's direct count reads" {
+    // Header.decode 必须与 MessageParser 直接按偏移读取的 count 一致（互操作性）。
+    const wire = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x05, 0x00, 0x07, 0x00, 0x09 };
+    const h = Header.decode(&wire);
+    try std.testing.expectEqual(mem.readInt(u16, wire[4..6], .big), h.qdcount);
+    try std.testing.expectEqual(mem.readInt(u16, wire[6..8], .big), h.ancount);
+    try std.testing.expectEqual(mem.readInt(u16, wire[8..10], .big), h.nscount);
+    try std.testing.expectEqual(mem.readInt(u16, wire[10..12], .big), h.arcount);
 }

@@ -148,8 +148,9 @@ pub fn parseDnsPacket(buffer: []const u8) !void {
     // Then read the answer section explicitly
     var answers = parser.resourceRecords(message.header.ancount);
     while (try answers.next()) |rr| {
-        // Parse RDATA based on type
-        const rdata = try dns.ResourceData.parse(rr.rtype, rr.rdata);
+        // Parse RDATA based on type. Domain names inside RDATA come back as
+        // self-contained `Name` values that resolve compression pointers.
+        const rdata = try parser.parseRData(rr);
 
         switch (rdata) {
             .A => |ip| {
@@ -161,8 +162,9 @@ pub fn parseDnsPacket(buffer: []const u8) !void {
                 std.debug.print("AAAA: {x:0>2}:{x:0>2}:...\n", .{ip[0], ip[1]});
             },
             .MX => |mx| {
+                var name_buf: [255]u8 = undefined;
                 std.debug.print("MX: pref={d}, exchange={s}\n", .{
-                    mx.preference, mx.exchange,
+                    mx.preference, try mx.exchange.str(&name_buf),
                 });
             },
             else => {},
@@ -199,6 +201,49 @@ if (try parser.findOptRecord(message.header.arcount)) |opt| {
 if (try parser.findECS(message.header.arcount)) |ecs| {
     std.debug.print("ECS family={d} prefix={d}\n", .{ ecs.family, ecs.source_prefix });
 }
+```
+
+### Server-side building: TCP framing, truncation, auto-counting
+
+`finish()` fills the header's section counts automatically from what you added, so
+they can never desync:
+
+```zig
+var builder = dns.Message.Builder.init(&buffer);
+try builder.addQuestion("example.com", .A, 1);      // -> qdcount
+try builder.addARecord("example.com", 60, .{1,2,3,4}); // -> ancount
+builder.setSection(.authority);
+try builder.addNSRecord("example.com", 60, "ns1.example.com"); // -> nscount
+
+// header counts are overwritten with the real values (pass 0s)
+const packet = builder.finish(header);
+// (use finishRaw(header) if you want to set the counts yourself)
+```
+
+Every `add*` call is atomic: if it returns `error.BufferTooSmall` the builder is
+rolled back to before the call, so you can stop and send a truncated response:
+
+```zig
+var truncated = false;
+for (answers) |a| {
+    builder.addARecord(a.name, a.ttl, a.ip) catch |e| switch (e) {
+        error.BufferTooSmall => { truncated = true; break; },
+        else => return e,
+    };
+}
+header.tc = if (truncated) 1 else 0;
+const packet = builder.finish(header);
+```
+
+For DNS-over-TCP, use the 2-byte length-prefix framing helpers:
+
+```zig
+var builder = try dns.Message.Builder.initTcp(&buffer);
+try builder.addQuestion("example.com", .A, 1);
+const frame = try builder.finishTcp(header); // 2-byte length prefix + message
+
+// parsing side strips the prefix:
+const message = try dns.Message.parseTcp(frame);
 ```
 
 ### Handling DNS Names

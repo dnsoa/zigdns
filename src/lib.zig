@@ -3,6 +3,7 @@
 
 pub const Header = @import("header.zig").Header;
 pub const NameIterator = @import("name.zig").NameIterator;
+pub const Name = @import("name.zig").Name;
 pub const formatDnsName = @import("name.zig").formatDnsName;
 pub const Type = @import("types.zig").Type;
 pub const Class = @import("types.zig").Class;
@@ -12,6 +13,7 @@ pub const OptionCode = @import("types.zig").OptionCode;
 pub const ECSData = @import("types.zig").ECSData;
 
 pub const Message = @import("message.zig").Message;
+pub const Section = @import("message.zig").Section;
 pub const MessageParser = @import("parser.zig").MessageParser;
 pub const ResourceData = @import("rdata.zig").RData;
 

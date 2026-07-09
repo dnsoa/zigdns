@@ -103,8 +103,8 @@ pub fn main() !void {
     while (try parser.nextRR()) |rr| {
         std.debug.print("{d}: Type={s} ", .{ i, @tagName(rr.rtype) });
 
-        // 使用 RData.parse 解析 RDATA 字节
-        const rdata = dns.ResourceData.parse(rr.rtype, rr.rdata) catch |err| {
+        // 使用 parseRData 解析 RDATA；内嵌域名以自包含的 Name 返回
+        const rdata = parser.parseRData(rr) catch |err| {
             std.debug.print("(parse error: {})\n", .{err});
             i += 1;
             continue;
@@ -124,22 +124,22 @@ pub fn main() !void {
             },
             .MX => |mx| {
                 var name_buf: [256]u8 = undefined;
-                const exchange_str = parser.formatNameFromSlice(mx.exchange, &name_buf) catch "[error]";
+                const exchange_str = mx.exchange.str(&name_buf) catch "[error]";
                 std.debug.print("MX(pref={d}, exchange={s})\n", .{ mx.preference, exchange_str });
             },
             .CNAME => |cname| {
                 var name_buf: [256]u8 = undefined;
-                const cname_str = parser.formatNameFromSlice(cname, &name_buf) catch "[error]";
+                const cname_str = cname.str(&name_buf) catch "[error]";
                 std.debug.print("CNAME={s}\n", .{cname_str});
             },
             .NS => |ns| {
                 var name_buf: [256]u8 = undefined;
-                const ns_str = parser.formatNameFromSlice(ns, &name_buf) catch "[error]";
+                const ns_str = ns.str(&name_buf) catch "[error]";
                 std.debug.print("NS={s}\n", .{ns_str});
             },
             .PTR => |ptr| {
                 var name_buf: [256]u8 = undefined;
-                const ptr_str = parser.formatNameFromSlice(ptr, &name_buf) catch "[error]";
+                const ptr_str = ptr.str(&name_buf) catch "[error]";
                 std.debug.print("PTR={s}\n", .{ptr_str});
             },
             .TXT => |txt| {
@@ -148,15 +148,15 @@ pub fn main() !void {
             .SOA => |soa| {
                 var mname_buf: [256]u8 = undefined;
                 var rname_buf: [256]u8 = undefined;
-                const mname_str = parser.formatNameFromSlice(soa.mname, &mname_buf) catch "[error]";
-                const rname_str = parser.formatNameFromSlice(soa.rname, &rname_buf) catch "[error]";
+                const mname_str = soa.mname.str(&mname_buf) catch "[error]";
+                const rname_str = soa.rname.str(&rname_buf) catch "[error]";
                 std.debug.print("SOA(mname={s}, rname={s}, serial={d})\n", .{
                     mname_str, rname_str, soa.serial,
                 });
             },
             .SRV => |srv| {
                 var name_buf: [256]u8 = undefined;
-                const target_str = parser.formatNameFromSlice(srv.target, &name_buf) catch "[error]";
+                const target_str = srv.target.str(&name_buf) catch "[error]";
                 std.debug.print("SRV(prio={d}, weight={d}, port={d}, target={s})\n", .{
                     srv.priority, srv.weight, srv.port, target_str,
                 });

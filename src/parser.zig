@@ -3,6 +3,7 @@ const mem = std.mem;
 const ECSData = @import("types.zig").ECSData;
 const Type = @import("types.zig").Type;
 const parseECS = @import("rdata.zig").parseECS;
+const RData = @import("rdata.zig").RData;
 
 pub const Question = struct {
     qname_end_pos: usize, // Where the name ends in the buffer
@@ -17,6 +18,7 @@ pub const ResourceRecord = struct {
     ttl: u32,
     rdlength: u16,
     rdata: []const u8, // Slice pointing into the original packet
+    rdata_offset: usize, // Absolute offset of rdata within the packet (for name resolution)
 };
 
 pub fn CountedIterator(comptime T: type) type {
@@ -112,6 +114,7 @@ pub const MessageParser = struct {
         if (self.pos + 10 + rdlen > self.buffer.len) return error.PacketTooShort;
 
         self.pos += 10;
+        const rdata_offset = self.pos;
         const rdata = self.buffer[self.pos .. self.pos + rdlen];
         self.pos += rdlen;
 
@@ -122,6 +125,7 @@ pub const MessageParser = struct {
             .ttl = ttl,
             .rdlength = rdlen,
             .rdata = rdata,
+            .rdata_offset = rdata_offset,
         };
     }
 
@@ -330,13 +334,11 @@ pub const MessageParser = struct {
         return error.MalformedName;
     }
 
-    /// Format a DNS name from a slice that points into the packet
-    /// Computes the offset and uses formatNameAt
-    pub fn formatNameFromSlice(self: *const MessageParser, name_slice: []const u8, out_buf: []u8) ![]const u8 {
-        // 计算切片在缓冲区中的偏移量
-        const offset = @intFromPtr(name_slice.ptr) - @intFromPtr(self.buffer.ptr);
-        if (offset >= self.buffer.len) return error.InvalidOffset;
-        return self.formatNameAt(offset, out_buf);
+    /// Parse a resource record's RDATA. Domain names inside RDATA are returned as
+    /// self-contained `Name` values bound to this parser's buffer, so they resolve
+    /// compression pointers without any pointer arithmetic or aliasing assumptions.
+    pub fn parseRData(self: *const MessageParser, rr: ResourceRecord) !RData {
+        return RData.parse(rr.rtype, self.buffer, rr.rdata_offset, rr.rdlength);
     }
 };
 
