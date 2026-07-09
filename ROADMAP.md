@@ -168,17 +168,19 @@ RFC 2535 起 byte3 为 `RA(1) Z(1) AD(1) CD(1) RCODE(4)`。当前 `z: u3` 吞掉
 
 ## P3 — 工程化与测试
 
-### 15. 缺少不可信输入的 fuzz 测试
+### 15. 缺少不可信输入的 fuzz 测试 — ✅ 已修复（harness 就绪）
 
-解析器直接面对网络恶意输入，却无 fuzz harness。**待办**：用 Zig `std.testing` fuzz 对 `Message.parse` / `MessageParser` / `RData.parse` / `formatNameAt` 做模糊测试（压缩环、越界指针、超长 label、截断包）。
+> **状态：已修复** 新增 `src/fuzz.zig`，用 Zig 0.16 `std.testing.fuzz`(`*Smith`) 覆盖 5 个入口：`Message.parse`+完整遍历（question/RR/rdata/内嵌域名）、`Message.parseTcp`+走帧、`formatNameAt`/`nameEqualsAt`（任意偏移）、`NameIterator`、`parseECS`。不变量：任意字节不 panic/不 UB/不死循环。已接入 `build.zig`：`zig build test` 编译并冒烟运行一次（CI 保活），`zig build fuzz --fuzz` 做真正模糊。
+>
+> **已知外部阻碍**：本机 Zig 0.16.0（homebrew `0.16.0_1`）自带的 `compiler/test_runner.zig` 在 fuzz 插桩构建下有类型错误（`writeStackTrace` 期望 `*const debug.StackTrace`），导致 `--fuzz` 引擎本身编译失败——**非本库代码问题**（`zig build test` 全绿，harness 自身零编译错误）。换用修复该 bug 的 Zig 版本即可实跑。
 
 ### 16. 测试存在结构性盲区
 
 `Header` 往返测试掩盖了 P0-1 这样的线格式错误。**待办**：改用**真实抓包字节向量**做断言（对已知报文断言具体字段值），覆盖 parse↔build 的互操作往返。
 
-### 17. 无 CI
+### 17. 无 CI — ✅ 已修复
 
-无 `.github/workflows`。**待办**：加 `zig build test` + examples 构建 + fuzz 冒烟的 CI。
+> **状态：已修复** 新增 `.github/workflows/ci.yml`（push main + PR 触发）：`mlugg/setup-zig@v2`(pin 0.16.0) → `zig fmt --check .` → `zig build test`（含 fuzz 冒烟）→ `zig build examples`。代码已 `zig fmt` 全库格式化通过。
 
 ### 18. 文档漂移 / 未验证的性能声明
 

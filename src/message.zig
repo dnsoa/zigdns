@@ -627,8 +627,19 @@ test "Message.Builder finish auto-counts sections" {
 
     // 传入全 0 计数，finish 应自动回填正确值
     const packet = builder.finish(.{
-        .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
-        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
     });
 
     const msg = try Message.parse(packet);
@@ -663,8 +674,19 @@ test "Message.Builder failed add is atomic (enables TC truncation)" {
 
     // 服务器此时置 TC=1 并正常收尾，得到有效的截断报文
     const packet = builder.finish(.{
-        .id = 1, .rd = 0, .tc = 1, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
-        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+        .id = 1,
+        .rd = 0,
+        .tc = 1,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
     });
     const msg = try Message.parse(packet);
     try std.testing.expectEqual(@as(u1, 1), msg.header.tc);
@@ -680,8 +702,19 @@ test "Message TCP framing round-trip" {
     try builder.addARecord("example.com", 60, .{ 93, 184, 216, 34 });
 
     const frame = try builder.finishTcp(.{
-        .id = 0x1234, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
-        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+        .id = 0x1234,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
     });
 
     // 前 2 字节为大端长度前缀，等于其后 DNS 报文长度
@@ -715,8 +748,19 @@ test "Message.Builder addOptRecord with ECS round-trips" {
     });
 
     const packet = builder.finish(.{
-        .id = 1, .rd = 0, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0,
-        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 0,
+        .opcode = 0,
+        .qr = 0,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
     });
 
     const msg = try Message.parse(packet);
@@ -748,8 +792,19 @@ test "Message.Builder addOptRecord without ECS (bare EDNS)" {
     try builder.addOptRecord(.{ .udp_payload_size = 1232 });
 
     const packet = builder.finish(.{
-        .id = 1, .rd = 1, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0,
-        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+        .id = 1,
+        .rd = 1,
+        .tc = 0,
+        .aa = 0,
+        .opcode = 0,
+        .qr = 0,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
     });
     const msg = try Message.parse(packet);
     try std.testing.expectEqual(@as(u16, 1), msg.header.arcount);
@@ -792,8 +847,19 @@ test "Message.Builder compression verifies bytes on hash collision" {
     try builder.addARecord("bar.example", 60, .{ 2, 2, 2, 2 });
 
     const packet = builder.finish(.{
-        .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0,
-        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
     });
 
     var parser = MessageParser.init(packet);

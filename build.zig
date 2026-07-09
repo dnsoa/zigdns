@@ -24,6 +24,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_tests.step);
 
+    // === 模糊测试 ===
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    // 随 `zig build test` 编译并冒烟运行一次
+    test_step.dependOn(&run_fuzz_tests.step);
+    // 真正模糊：`zig build fuzz --fuzz`
+    const fuzz_step = b.step("fuzz", "Run fuzz tests (append --fuzz to actually fuzz)");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
     // === 性能基准测试 ===
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
