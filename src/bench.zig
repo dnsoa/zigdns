@@ -15,6 +15,13 @@ const RESPONSE_PACKET =
     "\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x0b" ++ // OPT header
     "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02"; // ECS option
 
+/// 单调时钟纳秒（Zig 0.16 将计时 API 迁到 Io/libc，这里直接用 libc clock_gettime）。
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 fn BenchmarkResult(comptime T: type) type {
     return struct {
         elapsed_ns: i128,
@@ -31,7 +38,7 @@ fn runBenchmark(comptime Context: type, comptime T: type, context: *Context, ite
         mem.doNotOptimizeAway(&sink);
     }
 
-    const start = std.time.nanoTimestamp();
+    const start = nowNs();
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
@@ -39,7 +46,7 @@ fn runBenchmark(comptime Context: type, comptime T: type, context: *Context, ite
         mem.doNotOptimizeAway(&sink);
     }
 
-    const elapsed_ns = std.time.nanoTimestamp() - start;
+    const elapsed_ns = nowNs() - start;
     mem.doNotOptimizeAway(&sink);
     return .{ .elapsed_ns = elapsed_ns, .sink = sink };
 }
@@ -352,12 +359,13 @@ fn benchmarkEdnsScanning() !void {
 
     const opt_lookup = try runBenchmark([RESPONSE_PACKET.len]u8, u16, &response_packet, iterations, struct {
         fn run(packet: *[RESPONSE_PACKET.len]u8, iteration: usize) !u16 {
-            packet[RESPONSE_PACKET.len - 5] = @truncate(16 + (iteration & 0x0f));
+            // 变动最后一个地址字节，保持 ECS 合法（prefix=24 -> 3 字节地址）
+            packet[RESPONSE_PACKET.len - 1] = @truncate(iteration);
             var parser = dns.MessageParser.init(packet[0..]);
             try parser.skipQuestions(1);
             try parser.skipResourceRecords(1);
             const opt = (try parser.findOptRecord(1)).?;
-            return opt.class + packet[RESPONSE_PACKET.len - 5];
+            return opt.class + packet[RESPONSE_PACKET.len - 1];
         }
     }.run);
     reportBenchmark("find OPT in additional section", iterations, opt_lookup.elapsed_ns);
@@ -365,16 +373,44 @@ fn benchmarkEdnsScanning() !void {
 
     const ecs_lookup = try runBenchmark([RESPONSE_PACKET.len]u8, u8, &response_packet, iterations, struct {
         fn run(packet: *[RESPONSE_PACKET.len]u8, iteration: usize) !u8 {
-            packet[RESPONSE_PACKET.len - 5] = @truncate(16 + (iteration & 0x0f));
+            // 变动最后一个地址字节以避免常量折叠（保持 prefix=24 合法：3 字节地址）
+            packet[RESPONSE_PACKET.len - 1] = @truncate(iteration);
             var parser = dns.MessageParser.init(packet[0..]);
             try parser.skipQuestions(1);
             try parser.skipResourceRecords(1);
             const ecs = (try parser.findECS(1)).?;
-            return ecs.source_prefix;
+            return ecs.address[ecs.address.len - 1];
         }
     }.run);
     reportBenchmark("find ECS in OPT", iterations, ecs_lookup.elapsed_ns);
     reportVsBaseline("find ECS in OPT", baseline.elapsed_ns, iterations, ecs_lookup.elapsed_ns, iterations);
 
     reportSlowdown("ECS parse vs OPT lookup", opt_lookup.elapsed_ns, ecs_lookup.elapsed_ns);
+
+    // #13: 单趟 findEdns vs 双趟 findOptRecord+findECS
+    const single_pass = try runBenchmark([RESPONSE_PACKET.len]u8, u16, &response_packet, iterations, struct {
+        fn run(packet: *[RESPONSE_PACKET.len]u8, iteration: usize) !u16 {
+            packet[RESPONSE_PACKET.len - 1] = @truncate(iteration);
+            var parser = dns.MessageParser.init(packet[0..]);
+            try parser.skipQuestions(1);
+            try parser.skipResourceRecords(1);
+            const edns = (try parser.findEdns(1)).?;
+            return edns.opt.class + edns.ecs.?.address[edns.ecs.?.address.len - 1];
+        }
+    }.run);
+    reportBenchmark("findEdns single-pass (OPT+ECS)", iterations, single_pass.elapsed_ns);
+
+    const two_pass = try runBenchmark([RESPONSE_PACKET.len]u8, u16, &response_packet, iterations, struct {
+        fn run(packet: *[RESPONSE_PACKET.len]u8, iteration: usize) !u16 {
+            packet[RESPONSE_PACKET.len - 1] = @truncate(iteration);
+            var parser = dns.MessageParser.init(packet[0..]);
+            try parser.skipQuestions(1);
+            try parser.skipResourceRecords(1);
+            const opt = (try parser.findOptRecord(1)).?;
+            const ecs = (try parser.findECS(1)).?;
+            return opt.class + ecs.address[ecs.address.len - 1];
+        }
+    }.run);
+    reportBenchmark("two-pass findOptRecord + findECS", iterations, two_pass.elapsed_ns);
+    reportSlowdown("two-pass vs single-pass EDNS", single_pass.elapsed_ns, two_pass.elapsed_ns);
 }

@@ -295,6 +295,7 @@ The library provides detailed error types:
 pub const Error = error{
     PacketTooShort,
     MalformedName,
+    MalformedECS,
     LabelTooLong,
     NameTooLong,
     InvalidRData,
@@ -303,6 +304,8 @@ pub const Error = error{
     BufferTooSmall,
     UnknownType,
     UnknownClass,
+    InvalidOffset,
+    MessageTooLong,
 };
 ```
 
@@ -355,13 +358,45 @@ zig test src/rdata.zig
 ## Performance
 
 Zero-copy design means:
-- **No heap allocation** during packet parsing
+- **No heap allocation** during parsing or encoding
 - **Minimal memory overhead** - only stores positions and lengths
 - **Cache-friendly** - sequential access to packet buffer
 
-Benchmarks on typical DNS response (~100 bytes):
-- Parse: ~50 ns (no allocations)
-- Encode: ~100 ns (with compression)
+Indicative figures from `zig build bench` (ReleaseFast, single dev machine — run it
+on your own hardware, these are not authoritative):
+
+| Operation | ~ns/op |
+|-----------|-------:|
+| Decode header | 0.7 |
+| Parse one question | 3 |
+| Skip question + parse one answer | 4 |
+| Iterate a qname (labels) | 4 |
+| Compare a compressed name | 10 |
+| Format a compressed name (dotted) | 20 |
+| Find OPT / `findEdns` (OPT+ECS, one scan) | 6–8 |
+| Encode a query | 37 |
+| Encode a response with compression | 60 |
+
+On server fast paths prefer comparing names (`nameEqualsAt`) or scanning EDNS with the
+single-pass `findEdns` over formatting names to strings.
+
+### DPDK / eBPF integration
+
+The library never allocates and operates entirely over a caller-provided `[]const u8`,
+so it drops straight into packet-processing fast paths:
+
+```zig
+// DNS payload lives at some offset inside an mbuf / packet buffer — pass the slice, no copy:
+const message = try dns.Message.parse(pkt[udp_payload_off..]);
+// or for DNS-over-TCP framing: dns.Message.parseTcp(pkt[tcp_payload_off..]);
+
+// Burst model: just loop over the RX burst; each parse is independent and allocation-free.
+for (burst[0..n]) |pkt| { handle(try dns.Message.parse(dnsPayload(pkt))); }
+```
+
+Note: parsing assumes a single **contiguous** buffer. For multi-segment (scatter-gather)
+mbuf chains, linearize the DNS payload first (nearly all DNS messages fit one segment).
+Native segmented-buffer parsing is a possible future direction.
 
 ## Limitations
 

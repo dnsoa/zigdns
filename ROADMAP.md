@@ -144,9 +144,9 @@ RFC 2535 起 byte3 为 `RA(1) Z(1) AD(1) CD(1) RCODE(4)`。当前 `z: u3` 吞掉
 
 ## P2 — 性能（eBPF / DPDK 高吞吐相关）
 
-### 11. Header 解码用非原生 u96 bitcast
+### 11. Header 解码用非原生 u96 bitcast — ✅ 已修复（随 P0-1，实测确认）
 
-修好 P0-1 后，建议直接按字节 / 原生整型读取标志字节，避免 12 字节非 2 幂宽整型的 bitcast，在每包必经的热路径上更可控。
+> **状态：已修复** P0-1 的重写已改为 `readInt(u16)` + 位移的显式字节读取，不再有 u96 bitcast。实测 `zig build bench`：header 解码 **~0.7 ns/op**（仅比空循环基线高 ~0.09 ns），已在热路径地板附近，无需进一步优化。
 
 ### 12. `formatNameFromSlice` 用 `@intFromPtr` 做偏移，脆弱且潜在 UB — ✅ 已修复（随 #2）
 
@@ -156,13 +156,15 @@ RFC 2535 起 byte3 为 `RA(1) Z(1) AD(1) CD(1) RCODE(4)`。当前 `z: u3` 吞掉
 
 **已核实的修正**：此函数**是活代码**——`examples/records.zig` 里 MX/CNAME/NS/PTR/SOA(mname/rname)/SRV 共 **8 处**调用，`zig build` 会构建到。且"下溢被 `>= len` 拦截"的说法不准确：若切片不在 buffer 内，**安全构建下 `ptr - ptr` 的下溢会先 panic**，轮不到 `>= len` 检查。**建议**：改为显式传偏移（配合 P1-2 让 RDATA 内域名以绝对偏移返回），移除指针算术。
 
-### 13. EDNS/OPT 多次扫描重复解析
+### 13. EDNS/OPT 多次扫描重复解析 — ✅ 已修复
 
-`findOptRecord` 与 `findECS` 各自从 `parser` 状态克隆后**从头线性扫描** additional section。server 若既要 OPT 又要 ECS，会扫两遍。**建议**：单趟扫描返回 OPT 记录 + 其中的 ECS。
+> **状态：已修复** 新增 `MessageParser.findEdns(count)`，单趟扫描同时返回 `{ opt, ecs }`。新增测试与基准：单趟 ~8.3 ns vs 双趟 findOptRecord+findECS ~8.9 ns（此包附加区仅 1 条记录；OPT 前记录越多、双趟重复扫描的差距越大）。`findOptRecord`/`findECS` 保留供只需其一时使用。
 
-### 14. 面向 DPDK 的批量 / 分散缓冲区 API 缺失
+### 14. 面向 DPDK 的批量 / 分散缓冲区 API — ◑ 已定调（不做投机脚手架）
 
-现有 API 假设单一连续 `[]const u8`。DPDK 的 mbuf 可能分段（scatter-gather），且高吞吐场景需要批处理接口。**待办（长期）**：评估 vectored/批量解析接口；name 比较 / label 扫描可引入 SIMD。
+> **状态：评估后有意从简** 经权衡：库本身已零分配、全程在调用方 `[]const u8` 上零拷贝工作，DPDK/eBPF 直接把 mbuf/包内 DNS 载荷切片传入 `Message.parse(pkt[off..])` 即可；burst 就是对 RX 批次做循环，每次解析独立且无分配。README 新增「DPDK / eBPF integration」说明该用法。
+>
+> **有意不实现**：真正的分段（scatter-gather）解析需要把每个解析函数重写到「分段缓冲区」抽象上，改动巨大；而绝大多数 DNS 报文落在单个 mbuf 段内，DPDK 可先 linearize。在没有真实消费方与基准前构建批量/分段脚手架属过度设计。SIMD 化 name 比较/label 扫描同理——留待有 profile 支撑时再做。当前无 P2 悬留项阻塞 server 落地。
 
 ---
 
@@ -187,6 +189,8 @@ RFC 2535 起 byte3 为 `RA(1) Z(1) AD(1) CD(1) RCODE(4)`。当前 `z: u3` 吞掉
 - `README.md` 的 `Error` 集合缺 `InvalidOffset`、`MalformedECS`（与 `src/errors.zig` 不一致）。
 - README "Parse ~50ns / Encode ~100ns" 无可复现依据；且在 P0-1 修复前，header 相关基准衡量的是错误代码。
 - **已核实的修正**：examples **已**由默认 `zig build` 构建（`build.zig:67` 无条件 `installArtifact`）；问题仅是它们**未纳入 `test` step**，所以其中的 bug（如 P1-19 的 RDATA 域名路径）不会被 `zig build test` 捕获。
+
+> **状态（文档漂移部分）：✅ 已修复** README `Error` 集合已补齐 `MalformedECS`/`InvalidOffset`/`MessageTooLong`，与 `src/errors.zig` 一致；Performance 段替换为 `zig build bench` 实测数据（并注明非权威）。另：`src/bench.zig` 原先因 Zig 0.16 移除 `std.time.nanoTimestamp` 而无法编译，已改用 libc `clock_gettime` 修复，`zig build bench` 现可运行。
 
 ---
 

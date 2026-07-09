@@ -179,6 +179,22 @@ pub const MessageParser = struct {
         return null;
     }
 
+    pub const Edns = struct { opt: ResourceRecord, ecs: ?ECSData };
+
+    /// 单趟扫描附加区：一次返回 OPT 记录及其中的 ECS（若有），
+    /// 避免同时需要 OPT 与 ECS 时 findOptRecord + findECS 的双次扫描。
+    pub fn findEdns(self: *const MessageParser, count: u16) !?Edns {
+        var scan = self.*;
+        var remaining = count;
+        while (remaining > 0) : (remaining -= 1) {
+            const rr = (try scan.nextRR()) orelse return error.PacketTooShort;
+            if (rr.rtype == .OPT) {
+                return .{ .opt = rr, .ecs = try parseECS(rr.rdata) };
+            }
+        }
+        return null;
+    }
+
     pub fn nameEqualsAt(self: *const MessageParser, offset: usize, expected: []const u8) !bool {
         if (offset >= self.buffer.len) return error.InvalidOffset;
 
@@ -660,6 +676,36 @@ test "MessageParser findOptRecord scans without consuming parser state" {
     try std.testing.expectEqual(@as(usize, initial_pos), parser.pos);
     try std.testing.expectEqual(Type.OPT, opt.rtype);
     try std.testing.expectEqual(@as(u16, 1232), opt.class);
+}
+
+test "MessageParser findEdns returns OPT and ECS in one scan" {
+    var packet: [64]u8 = undefined;
+    @memset(packet[0..12], 0);
+
+    var pos: usize = 12;
+    packet[pos] = 0;
+    pos += 1;
+    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
+    mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
+    mem.writeInt(u16, packet[pos + 8 ..][0..2], 11, .big);
+    pos += 10;
+    mem.writeInt(u16, packet[pos..][0..2], 8, .big);
+    mem.writeInt(u16, packet[pos + 2 ..][0..2], 7, .big);
+    mem.writeInt(u16, packet[pos + 4 ..][0..2], 1, .big);
+    packet[pos + 6] = 24;
+    packet[pos + 7] = 0;
+    @memcpy(packet[pos + 8 ..][0..3], &[_]u8{ 192, 0, 2 });
+    pos += 11;
+
+    const parser = MessageParser.init(packet[0..pos]);
+    const edns = (try parser.findEdns(1)).?;
+
+    try std.testing.expectEqual(Type.OPT, edns.opt.rtype);
+    try std.testing.expectEqual(@as(u16, 1232), edns.opt.class);
+    try std.testing.expectEqual(@as(u16, 1), edns.ecs.?.family);
+    try std.testing.expectEqual(@as(u8, 24), edns.ecs.?.source_prefix);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2 }, edns.ecs.?.address);
 }
 
 test "MessageParser findECS extracts ECS from OPT record" {

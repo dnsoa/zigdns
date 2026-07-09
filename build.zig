@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .link_libc = true, // clock_gettime for timing
     });
     bench_module.addImport("dns", dns_module);
 
