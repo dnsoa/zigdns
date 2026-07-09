@@ -12,7 +12,10 @@ pub const Header = packed struct(u96) {
     opcode: u4, // 操作码
     qr: u1, // 0:查询, 1:响应
     rcode: u4, // 响应码
-    z: u3, // 保留
+    // RFC 2535 起 byte3 的保留区细分为 Z/AD/CD 三个独立标志位（默认 0，向后兼容旧构造点）
+    cd: u1 = 0, // 禁用校验 (Checking Disabled)
+    ad: u1 = 0, // 已验证数据 (Authentic Data)
+    z: u1 = 0, // 保留 (必须为 0)
     ra: u1, // 递归可用
 
     qdcount: u16, // 问题数
@@ -23,7 +26,7 @@ pub const Header = packed struct(u96) {
     // 显式按线格式字节解码，不依赖 packed struct 的隐式位序。
     // RFC 1035 4.1.1:
     //   byte2: QR(1) Opcode(4) AA(1) TC(1) RD(1)
-    //   byte3: RA(1) Z(3) RCODE(4)   (Z 高位在 RFC 2535 起细分为 Z/AD/CD，此处合并为 z:u3)
+    //   byte3: RA(1) Z(1) AD(1) CD(1) RCODE(4)   (RFC 2535 起细分 Z/AD/CD)
     pub fn decode(data: *const [12]u8) Header {
         const b2 = data[2];
         const b3 = data[3];
@@ -35,7 +38,9 @@ pub const Header = packed struct(u96) {
             .tc = @truncate(b2 >> 1),
             .rd = @truncate(b2),
             .ra = @truncate(b3 >> 7),
-            .z = @truncate(b3 >> 4),
+            .z = @truncate(b3 >> 6),
+            .ad = @truncate(b3 >> 5),
+            .cd = @truncate(b3 >> 4),
             .rcode = @truncate(b3),
             .qdcount = mem.readInt(u16, data[4..6], .big),
             .ancount = mem.readInt(u16, data[6..8], .big),
@@ -53,7 +58,9 @@ pub const Header = packed struct(u96) {
             (@as(u8, self.tc) << 1) |
             @as(u8, self.rd);
         buf[3] = (@as(u8, self.ra) << 7) |
-            (@as(u8, self.z) << 4) |
+            (@as(u8, self.z) << 6) |
+            (@as(u8, self.ad) << 5) |
+            (@as(u8, self.cd) << 4) |
             @as(u8, self.rcode);
         mem.writeInt(u16, buf[4..6], self.qdcount, .big);
         mem.writeInt(u16, buf[6..8], self.ancount, .big);
@@ -114,7 +121,7 @@ test "Header decode real query wire bytes" {
     try std.testing.expectEqual(@as(u1, 0), h.tc);
     try std.testing.expectEqual(@as(u1, 1), h.rd);
     try std.testing.expectEqual(@as(u1, 0), h.ra);
-    try std.testing.expectEqual(@as(u3, 0), h.z);
+    try std.testing.expectEqual(@as(u1, 0), h.z);
     try std.testing.expectEqual(@as(u4, 0), h.rcode);
     try std.testing.expectEqual(@as(u16, 1), h.qdcount);
     try std.testing.expectEqual(@as(u16, 0), h.ancount);
@@ -152,7 +159,7 @@ test "Header decode packs opcode/rcode/flags into correct bits" {
     try std.testing.expectEqual(@as(u1, 1), h.tc);
     try std.testing.expectEqual(@as(u1, 0), h.rd);
     try std.testing.expectEqual(@as(u1, 1), h.ra);
-    try std.testing.expectEqual(@as(u3, 0), h.z);
+    try std.testing.expectEqual(@as(u1, 0), h.z);
     try std.testing.expectEqual(@as(u4, 3), h.rcode);
     try std.testing.expectEqual(@as(u16, 0x1234), h.qdcount);
     try std.testing.expectEqual(@as(u16, 0x5678), h.ancount);
@@ -178,6 +185,52 @@ test "Header encode produces exact wire bytes" {
     };
     const expected = [_]u8{ 0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01 };
     try std.testing.expectEqualSlices(u8, &expected, &h.encode());
+}
+
+test "Header decodes AD and CD flags independently" {
+    // RFC 2535: byte3 = RA(1) Z(1) AD(1) CD(1) RCODE(4)
+    // byte3=0xA0 -> RA=1, Z=0, AD=1, CD=0, RCODE=0 (DNSSEC-validated response)
+    const wire = [_]u8{ 0x12, 0x34, 0x81, 0xA0, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+    const h = Header.decode(&wire);
+    try std.testing.expectEqual(@as(u1, 1), h.ra);
+    try std.testing.expectEqual(@as(u1, 0), h.z);
+    try std.testing.expectEqual(@as(u1, 1), h.ad);
+    try std.testing.expectEqual(@as(u1, 0), h.cd);
+    try std.testing.expectEqual(@as(u4, 0), h.rcode);
+}
+
+test "Header decodes CD flag independently" {
+    // byte3=0x10 -> RA=0, Z=0, AD=0, CD=1, RCODE=0 (checking-disabled query)
+    const wire = [_]u8{ 0x12, 0x34, 0x01, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const h = Header.decode(&wire);
+    try std.testing.expectEqual(@as(u1, 0), h.ra);
+    try std.testing.expectEqual(@as(u1, 0), h.z);
+    try std.testing.expectEqual(@as(u1, 0), h.ad);
+    try std.testing.expectEqual(@as(u1, 1), h.cd);
+    try std.testing.expectEqual(@as(u4, 0), h.rcode);
+}
+
+test "Header encodes AD and CD flags into byte3" {
+    const h = Header{
+        .id = 0x1234,
+        .rd = 0,
+        .tc = 0,
+        .aa = 0,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ad = 1,
+        .cd = 1,
+        .ra = 1,
+        .qdcount = 1,
+        .ancount = 1,
+        .nscount = 0,
+        .arcount = 0,
+    };
+    // byte3 = RA(1) Z(0) AD(1) CD(1) RCODE(0) = 0x80 | 0x20 | 0x10 = 0xB0
+    const encoded = h.encode();
+    try std.testing.expectEqual(@as(u8, 0xB0), encoded[3]);
 }
 
 test "Header decode matches parser's direct count reads" {
