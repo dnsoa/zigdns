@@ -6,6 +6,7 @@ const parseECS = @import("rdata.zig").parseECS;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
 const formatDnsName = @import("name.zig").formatDnsName;
+const Error = @import("errors.zig").Error;
 
 pub const Question = struct {
     qname_end_pos: usize, // Where the name ends in the buffer
@@ -27,9 +28,9 @@ pub fn CountedIterator(comptime T: type) type {
     return struct {
         parser: *MessageParser,
         remaining: u16,
-        nextFn: *const fn (*MessageParser) anyerror!?T,
+        nextFn: *const fn (*MessageParser) Error!?T,
 
-        pub fn next(self: *@This()) !?T {
+        pub fn next(self: *@This()) Error!?T {
             if (self.remaining == 0) return null;
 
             const item = try self.nextFn(self.parser);
