@@ -219,7 +219,7 @@ pub const Message = struct {
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
             try self.writeU16(0); // 占位 RDLength
-            try self.writeNameRaw(cname);
+            try self.writeName(cname); // RFC 1035 允许压缩 CNAME 的 rdata 域名
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
             self.countRecord();
@@ -236,7 +236,7 @@ pub const Message = struct {
             const rdlen_pos = self.pos;
             try self.writeU16(0); // 占位 RDLength
             try self.writeU16(preference);
-            try self.writeNameRaw(exchange);
+            try self.writeName(exchange); // RFC 1035 允许压缩 MX 的 exchange
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
             self.countRecord();
@@ -252,7 +252,7 @@ pub const Message = struct {
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
             try self.writeU16(0); // 占位 RDLength
-            try self.writeNameRaw(nsdname);
+            try self.writeName(nsdname); // RFC 1035 允许压缩 NS 的 rdata 域名
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
             self.countRecord();
@@ -268,7 +268,7 @@ pub const Message = struct {
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
             try self.writeU16(0); // 占位 RDLength
-            try self.writeNameRaw(ptrdname);
+            try self.writeName(ptrdname); // RFC 1035 允许压缩 PTR 的 rdata 域名
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
             self.countRecord();
@@ -313,8 +313,8 @@ pub const Message = struct {
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
             try self.writeU16(0); // 占位 RDLength
-            try self.writeNameRaw(mname);
-            try self.writeNameRaw(rname);
+            try self.writeName(mname); // RFC 1035 允许压缩 SOA 的 mname/rname
+            try self.writeName(rname);
             try self.writeU32(serial);
             try self.writeU32(refresh);
             try self.writeU32(retry);
@@ -346,7 +346,7 @@ pub const Message = struct {
             try self.writeU16(priority);
             try self.writeU16(weight);
             try self.writeU16(port);
-            try self.writeNameRaw(target);
+            try self.writeNameRaw(target); // RFC 2782: SRV target 不得压缩
             const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
             mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
             self.countRecord();
@@ -425,7 +425,19 @@ pub const Message = struct {
             self.pos += addr_len;
         }
 
-        /// 写入域名，支持压缩指针
+        /// 写入一串点分标签（不含结束符），每个标签带 1 字节长度前缀。
+        /// canonical 必须已通过 validateName（无空标签 / 无首尾点）。
+        fn writeLabels(self: *Builder, canonical: []const u8) !void {
+            var it = mem.splitScalar(u8, canonical, '.');
+            while (it.next()) |label| {
+                try self.ensureCapacity(1 + label.len);
+                self.buf[self.pos] = @intCast(label.len);
+                @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
+                self.pos += 1 + label.len;
+            }
+        }
+
+        /// 写入域名，支持压缩指针（含共享后缀压缩）。
         fn writeName(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
                 try self.ensureCapacity(1);
@@ -436,35 +448,36 @@ pub const Message = struct {
 
             const analyzed = try analyzeName(name);
             const canonical = analyzed.canonical;
-            const hash = analyzed.hash;
 
-            // 检查是否可以使用压缩指针（hash 命中后必须字节级确认，避免碰撞指向错误域名）
+            // 从最长后缀（整名）开始逐段缩短，寻找压缩表中已写入的可复用后缀。
+            // 命中后写「前缀标签 + 指向该后缀的指针」；hash 命中须字节级确认防碰撞。
             if (self.compression_count > 0) {
-                for (self.compression_table[0..self.compression_count]) |entry| {
-                    if (entry.hash == hash and entry.pos < 0x3FFF and self.nameMatchesAt(entry.pos, canonical)) {
-                        try self.ensureCapacity(2);
-                        self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
-                        self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
-                        self.pos += 2;
-                        return;
+                var s: usize = 0;
+                while (true) {
+                    const suffix = canonical[s..];
+                    const suffix_hash = if (s == 0) analyzed.hash else std.hash.Wyhash.hash(0, suffix);
+                    for (self.compression_table[0..self.compression_count]) |entry| {
+                        if (entry.hash == suffix_hash and entry.pos < 0x3FFF and self.nameMatchesAt(entry.pos, suffix)) {
+                            if (s > 0) try self.writeLabels(canonical[0 .. s - 1]); // 后缀前的前缀标签（去掉分隔点）
+                            try self.ensureCapacity(2);
+                            self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
+                            self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
+                            self.pos += 2;
+                            return;
+                        }
                     }
+                    const next_dot = mem.indexOfScalar(u8, canonical[s..], '.') orelse break;
+                    s += next_dot + 1;
                 }
             }
 
-            // 写入完整域名
+            // 无可复用后缀：写完整域名并把其各后缀记入压缩表。
             const start = self.pos;
-            var it = mem.splitScalar(u8, canonical, '.');
-            while (it.next()) |label| {
-                try self.ensureCapacity(1 + label.len);
-                self.buf[self.pos] = @intCast(label.len);
-                @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
-                self.pos += 1 + label.len;
-            }
+            try self.writeLabels(canonical);
             try self.ensureCapacity(1);
             self.buf[self.pos] = 0;
             self.pos += 1;
 
-            // 记录到压缩表（追踪后缀域名）
             if (self.compression_count < MAX_COMPRESSION) {
                 var label_it = mem.splitScalar(u8, canonical, '.');
                 var suffix_offset: usize = 0;
@@ -482,7 +495,7 @@ pub const Message = struct {
             }
         }
 
-        /// 写入原始域名（不压缩，用于 rdata 中的域名）
+        /// 写入完整展开、不压缩的域名（用于 RFC 2782 规定不得压缩的 SRV target）。
         fn writeNameRaw(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
                 try self.ensureCapacity(1);
@@ -492,13 +505,7 @@ pub const Message = struct {
             }
 
             const canonical = try validateName(name);
-            var it = mem.splitScalar(u8, canonical, '.');
-            while (it.next()) |label| {
-                try self.ensureCapacity(1 + label.len);
-                self.buf[self.pos] = @intCast(label.len);
-                @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
-                self.pos += 1 + label.len;
-            }
+            try self.writeLabels(canonical);
             try self.ensureCapacity(1);
             self.buf[self.pos] = 0;
             self.pos += 1;
@@ -592,7 +599,158 @@ test "Message.Builder compression pointer" {
     try std.testing.expectEqual(@as(usize, 16), pos2 - pos1);
 }
 
+test "Message.Builder compresses shared suffix" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    // 第一条 owner "example.com" 展开写入（偏移 12）。
+    try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 1 });
+    // 第二条 owner "www.example.com" 应压缩共享后缀：写 "www" 标签 + 指向 example.com 的指针。
+    const pos1 = builder.pos;
+    const name2_off = pos1;
+    try builder.addARecord("www.example.com", 3600, [_]u8{ 192, 0, 2, 2 });
+    const pos2 = builder.pos;
+
+    // owner 名字应为 "www"(4) + 指针(2) = 6 字节，而非完整 17 字节。
+    // 记录其余固定部分 2+2+4+2+4 = 14 字节。
+    try std.testing.expectEqual(@as(usize, 6 + 14), pos2 - pos1);
+
+    // 且必须能正确解析回完整域名。
+    const packet = builder.finish(.{
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
+    });
+    var parser = MessageParser.init(packet);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("example.com", try parser.formatNameAt(12, &nbuf));
+    try std.testing.expectEqualStrings("www.example.com", try parser.formatNameAt(name2_off, &nbuf));
+}
+
+test "Message.Builder compresses shorter shared suffix (com)" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    // "example.com" 展开写入，表中含 example.com@12 与 com@20。
+    try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 1 });
+    // "other.com" 与前者仅共享 "com"：整名/次长后缀均不匹配，应缩短到 "com" 命中。
+    const name2_off = builder.pos;
+    const pos1 = builder.pos;
+    try builder.addARecord("other.com", 3600, [_]u8{ 192, 0, 2, 2 });
+    const pos2 = builder.pos;
+
+    // owner = "other"(6) + 指向 com 的指针(2) = 8 字节；其余固定 14 字节。
+    try std.testing.expectEqual(@as(usize, 8 + 14), pos2 - pos1);
+
+    const packet = builder.finish(.{
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
+    });
+    var parser = MessageParser.init(packet);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("other.com", try parser.formatNameAt(name2_off, &nbuf));
+}
+
+test "Message.Builder compresses NS rdata name (RFC 1035 type)" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    // owner "example.com" 写在偏移 12 并入表；NS rdata "ns1.example.com"
+    // 应压缩共享后缀 -> "ns1"(4) + 指向 example.com 的指针(2) = 6 字节。
+    builder.setSection(.authority);
+    try builder.addNSRecord("example.com", 3600, "ns1.example.com");
+
+    const packet = builder.finish(.{
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
+    });
+
+    var parser = MessageParser.init(packet);
+    var rrs = parser.resourceRecords(1);
+    const rr = (try rrs.next()).?;
+    try std.testing.expectEqual(@as(u16, 6), rr.rdlength); // 压缩后仅 6 字节
+
+    const rdata = try parser.parseRData(rr);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("ns1.example.com", try rdata.NS.str(&nbuf));
+}
+
+test "Message.Builder does not compress SRV target (RFC 2782)" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    // 先写 A 记录令 "example.com" 入表；SRV target 与之共享后缀，
+    // 但 RFC 2782 规定 SRV target 不得压缩 -> 必须完整展开。
+    try builder.addARecord("example.com", 3600, .{ 1, 2, 3, 4 });
+    builder.setSection(.authority);
+    try builder.addSRVRecord("service.example.com", 3600, 10, 20, 5060, "sipserver.example.com");
+
+    const packet = builder.finish(.{
+        .id = 1,
+        .rd = 0,
+        .tc = 0,
+        .aa = 1,
+        .opcode = 0,
+        .qr = 1,
+        .rcode = 0,
+        .z = 0,
+        .ra = 0,
+        .qdcount = 0,
+        .ancount = 0,
+        .nscount = 0,
+        .arcount = 0,
+    });
+
+    var parser = MessageParser.init(packet);
+    try parser.skipResourceRecords(1); // 跳过 A 记录
+    var rrs = parser.resourceRecords(1);
+    const rr = (try rrs.next()).?;
+    // rdata = prio/weight/port(6) + 完整 "sipserver.example.com"(23) = 29，未压缩
+    try std.testing.expectEqual(@as(u16, 29), rr.rdlength);
+
+    const rdata = try parser.parseRData(rr);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("sipserver.example.com", try rdata.SRV.target.str(&nbuf));
+}
+
 test "Message.Builder addMXRecord" {
+    const MessageParser = @import("parser.zig").MessageParser;
     var buf: [512]u8 = undefined;
     var builder = Message.Builder.init(&buf);
 
@@ -601,8 +759,18 @@ test "Message.Builder addMXRecord" {
     const header = Header{ .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 1, .nscount = 0, .arcount = 0 };
     const packet = builder.finish(header);
 
-    // 12 + 13 (example.com) + 10 (fixed) + 2 (pref) + 18 (mail.example.com) = 55
-    try std.testing.expectEqual(@as(usize, 55), packet.len);
+    // exchange "mail.example.com" 压缩共享后缀 -> "mail"(5) + 指针(2) = 7（而非完整 18）。
+    // 12 + 13 (example.com) + 10 (fixed) + 2 (pref) + 7 (mail + ptr) = 44
+    try std.testing.expectEqual(@as(usize, 44), packet.len);
+
+    // 压缩后仍能正确解析 exchange 域名。
+    var parser = MessageParser.init(packet);
+    var rrs = parser.resourceRecords(1);
+    const rr = (try rrs.next()).?;
+    const rdata = try parser.parseRData(rr);
+    try std.testing.expectEqual(@as(u16, 10), rdata.MX.preference);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("mail.example.com", try rdata.MX.exchange.str(&nbuf));
 }
 
 test "Message.Builder returns BufferTooSmall on short destination" {
