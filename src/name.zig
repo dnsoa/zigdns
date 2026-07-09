@@ -1,6 +1,65 @@
 const std = @import("std");
 const mem = std.mem;
 
+// RFC 1035 2.3.4: 单标签 ≤63 字节，完整域名 ≤255 字节。
+const MAX_LABEL = 63;
+const MAX_NAME = 255;
+// 单个域名跟随压缩指针的次数上限。合法域名远用不到这么多，纯粹用于防止
+// 指针环导致死循环（纯指针跳转不增长 total，故必须独立限次）。
+const MAX_POINTER_JUMPS = 128;
+
+/// 域名遍历游标：所有「跟随压缩指针」的读取逻辑的唯一实现。
+/// 逐标签推进，跟随 0xC0 压缩指针，统一强制 RFC 上限（label≤63 / name≤255）、
+/// 边界检查与指针跳转限次（防环）。零拷贝——返回指向原缓冲区的标签切片。
+///
+/// 语义：一个游标实例遍历「一个」完整域名——`total`（累计长度，用于 255 上限）
+/// 与 `jumps`（指针跳转计数，用于防环）跨多次 `next()` 累积。
+pub const NameCursor = struct {
+    buffer: []const u8,
+    pos: usize,
+    total: usize = 0,
+    jumps: usize = 0,
+
+    pub fn init(buffer: []const u8, offset: usize) NameCursor {
+        return .{ .buffer = buffer, .pos = offset };
+    }
+
+    /// 推进到下一个标签，返回其字节切片；遇结束符返回 null。
+    /// 跟随压缩指针；对非法/越界/超长/成环输入返回相应错误（绝不 panic）。
+    pub fn next(self: *NameCursor) !?[]const u8 {
+        while (true) {
+            if (self.pos >= self.buffer.len) return error.PacketTooShort;
+
+            const len = self.buffer[self.pos];
+            if (len == 0) {
+                self.pos += 1;
+                return null; // 结束符
+            }
+
+            // 压缩指针 (0xC0)：跟随目标，限次防环。
+            if (len & 0xC0 == 0xC0) {
+                if (self.pos + 1 >= self.buffer.len) return error.PacketTooShort;
+                const offset = (@as(usize, len & 0x3F) << 8) | self.buffer[self.pos + 1];
+                if (offset >= self.buffer.len) return error.InvalidOffset;
+                if (self.jumps >= MAX_POINTER_JUMPS) return error.MalformedName;
+                self.jumps += 1;
+                self.pos = offset;
+                continue;
+            }
+
+            if (len > MAX_LABEL) return error.LabelTooLong;
+            const start = self.pos + 1;
+            if (start + len > self.buffer.len) return error.PacketTooShort;
+
+            self.total += 1 + len;
+            if (self.total > MAX_NAME) return error.NameTooLong;
+
+            self.pos = start + len;
+            return self.buffer[start .. start + len];
+        }
+    }
+};
+
 /// 零拷贝域名解析器
 /// 不分配内存，仅返回指向原始数据包的切片迭代器
 pub const NameIterator = struct {
@@ -8,39 +67,10 @@ pub const NameIterator = struct {
     pos: u16,
 
     pub fn next(self: *NameIterator) !?[]const u8 {
-        var visited_offsets: [16]u16 = undefined;
-        var visited_count: usize = 0;
-
-        while (true) {
-            if (self.pos >= self.buffer.len) return error.PacketTooShort;
-
-            const len = self.buffer[self.pos];
-            if (len == 0) return null; // 结束符
-
-            // 处理指针压缩 (0xC0)
-            if (len & 0xC0 == 0xC0) {
-                if (self.pos + 1 >= self.buffer.len) return error.PacketTooShort;
-
-                const offset = mem.readInt(u16, self.buffer[self.pos..][0..2], .big) & 0x3FFF;
-                if (offset >= self.buffer.len) return error.InvalidOffset;
-
-                for (visited_offsets[0..visited_count]) |visited| {
-                    if (visited == offset) return error.MalformedName;
-                }
-                if (visited_count >= visited_offsets.len) return error.MalformedName;
-                visited_offsets[visited_count] = @intCast(offset);
-                visited_count += 1;
-                self.pos = @intCast(offset);
-                continue;
-            }
-
-            if (len > 63) return error.LabelTooLong;
-            if (@as(usize, self.pos) + 1 + len > self.buffer.len) return error.PacketTooShort;
-
-            const label = self.buffer[self.pos + 1 .. self.pos + 1 + len];
-            self.pos += 1 + len;
-            return label;
-        }
+        var cur = NameCursor.init(self.buffer, self.pos);
+        const label = try cur.next();
+        self.pos = @intCast(cur.pos);
+        return label;
     }
 };
 
@@ -93,46 +123,11 @@ test "NameIterator empty domain" {
 /// out_buf: 输出缓冲区，必须足够大（最多 253 字节 + 1）
 /// 返回: 写入 out_buf 的字符串切片
 pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 {
-    var read_pos: usize = pos;
+    var cur = NameCursor.init(buffer, pos);
     var write_pos: usize = 0;
     var first_label = true;
-    var visited_offsets: [16]usize = undefined;
-    var visited_count: usize = 0;
 
-    while (read_pos < buffer.len) {
-        const len = buffer[read_pos];
-
-        // 结束符
-        if (len == 0) {
-            if (write_pos == 0) {
-                // 根域名
-                if (out_buf.len == 0) return error.BufferTooSmall;
-                out_buf[write_pos] = '.';
-                write_pos += 1;
-            }
-            return out_buf[0..write_pos];
-        }
-
-        // 指针压缩
-        if (len & 0xC0 == 0xC0) {
-            if (read_pos + 1 >= buffer.len) return error.PacketTooShort;
-            const offset = mem.readInt(u16, buffer[read_pos..][0..2], .big) & 0x3FFF;
-            if (offset >= buffer.len) return error.InvalidOffset;
-
-            for (visited_offsets[0..visited_count]) |visited| {
-                if (visited == offset) return error.MalformedName;
-            }
-            if (visited_count >= visited_offsets.len) return error.MalformedName;
-            visited_offsets[visited_count] = offset;
-            visited_count += 1;
-            read_pos = offset;
-            continue;
-        }
-
-        // 验证标签长度
-        if (len > 63) return error.LabelTooLong;
-        if (read_pos + 1 + len > buffer.len) return error.PacketTooShort;
-
+    while (try cur.next()) |label| {
         // 添加点分隔符（第一个标签前不加）
         if (!first_label) {
             if (write_pos >= out_buf.len) return error.BufferTooSmall;
@@ -141,16 +136,18 @@ pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 
         }
         first_label = false;
 
-        // 检查输出缓冲区大小
-        if (write_pos + len > out_buf.len) return error.BufferTooSmall;
-
-        // 复制标签内容
-        @memcpy(out_buf[write_pos .. write_pos + len], buffer[read_pos + 1 .. read_pos + 1 + len]);
-        write_pos += len;
-        read_pos += 1 + len;
+        if (write_pos + label.len > out_buf.len) return error.BufferTooSmall;
+        @memcpy(out_buf[write_pos .. write_pos + label.len], label);
+        write_pos += label.len;
     }
 
-    return error.MalformedName;
+    // 根域名（无标签）返回 "."
+    if (write_pos == 0) {
+        if (out_buf.len == 0) return error.BufferTooSmall;
+        out_buf[0] = '.';
+        return out_buf[0..1];
+    }
+    return out_buf[0..write_pos];
 }
 
 /// 自包含的域名引用：{完整报文缓冲区, 域名起始偏移}。
@@ -251,4 +248,30 @@ test "NameIterator detects invalid pointer offset" {
     var iter = NameIterator{ .buffer = &buffer, .pos = 0 };
 
     try std.testing.expectError(error.InvalidOffset, iter.next());
+}
+
+test "formatDnsName rejects name exceeding 255 bytes" {
+    // 5 个 63 字节标签 = 320 字节 name，远超 RFC 1035 的 255 上限。
+    // out_buf 给足 512，确保「不是因缓冲区太小而失败，而是因超长而失败」。
+    var buf: [512]u8 = undefined;
+    @memset(&buf, 0);
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        buf[pos] = 63;
+        @memset(buf[pos + 1 ..][0..63], 'a');
+        pos += 64;
+    }
+    buf[pos] = 0;
+
+    var out: [512]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, formatDnsName(&buf, 0, &out));
+}
+
+test "NameCursor terminates on pointer loop" {
+    // 两个互指的压缩指针形成环：offset0 -> 2, offset2 -> 0。
+    // 跳转限次必须让它报错而非死循环。
+    const buf = [_]u8{ 0xC0, 0x02, 0xC0, 0x00 };
+    var out: [256]u8 = undefined;
+    try std.testing.expectError(error.MalformedName, formatDnsName(&buf, 0, &out));
 }

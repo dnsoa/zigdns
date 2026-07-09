@@ -4,6 +4,8 @@ const ECSData = @import("types.zig").ECSData;
 const Type = @import("types.zig").Type;
 const parseECS = @import("rdata.zig").parseECS;
 const RData = @import("rdata.zig").RData;
+const NameCursor = @import("name.zig").NameCursor;
+const formatDnsName = @import("name.zig").formatDnsName;
 
 pub const Question = struct {
     qname_end_pos: usize, // Where the name ends in the buffer
@@ -198,156 +200,32 @@ pub const MessageParser = struct {
     pub fn nameEqualsAt(self: *const MessageParser, offset: usize, expected: []const u8) !bool {
         if (offset >= self.buffer.len) return error.InvalidOffset;
 
-        var read_pos = offset;
+        var cur = NameCursor.init(self.buffer, offset);
         var expected_pos: usize = 0;
-        var redirects: u8 = 16;
         var first_label = true;
 
-        while (read_pos < self.buffer.len) {
-            const len = self.buffer[read_pos];
-
-            if (len == 0) {
-                return expected_pos == expected.len;
-            }
-
-            if (len & 0xC0 == 0xC0) {
-                if (read_pos + 1 >= self.buffer.len) return error.PacketTooShort;
-                if (redirects == 0) return error.MalformedName;
-                redirects -= 1;
-                read_pos = ((@as(u16, len & 0x3F)) << 8) | self.buffer[read_pos + 1];
-                if (read_pos >= self.buffer.len) return error.InvalidOffset;
-                continue;
-            }
-
-            if (len > 63) return error.LabelTooLong;
-            if (read_pos + 1 + len > self.buffer.len) return error.PacketTooShort;
-
+        while (try cur.next()) |label| {
             if (!first_label) {
                 if (expected_pos >= expected.len or expected[expected_pos] != '.') return false;
                 expected_pos += 1;
             }
             first_label = false;
 
-            if (expected_pos + len > expected.len) return false;
-            if (!mem.eql(u8, self.buffer[read_pos + 1 .. read_pos + 1 + len], expected[expected_pos .. expected_pos + len])) {
-                return false;
-            }
-
-            expected_pos += len;
-            read_pos += 1 + len;
+            if (expected_pos + label.len > expected.len) return false;
+            if (!mem.eql(u8, label, expected[expected_pos .. expected_pos + label.len])) return false;
+            expected_pos += label.len;
         }
 
-        return error.MalformedName;
+        return expected_pos == expected.len;
     }
 
-    fn formatNameFast(self: *const MessageParser, start_offset: usize, out_buf: []u8) !?[]const u8 {
-        var read_pos = start_offset;
-        var write_pos: usize = 0;
-
-        while (read_pos < self.buffer.len) {
-            const len = self.buffer[read_pos];
-
-            if (len == 0) {
-                if (write_pos == 0) {
-                    if (out_buf.len == 0) return error.BufferTooSmall;
-                    out_buf[0] = '.';
-                    return out_buf[0..1];
-                }
-                return out_buf[0..write_pos];
-            }
-
-            if (len & 0xC0 == 0xC0) return null;
-            if (len > 63) return error.LabelTooLong;
-            if (read_pos + 1 + len > self.buffer.len) return error.PacketTooShort;
-
-            if (write_pos != 0) {
-                if (write_pos >= out_buf.len) return error.BufferTooSmall;
-                out_buf[write_pos] = '.';
-                write_pos += 1;
-            }
-
-            if (write_pos + len > out_buf.len) return error.BufferTooSmall;
-            @memcpy(out_buf[write_pos .. write_pos + len], self.buffer[read_pos + 1 .. read_pos + 1 + len]);
-            write_pos += len;
-            read_pos += 1 + len;
-        }
-
-        return error.MalformedName;
-    }
-
-    /// Format a DNS name at a specific offset in the packet
-    /// Follows compression pointers and returns dotted format
+    /// Format a DNS name at a specific offset in the packet.
+    /// Follows compression pointers and returns dotted format.
+    /// 委托给 name.zig 的 `formatDnsName`（基于统一的 `NameCursor`），
+    /// 保留入口 InvalidOffset 语义。
     pub fn formatNameAt(self: *const MessageParser, offset: usize, out_buf: []u8) ![]const u8 {
         if (offset >= self.buffer.len) return error.InvalidOffset;
-
-        const first_len = self.buffer[offset];
-        if (first_len & 0xC0 == 0xC0) {
-            if (offset + 1 >= self.buffer.len) return error.PacketTooShort;
-
-            const ptr = ((@as(u16, first_len & 0x3F)) << 8) | self.buffer[offset + 1];
-            if (ptr >= self.buffer.len) return error.InvalidOffset;
-
-            if (try self.formatNameFast(ptr, out_buf)) |name| {
-                return name;
-            }
-        }
-
-        var read_pos: usize = offset;
-        var write_pos: usize = 0;
-        var first_label = true;
-        var visited_offsets: [16]usize = undefined; // Track visited offsets to detect loops
-        var visited_count: usize = 0;
-
-        while (read_pos < self.buffer.len) {
-            const len = self.buffer[read_pos];
-
-            // 结束符
-            if (len == 0) {
-                if (write_pos == 0) {
-                    out_buf[write_pos] = '.';
-                    write_pos += 1;
-                }
-                return out_buf[0..write_pos];
-            }
-
-            // 指针压缩 - 跟随指针
-            if (len & 0xC0 == 0xC0) {
-                const offset_ptr = mem.readInt(u16, self.buffer[read_pos..][0..2], .big) & 0x3FFF;
-
-                // 检测循环引用
-                for (visited_offsets[0..visited_count]) |v| {
-                    if (v == offset_ptr) return error.MalformedName;
-                }
-                if (visited_count >= 16) return error.MalformedName; // Too many redirects
-                visited_offsets[visited_count] = offset_ptr;
-                visited_count += 1;
-
-                read_pos = offset_ptr;
-                continue;
-            }
-
-            // 验证标签长度
-            if (len > 63) return error.LabelTooLong;
-            if (read_pos + 1 + len > self.buffer.len) return error.PacketTooShort;
-
-            // 添加点分隔符（第一个标签前不加）
-            if (!first_label) {
-                if (write_pos >= out_buf.len) return error.BufferTooSmall;
-                out_buf[write_pos] = '.';
-                write_pos += 1;
-            }
-            first_label = false;
-
-            // 检查输出缓冲区大小
-            if (write_pos + len > out_buf.len) return error.BufferTooSmall;
-
-            // 复制标签内容
-            @memcpy(out_buf[write_pos .. write_pos + len], self.buffer[read_pos + 1 .. read_pos + 1 + len]);
-            write_pos += len;
-            read_pos += 1 + len;
-        }
-
-        return error.MalformedName;
+        return formatDnsName(self.buffer, offset, out_buf);
     }
 
     /// Parse a resource record's RDATA. Domain names inside RDATA are returned as
