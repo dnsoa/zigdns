@@ -112,9 +112,9 @@ qdcount = readInt(u16, data[4..6], .big); // ancount/nscount/arcount 同理
 
 RFC 2535 起 byte3 为 `RA(1) Z(1) AD(1) CD(1) RCODE(4)`。当前 `z: u3` 吞掉了 AD、CD。DNSSEC-aware 解析需要独立的 AD/CD 位。**待办**：随 P0-1 重做 header 时拆分。
 
-### 9. EDNS 只能读不能写
+### 9. EDNS 只能读不能写 — ✅ 已修复
 
-可 `findOptRecord`/`findECS`/`parseECS`，但 Builder **没有** `addOptRecord` / 写 ECS 的能力。作为 server/client 无法生成 EDNS 响应或带 ECS 的查询。**待办**：补 OPT/ECS 构造 API。
+> **状态：已修复** 新增 `Builder.addOptRecord(Edns)`：自动置于附加区并计数，写入 OPT 记录（root name / CLASS=UDP 载荷大小 / TTL 编码 extended-rcode+version+DO 标志），`Edns.ecs` 非空时附带 ECS 选项（按 RFC 7871 校验 family/prefix/地址长度）。另有低级 `addOptRecordRaw(udp_size, ttl, options)` 供自定义选项。`Edns` 已导出。原子回滚同其他 add*。新增 round-trip（含 DO 标志与 ECS 解析回验）、裸 EDNS、非法 ECS 拒绝三个测试。Cookie/其他 EDNS 选项待后续。
 
 ### 10. ECS 地址长度未按 family/prefix 校验 — ✅ 已修复
 

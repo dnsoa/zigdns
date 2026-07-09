@@ -235,6 +235,20 @@ header.tc = if (truncated) 1 else 0;
 const packet = builder.finish(header);
 ```
 
+Attach EDNS(0) — an OPT record goes in the additional section, and `addOptRecord`
+places it there and counts it automatically:
+
+```zig
+try builder.addQuestion("example.com", .A, 1);
+try builder.addOptRecord(.{
+    .udp_payload_size = 1232,
+    .dnssec_ok = true,
+    .ecs = .{ .family = 1, .source_prefix = 24, .scope_prefix = 0,
+              .address = &[_]u8{ 192, 0, 2 } }, // 192.0.2.0/24
+});
+// use addOptRecordRaw(udp_size, ttl, options) to supply your own option bytes
+```
+
 For DNS-over-TCP, use the 2-byte length-prefix framing helpers:
 
 ```zig

@@ -2,6 +2,8 @@ const std = @import("std");
 const mem = std.mem;
 const Header = @import("header.zig").Header;
 const Type = @import("types.zig").Type;
+const OptionCode = @import("types.zig").OptionCode;
+const ECSData = @import("types.zig").ECSData;
 const Error = @import("errors.zig").Error;
 
 const MAX_COMPRESSION = 32; // 最多追踪 32 个域名
@@ -9,6 +11,15 @@ const MAX_NAME_LENGTH = 255;
 
 /// DNS 报文分区（RFC 1035 4.1）。构造时记录必须按此顺序添加。
 pub const Section = enum { question, answer, authority, additional };
+
+/// EDNS(0) OPT 记录参数（RFC 6891 / 7871）。
+pub const Edns = struct {
+    udp_payload_size: u16 = 1232, // 存于 OPT 记录的 CLASS 字段
+    extended_rcode: u8 = 0, // 扩展 RCODE 高 8 位（存于 TTL[31:24]）
+    version: u8 = 0, // EDNS 版本（存于 TTL[23:16]）
+    dnssec_ok: bool = false, // DO 标志（存于 TTL flags 最高位）
+    ecs: ?ECSData = null, // 若设置则写入 ECS 选项
+};
 
 /// 核心解析/构造器
 pub const Message = struct {
@@ -352,6 +363,68 @@ pub const Message = struct {
             self.qd += 1;
         }
 
+        /// 写入 EDNS(0) OPT 记录（RFC 6891）。自动置于附加区（additional）。
+        /// 若 edns.ecs 非空，附带 ECS 选项（RFC 7871）。
+        pub fn addOptRecord(self: *Builder, edns: Edns) !void {
+            self.setSection(.additional);
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
+
+            try self.writeU8(0); // OPT 的 owner name 必须为根
+            try self.writeU16(@intFromEnum(Type.OPT));
+            try self.writeU16(edns.udp_payload_size); // CLASS = 请求方 UDP 载荷大小
+            const flags: u32 = if (edns.dnssec_ok) 0x8000 else 0;
+            const ttl = (@as(u32, edns.extended_rcode) << 24) |
+                (@as(u32, edns.version) << 16) | flags;
+            try self.writeU32(ttl);
+
+            const rdlen_pos = self.pos;
+            try self.writeU16(0); // 占位 RDLength
+            if (edns.ecs) |ecs| try self.writeEcsOption(ecs);
+            const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
+            mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.countRecord();
+        }
+
+        /// 低级：写入 OPT 记录，options 为调用方自行编码的完整 RDATA。
+        pub fn addOptRecordRaw(self: *Builder, udp_payload_size: u16, ttl: u32, options: []const u8) !void {
+            if (options.len > 0xFFFF) return Error.MessageTooLong;
+            self.setSection(.additional);
+            const snap = self.snapshot();
+            errdefer self.restore(snap);
+
+            try self.writeU8(0);
+            try self.writeU16(@intFromEnum(Type.OPT));
+            try self.writeU16(udp_payload_size);
+            try self.writeU32(ttl);
+            try self.writeU16(@intCast(options.len));
+            try self.ensureCapacity(options.len);
+            @memcpy(self.buf[self.pos..][0..options.len], options);
+            self.pos += options.len;
+            self.countRecord();
+        }
+
+        /// 写入 ECS 选项 TLV（RFC 7871）。按 family/prefix 校验地址长度。
+        fn writeEcsOption(self: *Builder, ecs: ECSData) !void {
+            const max_prefix: u8 = switch (ecs.family) {
+                1 => 32, // IPv4
+                2 => 128, // IPv6
+                else => return Error.MalformedECS,
+            };
+            if (ecs.source_prefix > max_prefix) return Error.MalformedECS;
+            const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
+            if (ecs.address.len < addr_len) return Error.MalformedECS;
+
+            try self.writeU16(@intFromEnum(OptionCode.ECS));
+            try self.writeU16(@intCast(4 + addr_len)); // OPTION-LENGTH
+            try self.writeU16(ecs.family);
+            try self.writeU8(ecs.source_prefix);
+            try self.writeU8(ecs.scope_prefix);
+            try self.ensureCapacity(addr_len);
+            @memcpy(self.buf[self.pos..][0..addr_len], ecs.address[0..addr_len]);
+            self.pos += addr_len;
+        }
+
         /// 写入域名，支持压缩指针
         fn writeName(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
@@ -428,6 +501,12 @@ pub const Message = struct {
             }
             try self.ensureCapacity(1);
             self.buf[self.pos] = 0;
+            self.pos += 1;
+        }
+
+        fn writeU8(self: *Builder, val: u8) !void {
+            try self.ensureCapacity(1);
+            self.buf[self.pos] = val;
             self.pos += 1;
         }
 
@@ -621,6 +700,78 @@ test "Message.parseTcp rejects truncated frame" {
     var buf: [10]u8 = undefined;
     mem.writeInt(u16, buf[0..2], 100, .big);
     try std.testing.expectError(error.PacketTooShort, Message.parseTcp(&buf));
+}
+
+test "Message.Builder addOptRecord with ECS round-trips" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+
+    try builder.addQuestion("example.com", .A, 1);
+    try builder.addOptRecord(.{
+        .udp_payload_size = 4096,
+        .dnssec_ok = true,
+        .ecs = .{ .family = 1, .source_prefix = 24, .scope_prefix = 0, .address = &[_]u8{ 192, 0, 2 } },
+    });
+
+    const packet = builder.finish(.{
+        .id = 1, .rd = 0, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0,
+        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+    });
+
+    const msg = try Message.parse(packet);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 0), msg.header.ancount);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.arcount);
+
+    var parser = MessageParser.init(packet);
+    try parser.skipQuestions(msg.header.qdcount);
+    try parser.skipResourceRecords(msg.header.ancount + msg.header.nscount);
+
+    const opt = (try parser.findOptRecord(msg.header.arcount)).?;
+    try std.testing.expectEqual(Type.OPT, opt.rtype);
+    try std.testing.expectEqual(@as(u16, 4096), opt.class); // UDP payload size
+    try std.testing.expect((opt.ttl & 0x8000) != 0); // DO flag
+    try std.testing.expectEqual(@as(u8, 0), @as(u8, @truncate(opt.ttl >> 16))); // version 0
+
+    const ecs = (try parser.findECS(msg.header.arcount)).?;
+    try std.testing.expectEqual(@as(u16, 1), ecs.family);
+    try std.testing.expectEqual(@as(u8, 24), ecs.source_prefix);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2 }, ecs.address);
+}
+
+test "Message.Builder addOptRecord without ECS (bare EDNS)" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+    try builder.addQuestion("example.com", .A, 1);
+    try builder.addOptRecord(.{ .udp_payload_size = 1232 });
+
+    const packet = builder.finish(.{
+        .id = 1, .rd = 1, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0,
+        .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0,
+    });
+    const msg = try Message.parse(packet);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.arcount);
+
+    var parser = MessageParser.init(packet);
+    try parser.skipQuestions(msg.header.qdcount);
+    const opt = (try parser.findOptRecord(msg.header.arcount)).?;
+    try std.testing.expectEqual(@as(u16, 1232), opt.class);
+    try std.testing.expectEqual(@as(u16, 0), opt.rdlength); // 无选项
+    try std.testing.expect((opt.ttl & 0x8000) == 0); // 未设 DO
+}
+
+test "Message.Builder addOptRecord rejects invalid ECS" {
+    var buf: [512]u8 = undefined;
+    var builder = Message.Builder.init(&buf);
+    // IPv4 prefix=24 需 3 字节，但只给 2 字节
+    try std.testing.expectError(error.MalformedECS, builder.addOptRecord(.{
+        .ecs = .{ .family = 1, .source_prefix = 24, .scope_prefix = 0, .address = &[_]u8{ 192, 0 } },
+    }));
+    // 失败后应原子回滚：pos 回到初始 header 之后
+    try std.testing.expectEqual(@as(usize, 12), builder.pos);
+    try std.testing.expectEqual(@as(u16, 0), builder.ar);
 }
 
 test "Message.Builder compression verifies bytes on hash collision" {

@@ -14,6 +14,7 @@ pub const ECSData = @import("types.zig").ECSData;
 
 pub const Message = @import("message.zig").Message;
 pub const Section = @import("message.zig").Section;
+pub const Edns = @import("message.zig").Edns;
 pub const MessageParser = @import("parser.zig").MessageParser;
 pub const ResourceData = @import("rdata.zig").RData;
 
