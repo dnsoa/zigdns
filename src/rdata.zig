@@ -56,6 +56,8 @@ pub fn parseECS(rdata: []const u8) !?ECSData {
         }
         pos += len;
     }
+    // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
+    if (pos != rdata.len) return error.InvalidRData;
     return null;
 }
 
@@ -122,6 +124,23 @@ pub const SvcbData = struct {
         return .{ .data = self.params };
     }
 };
+
+/// 校验 SvcParams 原始字节（RFC 9460 §2.2）：各 TLV 恰好平铺，且 SvcParamKey
+/// 按数值严格递增（因而自动去重）。空 params（AliasMode）合法。
+pub fn validateSvcParams(params: []const u8) !void {
+    var pos: usize = 0;
+    var prev_key: i32 = -1;
+    while (pos < params.len) {
+        if (pos + 4 > params.len) return error.InvalidRData;
+        const key = mem.readInt(u16, params[pos..][0..2], .big);
+        const plen = mem.readInt(u16, params[pos + 2 ..][0..2], .big);
+        if (@as(i32, key) <= prev_key) return error.InvalidRData; // 严格递增 + 去重
+        prev_key = key;
+        pos += 4;
+        if (pos + plen > params.len) return error.InvalidRData;
+        pos += plen;
+    }
+}
 
 /// NSEC/NSEC3 类型位图（RFC 4034 §4.1.2）：window块(1)+位图长度(1)+位图 的窗口序列。
 /// 零拷贝保留原始字节；迭代产出所有置位的 RR 类型编号（升序）。
@@ -235,6 +254,8 @@ pub fn parseCookie(rdata: []const u8) !?CookieData {
         }
         pos += len;
     }
+    // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
+    if (pos != rdata.len) return error.InvalidRData;
     return null;
 }
 
@@ -419,15 +440,8 @@ pub const RData = union(Type) {
                 const priority = mem.readInt(u16, data[0..2], .big);
                 var pos: usize = 2;
                 try advanceNameNoPointer(data, &pos); // TargetName 不得压缩（RFC 9460 §2.2）
-                // 校验 SvcParams 各 TLV 恰好平铺剩余字节。
-                var pp = pos;
-                while (pp < data.len) {
-                    if (pp + 4 > data.len) return error.InvalidRData;
-                    const plen = mem.readInt(u16, data[pp + 2 ..][0..2], .big);
-                    pp += 4;
-                    if (pp + plen > data.len) return error.InvalidRData;
-                    pp += plen;
-                }
+                // 校验 SvcParams：TLV 平铺 + key 严格递增去重（RFC 9460 §2.2）。
+                try validateSvcParams(data[pos..]);
                 const svcb = SvcbData{
                     .priority = priority,
                     .target = Name{ .buffer = msg, .offset = rdata_offset + 2 },
@@ -806,6 +820,29 @@ test "parseCookie rejects invalid cookie length" {
     // len=9：既非 8 也不在 16..40 -> 非法
     const rdata = "\x00\x0a\x00\x09" ++ "\x01\x02\x03\x04\x05\x06\x07\x08\x09";
     try std.testing.expectError(error.MalformedCookie, parseCookie(rdata));
+}
+
+test "parseECS rejects trailing bytes that don't form a TLV" {
+    // 一个完整的非 ECS 选项 (COOKIE code=10,len=8) + 2 字节残尾 -> 畸形，不得当成"无 ECS"。
+    const rdata = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08" ++ "\xff\xff";
+    try std.testing.expectError(error.InvalidRData, parseECS(rdata));
+}
+
+test "parseCookie rejects trailing bytes that don't form a TLV" {
+    // 一个完整的 ECS 选项 + 2 字节残尾 -> 畸形，不得当成"无 COOKIE"。
+    const rdata = "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02" ++ "\xff\xff";
+    try std.testing.expectError(error.InvalidRData, parseCookie(rdata));
+}
+
+test "RData parse SVCB rejects out-of-order SvcParam keys (RFC 9460)" {
+    // priority + 根 target + key=3 然后 key=1（递减，违反严格递增）
+    const rdata = "\x00\x01" ++ "\x00" ++ "\x00\x03\x00\x00" ++ "\x00\x01\x00\x00";
+    try std.testing.expectError(error.InvalidRData, RData.parse(.SVCB, rdata, 0, rdata.len));
+}
+
+test "RData parse SVCB rejects duplicate SvcParam keys" {
+    const rdata = "\x00\x01" ++ "\x00" ++ "\x00\x01\x00\x00" ++ "\x00\x01\x00\x00";
+    try std.testing.expectError(error.InvalidRData, RData.parse(.SVCB, rdata, 0, rdata.len));
 }
 
 test "parseCookie returns null when no cookie option present" {

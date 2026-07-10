@@ -9,6 +9,7 @@ const Error = @import("errors.zig").Error;
 const ResourceRecord = @import("parser.zig").ResourceRecord;
 const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
+const validateSvcParams = @import("rdata.zig").validateSvcParams;
 
 const MAX_COMPRESSION = 32; // 最多追踪 32 个域名
 const MAX_NAME_LENGTH = 255;
@@ -481,6 +482,7 @@ pub const Message = struct {
         }
 
         fn addSvcbLike(self: *Builder, rtype: Type, name: []const u8, ttl: u32, priority: u16, target: []const u8, params: []const u8) !void {
+            try validateSvcParams(params); // RFC 9460 §2.2: key 须严格递增去重、TLV 平铺
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
@@ -1246,6 +1248,13 @@ test "Message.Builder addCAARecord rejects empty/oversized tag" {
     var big: [256]u8 = undefined;
     @memset(&big, 'a');
     try std.testing.expectError(error.LabelTooLong, builder.addCAARecord("example.com", 3600, 0, &big, "x"));
+}
+
+test "Message.Builder addSVCBRecord rejects out-of-order SvcParams (RFC 9460)" {
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    const params = "\x00\x03\x00\x00" ++ "\x00\x01\x00\x00"; // key 3 然后 key 1，递减非法
+    try std.testing.expectError(error.InvalidRData, builder.addSVCBRecord("svc.example.com", 3600, 1, "svc.example.com", params));
 }
 
 test "Message.Builder addHTTPSRecord round-trips with uncompressed target (RFC 9460)" {
