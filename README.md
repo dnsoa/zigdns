@@ -5,9 +5,10 @@ A high-performance DNS protocol library for Zig, featuring zero-copy packet pars
 ## Features
 
 - **Zero-copy parsing**: All parsed data references the original buffer - no allocations
-- **Compression support**: Automatic compression pointer handling when encoding
-- **Comprehensive record types**: A, AAAA, CNAME, NS, MX, TXT, PTR, SOA, SRV
-- **EDNS0 support**: OPT records with ECS (Client Subnet) parsing
+- **Compression support**: Automatic compression pointer following on parse; shared-suffix compression on encode
+- **Comprehensive record types**: A, AAAA, CNAME, NS, MX, TXT, PTR, SOA, SRV, CAA, SVCB, HTTPS
+- **EDNS0 support**: OPT records with ECS (Client Subnet, RFC 7871) and DNS Cookies (RFC 7873)
+- **DNSSEC**: DNSKEY, DS, RRSIG, NSEC, NSEC3, NSEC3PARAM parsing and construction, key tag computation, type bitmaps, canonical ordering (RFC 4034 / 5155)
 - **Type-safe**: Zig's type system ensures correctness at compile time
 - **RFC compliant**: Follows RFC 1035, RFC 1034, and related standards
 
@@ -286,6 +287,18 @@ while (try iter.next()) |label| {
 | TXT | Text record | `addTXTRecord()` |
 | SOA | Start of authority | `addSOARecord()` |
 | SRV | Service record | `addSRVRecord()` |
+| CAA | Certification authority authorization (RFC 8659) | `addCAARecord()` |
+| SVCB | Service binding (RFC 9460) | `addSVCBRecord()` |
+| HTTPS | HTTPS service binding (RFC 9460) | `addHTTPSRecord()` |
+| DNSKEY | DNS public key (RFC 4034) | `addDNSKEYRecord()` |
+| DS | Delegation signer (RFC 4034) | `addDSRecord()` |
+| RRSIG | Resource record signature (RFC 4034) | `addRRSIGRecord()` |
+| NSEC | Next secure record (RFC 4034) | `addNSECRecord()` |
+| NSEC3 | Hashed NSEC (RFC 5155) | `addNSEC3Record()` |
+| NSEC3PARAM | NSEC3 parameters (RFC 5155) | `addNSEC3PARAMRecord()` |
+| OPT | EDNS(0) | `addOptRecord()` |
+
+Unknown or non-IN-class records can be served verbatim via `addRecordRaw()` (RFC 3597).
 
 ### Error Handling
 
@@ -296,6 +309,7 @@ pub const Error = error{
     PacketTooShort,
     MalformedName,
     MalformedECS,
+    MalformedCookie,
     LabelTooLong,
     NameTooLong,
     InvalidRData,
@@ -306,6 +320,8 @@ pub const Error = error{
     UnknownClass,
     InvalidOffset,
     MessageTooLong,
+    MultipleOptRecords, // RFC 6891 §6.1.1: more than one OPT record → FORMERR
+    InvalidRecordOrder, // Builder misuse: section regression, or question after an RR
 };
 ```
 
@@ -400,9 +416,8 @@ Native segmented-buffer parsing is a possible future direction.
 
 ## Limitations
 
-- No dynamic domain name compression (planned)
+- DNSSEC **validation** is not implemented: the library parses and builds DNSSEC records (DNSKEY, DS, RRSIG, NSEC(3)) and computes key tags, but does not verify signatures or chains of trust
 - EDNS0 signing not implemented (RFC 4035)
-- DNSSEC not supported
 - TSIG not supported
 
 ## Contributing

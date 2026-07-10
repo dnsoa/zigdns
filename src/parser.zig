@@ -75,6 +75,9 @@ pub const MessageParser = struct {
                 return;
             }
             if (len & 0xC0 == 0xC0) { // Pointer
+                // 指针占 2 字节；末尾仅剩 1 字节（悬挂指针）时直接报错，不得把 pos
+                // 推过缓冲区末尾后依赖下游兜底（与 NameCursor.next 的守卫一致）。
+                if (self.pos + 2 > self.buffer.len) return error.PacketTooShort;
                 self.pos += 2;
                 return;
             }
@@ -237,7 +240,13 @@ pub const MessageParser = struct {
         if (offset >= self.buffer.len) return error.InvalidOffset;
 
         // 根域名以 "." 或 "" 表示（与 formatDnsName 输出 "." 一致）。
-        const want = if (mem.eql(u8, expected, ".")) expected[0..0] else expected;
+        // 非根名字剥掉单个尾点，与 Builder.canonicalizeName 及区域文件 FQDN 约定一致；
+        // 否则带尾点的 "example.com." 会对实际为 example.com 的名字误报不匹配。
+        const want: []const u8 = blk: {
+            if (mem.eql(u8, expected, ".")) break :blk expected[0..0];
+            if (expected.len > 1 and expected[expected.len - 1] == '.') break :blk expected[0 .. expected.len - 1];
+            break :blk expected;
+        };
 
         var cur = NameCursor.init(self.buffer, offset);
         var expected_pos: usize = 0;
@@ -785,4 +794,33 @@ test "MessageParser nameEqualsAt is case-insensitive (RFC 4343)" {
     try std.testing.expect(try parser.nameEqualsAt(12, "example.com"));
     try std.testing.expect(try parser.nameEqualsAt(12, "EXAMPLE.COM"));
     try std.testing.expect(!(try parser.nameEqualsAt(12, "example.net")));
+}
+
+test "MessageParser nameEqualsAt accepts trailing dot (FQDN)" {
+    // 区域文件 FQDN 按惯例带尾点；须与无尾点形式同样匹配
+    // （与 Builder.canonicalizeName 一致），否则服务端快速路径会误报不匹配。
+    var packet: [64]u8 = undefined;
+    @memset(packet[0..12], 0);
+    packet[12] = 7;
+    @memcpy(packet[13..20], "example");
+    packet[20] = 3;
+    @memcpy(packet[21..24], "com");
+    packet[24] = 0;
+
+    const parser = MessageParser.init(packet[0..25]);
+    try std.testing.expect(try parser.nameEqualsAt(12, "example.com."));
+    try std.testing.expect(try parser.nameEqualsAt(12, "example.com"));
+    try std.testing.expect(!(try parser.nameEqualsAt(12, "example.net.")));
+}
+
+test "MessageParser skipName rejects dangling compression pointer" {
+    // 名字以单个 0xC0 指针字节结尾，缺少第二字节。skipName 不得把 pos 推过缓冲区末尾
+    // 后再交给下游兜底；应在指针处直接报 PacketTooShort（与 NameCursor.next 的守卫一致）。
+    var packet: [17]u8 = undefined;
+    @memset(packet[0..12], 0);
+    packet[12] = 3;
+    @memcpy(packet[13..16], "com");
+    packet[16] = 0xC0; // 悬挂指针：缺少第二字节
+    var parser = MessageParser.init(&packet);
+    try std.testing.expectError(error.PacketTooShort, parser.nextQuestion());
 }
