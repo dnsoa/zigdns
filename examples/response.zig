@@ -6,7 +6,7 @@ pub fn main() !void {
 
     // 创建 DNS 响应报文
     var buffer: [512]u8 = undefined;
-    var builder = dns.Message.Builder.init(&buffer);
+    var builder = try dns.Message.Builder.init(&buffer);
 
     // 添加问题 (模拟查询)
     try builder.addQuestion("example.com", .A, 1);
@@ -109,7 +109,10 @@ pub fn main() !void {
                 std.debug.print(" TTL={d}\n", .{rr.ttl});
             },
             .TXT => |txt| {
-                std.debug.print("TXT \"{s}\" TTL={d}\n", .{ txt, rr.ttl });
+                var it = txt.iterator();
+                std.debug.print("TXT TTL={d} ", .{rr.ttl});
+                while (it.next() catch null) |seg| std.debug.print("\"{s}\" ", .{seg});
+                std.debug.print("\n", .{});
             },
             else => {
                 std.debug.print("Type={d}\n", .{@intFromEnum(rr.rtype)});

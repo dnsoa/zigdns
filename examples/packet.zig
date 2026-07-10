@@ -8,7 +8,7 @@ const Type = dns.Type;
 pub fn main() !void {
     // 创建 DNS 查询报文
     var buffer: [512]u8 = undefined;
-    var builder = Builder.init(&buffer);
+    var builder = try Builder.init(&buffer);
 
     // 添加问题: example.com A 记录
     try builder.addQuestion("example.com", .A, 1);

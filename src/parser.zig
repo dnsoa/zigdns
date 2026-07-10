@@ -1,20 +1,24 @@
 const std = @import("std");
 const mem = std.mem;
 const ECSData = @import("types.zig").ECSData;
+const CookieData = @import("types.zig").CookieData;
 const Type = @import("types.zig").Type;
 const parseECS = @import("rdata.zig").parseECS;
+const parseCookie = @import("rdata.zig").parseCookie;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
 const formatDnsName = @import("name.zig").formatDnsName;
 const Error = @import("errors.zig").Error;
 
 pub const Question = struct {
+    name_pos: usize, // Where the owner name starts in the buffer (for zero-copy echo / name resolution)
     qname_end_pos: usize, // Where the name ends in the buffer
     qtype: Type,
     qclass: u16,
 };
 
 pub const ResourceRecord = struct {
+    name_pos: usize, // Where the owner name starts in the buffer (for name resolution / OPT root check)
     name_end_pos: usize,
     rtype: Type,
     class: u16,
@@ -22,6 +26,12 @@ pub const ResourceRecord = struct {
     rdlength: u16,
     rdata: []const u8, // Slice pointing into the original packet
     rdata_offset: usize, // Absolute offset of rdata within the packet (for name resolution)
+
+    /// RFC 2181 §8: 收到的 TTL 是 31 位无符号；最高位置位时应视为 0。
+    /// 保留原始 `ttl` 不变，缓存/回显请使用此规范化值。
+    pub fn effectiveTtl(self: ResourceRecord) u32 {
+        return if (self.ttl > 0x7FFFFFFF) 0 else self.ttl;
+    }
 };
 
 pub fn CountedIterator(comptime T: type) type {
@@ -83,6 +93,7 @@ pub const MessageParser = struct {
     pub fn nextQuestion(self: *MessageParser) !?Question {
         if (self.pos >= self.buffer.len) return null;
 
+        const name_pos = self.pos;
         try self.skipName();
         const end_name = self.pos;
 
@@ -93,6 +104,7 @@ pub const MessageParser = struct {
         self.pos += 4;
 
         return Question{
+            .name_pos = name_pos,
             .qname_end_pos = end_name,
             .qtype = qtype,
             .qclass = qclass,
@@ -103,6 +115,7 @@ pub const MessageParser = struct {
     pub fn nextRR(self: *MessageParser) !?ResourceRecord {
         if (self.pos >= self.buffer.len) return null;
 
+        const name_pos = self.pos;
         try self.skipName();
         const end_name = self.pos;
 
@@ -122,6 +135,7 @@ pub const MessageParser = struct {
         self.pos += rdlen;
 
         return ResourceRecord{
+            .name_pos = name_pos,
             .name_end_pos = end_name,
             .rtype = rtype,
             .class = class,
@@ -162,6 +176,8 @@ pub const MessageParser = struct {
         }
     }
 
+    /// 返回附加区第一个 OPT 记录（快路径，不检测重复、不校验 owner 为根）。
+    /// 需要 RFC 6891 §6.1.1 严格语义（多 OPT/非根 owner → FORMERR）时用 `findEdns`。
     pub fn findOptRecord(self: *const MessageParser, count: u16) !?ResourceRecord {
         var scan = self.*;
         var remaining = count;
@@ -171,6 +187,8 @@ pub const MessageParser = struct {
         }
         return null;
     }
+
+    /// 便捷：返回第一个 OPT 中的 ECS（快路径，不检测重复 OPT）。严格校验用 `findEdns`。
 
     pub fn findECS(self: *const MessageParser, count: u16) !?ECSData {
         var scan = self.*;
@@ -182,24 +200,44 @@ pub const MessageParser = struct {
         return null;
     }
 
-    pub const Edns = struct { opt: ResourceRecord, ecs: ?ECSData };
-
-    /// 单趟扫描附加区：一次返回 OPT 记录及其中的 ECS（若有），
-    /// 避免同时需要 OPT 与 ECS 时 findOptRecord + findECS 的双次扫描。
-    pub fn findEdns(self: *const MessageParser, count: u16) !?Edns {
+    /// 扫描附加区第一个 OPT 记录并解出其 DNS Cookie（RFC 7873；快路径，不检测重复 OPT）。
+    pub fn findCookie(self: *const MessageParser, count: u16) !?CookieData {
         var scan = self.*;
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
             const rr = (try scan.nextRR()) orelse return error.PacketTooShort;
-            if (rr.rtype == .OPT) {
-                return .{ .opt = rr, .ecs = try parseECS(rr.rdata) };
-            }
+            if (rr.rtype == .OPT) return parseCookie(rr.rdata);
         }
         return null;
     }
 
+    pub const Edns = struct { opt: ResourceRecord, ecs: ?ECSData };
+
+    /// 单趟扫描附加区：一次返回 OPT 记录及其中的 ECS（若有），
+    /// 避免同时需要 OPT 与 ECS 时 findOptRecord + findECS 的双次扫描。
+    /// 严格模式：扫描全程，若发现多于一个 OPT 记录则报 error.MultipleOptRecords
+    /// （RFC 6891 §6.1.1：多 OPT 必须回 FORMERR）。
+    pub fn findEdns(self: *const MessageParser, count: u16) !?Edns {
+        var scan = self.*;
+        var remaining = count;
+        var found: ?Edns = null;
+        while (remaining > 0) : (remaining -= 1) {
+            const rr = (try scan.nextRR()) orelse return error.PacketTooShort;
+            if (rr.rtype == .OPT) {
+                if (found != null) return error.MultipleOptRecords;
+                // RFC 6891 §6.1.1: OPT 的 owner name 必须为根（单个 0 字节）。
+                if (rr.name_pos >= self.buffer.len or self.buffer[rr.name_pos] != 0) return error.MalformedName;
+                found = .{ .opt = rr, .ecs = try parseECS(rr.rdata) };
+            }
+        }
+        return found;
+    }
+
     pub fn nameEqualsAt(self: *const MessageParser, offset: usize, expected: []const u8) !bool {
         if (offset >= self.buffer.len) return error.InvalidOffset;
+
+        // 根域名以 "." 或 "" 表示（与 formatDnsName 输出 "." 一致）。
+        const want = if (mem.eql(u8, expected, ".")) expected[0..0] else expected;
 
         var cur = NameCursor.init(self.buffer, offset);
         var expected_pos: usize = 0;
@@ -207,17 +245,18 @@ pub const MessageParser = struct {
 
         while (try cur.next()) |label| {
             if (!first_label) {
-                if (expected_pos >= expected.len or expected[expected_pos] != '.') return false;
+                if (expected_pos >= want.len or want[expected_pos] != '.') return false;
                 expected_pos += 1;
             }
             first_label = false;
 
-            if (expected_pos + label.len > expected.len) return false;
-            if (!mem.eql(u8, label, expected[expected_pos .. expected_pos + label.len])) return false;
+            if (expected_pos + label.len > want.len) return false;
+            // RFC 1035 §2.3.3 / RFC 4343: 域名比较对 ASCII 大小写不敏感。
+            if (!std.ascii.eqlIgnoreCase(label, want[expected_pos .. expected_pos + label.len])) return false;
             expected_pos += label.len;
         }
 
-        return expected_pos == expected.len;
+        return expected_pos == want.len;
     }
 
     /// Format a DNS name at a specific offset in the packet.
@@ -236,6 +275,43 @@ pub const MessageParser = struct {
         return RData.parse(rr.rtype, self.buffer, rr.rdata_offset, rr.rdlength);
     }
 };
+
+test "Question and RR expose owner name start offset" {
+    var packet: [128]u8 = undefined;
+    @memset(packet[0..12], 0);
+
+    // Question "example.com" 起始于偏移 12
+    var pos: usize = 12;
+    const qname = "\x07example\x03com\x00";
+    @memcpy(packet[pos..][0..qname.len], qname);
+    pos += qname.len;
+    mem.writeInt(u16, packet[pos..][0..2], 1, .big);
+    mem.writeInt(u16, packet[pos + 2 ..][0..2], 1, .big);
+    pos += 4;
+
+    // RR owner name 起始于此偏移
+    const rr_name_pos = pos;
+    const rr_name = "\x03www\x07example\x03com\x00";
+    @memcpy(packet[pos..][0..rr_name.len], rr_name);
+    pos += rr_name.len;
+    mem.writeInt(u16, packet[pos..][0..2], 1, .big);
+    mem.writeInt(u16, packet[pos + 2 ..][0..2], 1, .big);
+    mem.writeInt(u32, packet[pos + 4 ..][0..4], 60, .big);
+    mem.writeInt(u16, packet[pos + 8 ..][0..2], 4, .big);
+    pos += 10;
+    @memcpy(packet[pos..][0..4], &[_]u8{ 127, 0, 0, 1 });
+    pos += 4;
+
+    var parser = MessageParser.init(packet[0..pos]);
+    const q = (try parser.nextQuestion()).?;
+    try std.testing.expectEqual(@as(usize, 12), q.name_pos);
+    // 起点可直接喂给 name 解析/比较 API
+    try std.testing.expect(try parser.nameEqualsAt(q.name_pos, "example.com"));
+
+    const rr = (try parser.nextRR()).?;
+    try std.testing.expectEqual(rr_name_pos, rr.name_pos);
+    try std.testing.expect(try parser.nameEqualsAt(rr.name_pos, "www.example.com"));
+}
 
 test "MessageParser parse question" {
     // 构造 DNS 查询报文
@@ -615,6 +691,28 @@ test "MessageParser findECS extracts ECS from OPT record" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2 }, ecs.address);
 }
 
+test "MessageParser findEdns rejects OPT with non-root owner name (RFC 6891)" {
+    // OPT 记录的 owner name 必须为根（单个 0 字节）；非根须 FORMERR。
+    var packet: [64]u8 = undefined;
+    @memset(packet[0..12], 0);
+    mem.writeInt(u16, packet[10..12], 1, .big); // arcount=1
+
+    var pos: usize = 12;
+    // 非根 owner: label 'a' + 结束符
+    packet[pos] = 1;
+    packet[pos + 1] = 'a';
+    packet[pos + 2] = 0;
+    pos += 3;
+    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
+    mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
+    mem.writeInt(u16, packet[pos + 8 ..][0..2], 0, .big);
+    pos += 10;
+
+    var parser = MessageParser.init(packet[0..pos]);
+    try std.testing.expectError(error.MalformedName, parser.findEdns(1));
+}
+
 test "MessageParser nameEqualsAt matches compressed name" {
     var packet: [64]u8 = undefined;
     @memset(packet[0..12], 0);
@@ -629,5 +727,62 @@ test "MessageParser nameEqualsAt matches compressed name" {
 
     const parser = MessageParser.init(packet[0..45]);
     try std.testing.expect(try parser.nameEqualsAt(12, "example.com"));
+    try std.testing.expect(!(try parser.nameEqualsAt(12, "example.net")));
+}
+
+test "MessageParser nameEqualsAt matches root against both \".\" and \"\"" {
+    // 根域名（单个 0 字节）应同时匹配 "." 与 ""，与 formatDnsName 输出 "." 保持一致。
+    var packet: [16]u8 = undefined;
+    @memset(packet[0..12], 0);
+    packet[12] = 0; // 根
+
+    const parser = MessageParser.init(packet[0..13]);
+    try std.testing.expect(try parser.nameEqualsAt(12, "."));
+    try std.testing.expect(try parser.nameEqualsAt(12, ""));
+    try std.testing.expect(!(try parser.nameEqualsAt(12, "example.com")));
+}
+
+test "ResourceRecord.effectiveTtl clamps high-bit TTL to zero (RFC 2181)" {
+    // RFC 2181 §8: 收到的 TTL 最高位置位时应视为 0。
+    const rr_hi = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .A,
+        .class = 1,
+        .ttl = 0x80000000,
+        .rdlength = 0,
+        .rdata = &[_]u8{},
+        .rdata_offset = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 0), rr_hi.effectiveTtl());
+    try std.testing.expectEqual(@as(u32, 0x80000000), rr_hi.ttl); // 原始值保留
+
+    const rr_ok = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .A,
+        .class = 1,
+        .ttl = 3600,
+        .rdlength = 0,
+        .rdata = &[_]u8{},
+        .rdata_offset = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 3600), rr_ok.effectiveTtl());
+}
+
+test "MessageParser nameEqualsAt is case-insensitive (RFC 4343)" {
+    // 报文里存 "ExAmPlE.CoM"，查询名 "example.com" 应匹配；反之亦然。
+    // DNS 域名比较对 ASCII 大小写不敏感（RFC 1035 §2.3.3 / RFC 4343）。
+    var packet: [64]u8 = undefined;
+    @memset(packet[0..12], 0);
+    packet[12] = 7;
+    @memcpy(packet[13..20], "ExAmPlE");
+    packet[20] = 3;
+    @memcpy(packet[21..24], "CoM");
+    packet[24] = 0;
+
+    const parser = MessageParser.init(packet[0..25]);
+    try std.testing.expect(try parser.nameEqualsAt(12, "example.com"));
+    try std.testing.expect(try parser.nameEqualsAt(12, "EXAMPLE.COM"));
     try std.testing.expect(!(try parser.nameEqualsAt(12, "example.net")));
 }

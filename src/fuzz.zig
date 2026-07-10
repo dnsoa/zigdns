@@ -11,6 +11,7 @@ const Message = @import("message.zig").Message;
 const MessageParser = @import("parser.zig").MessageParser;
 const NameIterator = @import("name.zig").NameIterator;
 const parseECS = @import("rdata.zig").parseECS;
+const parseCookie = @import("rdata.zig").parseCookie;
 
 /// 从 Smith 取一段受控字节作为报文输入。
 fn draw(s: *Smith, buf: []u8, hash: u32) []const u8 {
@@ -46,6 +47,31 @@ fn walk(input: []const u8) void {
             },
             .SRV => |srv| {
                 _ = srv.target.str(&nbuf) catch {};
+            },
+            .TXT => |txt| {
+                var it = txt.iterator();
+                while (it.next() catch null) |_| {}
+            },
+            .SVCB, .HTTPS => |svcb| {
+                _ = svcb.target.str(&nbuf) catch {};
+                var it = svcb.iterator();
+                while (it.next() catch null) |_| {}
+            },
+            .CAA => |caa| {
+                _ = caa.tag;
+                _ = caa.value;
+            },
+            .RRSIG => |sig| {
+                _ = sig.signer.str(&nbuf) catch {};
+            },
+            .NSEC => |n| {
+                _ = n.next_domain.str(&nbuf) catch {};
+                var it = n.types.iterator();
+                while (it.next() catch null) |_| {}
+            },
+            .NSEC3 => |n3| {
+                var it = n3.types.iterator();
+                while (it.next() catch null) |_| {}
             },
             else => {},
         }
@@ -117,6 +143,16 @@ test "fuzz parseECS" {
         fn one(_: void, s: *Smith) anyerror!void {
             var buf: [512]u8 = undefined;
             _ = parseECS(draw(s, &buf, 0xE5)) catch {};
+        }
+    };
+    try std.testing.fuzz({}, F.one, .{});
+}
+
+test "fuzz parseCookie" {
+    const F = struct {
+        fn one(_: void, s: *Smith) anyerror!void {
+            var buf: [512]u8 = undefined;
+            _ = parseCookie(draw(s, &buf, 0xF6)) catch {};
         }
     };
     try std.testing.fuzz({}, F.one, .{});

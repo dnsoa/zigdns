@@ -16,7 +16,7 @@ pub fn main() !void {
 
         // 使用 Message.Builder 编码域名
         var buffer: [256]u8 = undefined;
-        var builder = dns.Message.Builder.init(&buffer);
+        var builder = try dns.Message.Builder.init(&buffer);
         try builder.addQuestion(domain, .A, 1);
         const packet = builder.finish(dns.Header{
             .id = 0,
@@ -66,7 +66,7 @@ pub fn main() !void {
     std.debug.print("=== Testing Compression Pointer ===\n\n", .{});
 
     var buffer: [512]u8 = undefined;
-    var builder = dns.Message.Builder.init(&buffer);
+    var builder = try dns.Message.Builder.init(&buffer);
 
     // 添加多个相同域名的记录，第二次应使用压缩指针
     try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 1 });

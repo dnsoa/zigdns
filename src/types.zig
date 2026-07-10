@@ -12,11 +12,22 @@ pub const Type = enum(u16) {
     AAAA = 28,
     SRV = 33,
     OPT = 41, // EDNS
+    SVCB = 64, // 服务绑定 (RFC 9460)
+    HTTPS = 65, // HTTPS 服务绑定 (RFC 9460)
+    CAA = 257, // 证书颁发机构授权 (RFC 8659)
+    // DNSSEC（字段声明顺序须与 RData union 一致，与数值无关）
+    DS = 43, // 委派签名者 (RFC 4034)
+    RRSIG = 46, // 资源记录签名 (RFC 4034)
+    NSEC = 47, // 下一安全记录 (RFC 4034)
+    DNSKEY = 48, // DNS 公钥 (RFC 4034)
+    NSEC3 = 50, // 哈希化 NSEC (RFC 5155)
+    NSEC3PARAM = 51, // NSEC3 参数 (RFC 5155)
     _,
 };
 
 pub const OptionCode = enum(u16) {
     ECS = 8, // Client Subnet (RFC 7871)
+    COOKIE = 10, // DNS Cookie (RFC 7873)
     _,
 };
 
@@ -62,6 +73,12 @@ pub const ECSData = struct {
     source_prefix: u8,
     scope_prefix: u8,
     address: []const u8, // Slice into the original packet
+};
+
+/// DNS Cookie（RFC 7873 §4）：8 字节 Client Cookie + 可选 8..32 字节 Server Cookie。
+pub const CookieData = struct {
+    client: [8]u8,
+    server: []const u8, // 空（仅客户端，通常出现在查询）或 8..32 字节（响应/后续查询）
 };
 
 test "Opcode/Rcode tolerate reserved/unknown values" {

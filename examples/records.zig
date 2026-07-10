@@ -8,7 +8,7 @@ pub fn main() !void {
 
     // 创建一个 DNS 响应报文，展示各种记录类型
     var buffer: [2048]u8 = undefined;
-    var builder = Builder.init(&buffer);
+    var builder = try Builder.init(&buffer);
 
     // 添加各种类型的资源记录
     const ttl: u32 = 3600;
@@ -143,7 +143,11 @@ pub fn main() !void {
                 std.debug.print("PTR={s}\n", .{ptr_str});
             },
             .TXT => |txt| {
-                std.debug.print("TXT=\"{s}\"\n", .{txt});
+                // TXT 可含多个 character-string（RFC 1035 §3.3.14），逐段打印。
+                var it = txt.iterator();
+                std.debug.print("TXT=", .{});
+                while (it.next() catch null) |seg| std.debug.print("\"{s}\" ", .{seg});
+                std.debug.print("\n", .{});
             },
             .SOA => |soa| {
                 var mname_buf: [256]u8 = undefined;

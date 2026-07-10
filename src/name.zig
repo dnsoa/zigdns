@@ -60,19 +60,93 @@ pub const NameCursor = struct {
     }
 };
 
+/// 将点分域名切成标签数组（根 "." 或 "" -> 0 个标签）。返回标签数。
+/// out 长度上限即为可容纳的标签数；超出则截断到上限（域名 ≤255 -> ≤127 标签）。
+fn splitLabels(name: []const u8, out: [][]const u8) usize {
+    var n: usize = 0;
+    var it = mem.splitScalar(u8, name, '.');
+    while (it.next()) |label| {
+        if (label.len == 0) continue; // 跳过根/尾点产生的空标签
+        if (n >= out.len) break;
+        out[n] = label;
+        n += 1;
+    }
+    return n;
+}
+
+fn compareLabelCI(x: []const u8, y: []const u8) std.math.Order {
+    const n = @min(x.len, y.len);
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const cx = std.ascii.toLower(x[k]);
+        const cy = std.ascii.toLower(y[k]);
+        if (cx != cy) return std.math.order(cx, cy);
+    }
+    return std.math.order(x.len, y.len);
+}
+
+/// DNSSEC canonical 名序（RFC 4034 §6.1）：从最右（TLD）标签起逐个比较，
+/// 每个标签按 US-ASCII 大小写折叠后的八位组序比较；共有后缀相同时标签更少者在前。
+/// 输入为点分域名（大小写不敏感），根用 "." 或 ""。
+pub fn canonicalCompare(a: []const u8, b: []const u8) std.math.Order {
+    var la: [128][]const u8 = undefined;
+    var lb: [128][]const u8 = undefined;
+    const na = splitLabels(a, &la);
+    const nb = splitLabels(b, &lb);
+
+    var i: usize = 0;
+    while (i < na and i < nb) : (i += 1) {
+        const ord = compareLabelCI(la[na - 1 - i], lb[nb - 1 - i]);
+        if (ord != .eq) return ord;
+    }
+    return std.math.order(na, nb); // 共有后缀相同 -> 标签更少者在前
+}
+
 /// 零拷贝域名解析器
-/// 不分配内存，仅返回指向原始数据包的切片迭代器
+/// 不分配内存，仅返回指向原始数据包的切片迭代器。
+/// 内部持有一个贯穿整次遍历的 `NameCursor`，使 jumps/total 跨 next() 累积——
+/// 这是防指针环与 255 上限的前提（每次新建游标会重置计数，导致死循环 DoS）。
 pub const NameIterator = struct {
     buffer: []const u8,
-    pos: u16,
+    pos: usize,
+    cursor: ?NameCursor = null,
 
     pub fn next(self: *NameIterator) !?[]const u8 {
-        var cur = NameCursor.init(self.buffer, self.pos);
-        const label = try cur.next();
-        self.pos = @intCast(cur.pos);
+        if (self.cursor == null) self.cursor = NameCursor.init(self.buffer, self.pos);
+        const label = try self.cursor.?.next();
+        self.pos = self.cursor.?.pos;
         return label;
     }
 };
+
+test "canonicalCompare orders names per RFC 4034 6.1" {
+    const O = std.math.Order;
+    // 后缀名（标签更少）排在前：example.com < a.example.com
+    try std.testing.expectEqual(O.lt, canonicalCompare("example.com", "a.example.com"));
+    try std.testing.expectEqual(O.gt, canonicalCompare("a.example.com", "example.com"));
+    // 同层按标签比较：a.example.com < b.example.com
+    try std.testing.expectEqual(O.lt, canonicalCompare("a.example.com", "b.example.com"));
+    // 大小写不敏感
+    try std.testing.expectEqual(O.eq, canonicalCompare("A.Example.COM", "a.example.com"));
+    // 从最右标签开始比较占主导：z.a.com < a.z.com（com==com，再比 a<z）
+    try std.testing.expectEqual(O.lt, canonicalCompare("z.a.com", "a.z.com"));
+    // 根最小
+    try std.testing.expectEqual(O.lt, canonicalCompare(".", "com"));
+}
+
+test "NameIterator terminates on pointer-cycle with intervening label" {
+    // {label 'a', pointer->0}: 每次 next() 必须共享同一游标状态（jumps/total 累积），
+    // 否则指针环无法被检测，形成死循环 DoS。
+    const buf = [_]u8{ 0x01, 'a', 0xC0, 0x00 };
+    var it = NameIterator{ .buffer = &buf, .pos = 0 };
+    var count: usize = 0;
+    while (true) {
+        const label = it.next() catch break; // 必须最终报错（MalformedName）而非死循环
+        if (label == null) break;
+        count += 1;
+        try std.testing.expect(count < 500); // 若到 500 说明死循环
+    }
+}
 
 test "NameIterator simple domain" {
     // "example.com" 的编码: 7 e x a m p l e 3 c o m 0

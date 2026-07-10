@@ -182,7 +182,7 @@ fn benchmarkEncode() !void {
     const query_encode = try runBenchmark(EncodeQueryContext, usize, &query_context, iterations, struct {
         fn run(context: *EncodeQueryContext, iteration: usize) !usize {
             context.header.id = @truncate(iteration);
-            var builder = dns.Message.Builder.init(&context.buffer);
+            var builder = try dns.Message.Builder.init(&context.buffer);
             try builder.addQuestion("example.com", .A, 1);
             const packet = builder.finish(context.header);
             mem.doNotOptimizeAway(packet.ptr);
@@ -199,7 +199,7 @@ fn benchmarkEncode() !void {
 
     const repeated_names = try runBenchmark(EncodeRepeatedContext, usize, &repeated_context, iterations, struct {
         fn run(context: *EncodeRepeatedContext, iteration: usize) !usize {
-            var builder = dns.Message.Builder.init(&context.buffer);
+            var builder = try dns.Message.Builder.init(&context.buffer);
             try builder.addQuestion("example.com", .A, 1);
             try builder.addARecord("example.com", 60, [_]u8{ 93, 184, 216, 34 });
             try builder.addARecord("example.com", 60, [_]u8{ 93, 184, 216, @truncate(35 + (iteration & 0x0f)) });
