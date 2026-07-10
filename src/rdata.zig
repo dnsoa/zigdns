@@ -505,6 +505,9 @@ pub const RData = union(Type) {
                 const hash_len: usize = data[5 + salt_len];
                 const hash_start = 6 + salt_len;
                 if (hash_start + hash_len > data.len) return error.InvalidRData;
+                // RFC 5155 §3.1.1/§3.1.7: 仅定义 SHA-1（算法 1），其哈希固定 20 字节。
+                // 已知算法的非法哈希长度视为畸形；未定义算法长度不可校验，保持宽松。
+                if (data[0] == 1 and hash_len != 20) return error.InvalidRData;
                 return RData{ .NSEC3 = .{
                     .hash_algorithm = data[0],
                     .flags = data[1],
@@ -625,18 +628,24 @@ test "RData parse NSEC record with type bitmap (RFC 4034)" {
 
 test "RData parse NSEC3 record (RFC 5155)" {
     const rdata = "\x01\x01\x00\x0a\x04\xaa\xbb\xcc\xdd" ++ // hash,flags,iters,salt
-        "\x05\x01\x02\x03\x04\x05" ++ // hash_len=5, next_hashed_owner
+        "\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14" ++ // hash_len=20 (SHA-1), next_hashed_owner
         "\x00\x02\x40\x01"; // types: A(1), MX(15)
     const rd = try RData.parse(.NSEC3, rdata, 0, rdata.len);
     try std.testing.expectEqual(@as(u8, 1), rd.NSEC3.hash_algorithm);
     try std.testing.expectEqual(@as(u8, 1), rd.NSEC3.flags);
     try std.testing.expectEqual(@as(u16, 10), rd.NSEC3.iterations);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd }, rd.NSEC3.salt);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5 }, rd.NSEC3.next_hashed_owner);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 }, rd.NSEC3.next_hashed_owner);
     var it = rd.NSEC3.types.iterator();
     try std.testing.expectEqual(@as(u16, 1), (try it.next()).?);
     try std.testing.expectEqual(@as(u16, 15), (try it.next()).?);
     try std.testing.expect((try it.next()) == null);
+}
+
+test "RData parse NSEC3 rejects non-20-byte hash for SHA-1 (RFC 5155)" {
+    // SHA-1（算法 1）哈希固定 20 字节；此处给 5 字节须报错。
+    const rdata = "\x01\x01\x00\x0a\x04\xaa\xbb\xcc\xdd" ++ "\x05\x01\x02\x03\x04\x05" ++ "\x00\x00";
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC3, rdata, 0, rdata.len));
 }
 
 test "RData rejects compressed names where RFC forbids compression" {

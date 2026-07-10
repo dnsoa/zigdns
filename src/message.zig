@@ -661,6 +661,8 @@ pub const Message = struct {
         /// 写入 NSEC3 记录（RFC 5155）。salt 与 next_hashed_owner 均须 ≤255 字节；types 须升序。
         pub fn addNSEC3Record(self: *Builder, name: []const u8, ttl: u32, n3: Nsec3) !void {
             if (n3.salt.len > 255 or n3.next_hashed_owner.len > 255) return Error.InvalidRData;
+            // RFC 5155: SHA-1（算法 1）哈希固定 20 字节——与解析端一致，避免构造出解析器会拒的记录。
+            if (n3.hash_algorithm == 1 and n3.next_hashed_owner.len != 20) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
@@ -1386,7 +1388,7 @@ test "Message.Builder addNSEC3Record and addNSEC3PARAMRecord round-trip (RFC 515
         .flags = 1,
         .iterations = 10,
         .salt = "\xaa\xbb\xcc\xdd",
-        .next_hashed_owner = "\x01\x02\x03\x04\x05",
+        .next_hashed_owner = "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14", // SHA-1 = 20 字节
         .types = &[_]u16{ 1, 15 },
     });
     const packet = builder.finish(.{ .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0 });
@@ -1396,11 +1398,25 @@ test "Message.Builder addNSEC3Record and addNSEC3PARAMRecord round-trip (RFC 515
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xdd }, rd1.NSEC3PARAM.salt);
     const rd2 = try parser.parseRData((try rrs.next()).?);
     try std.testing.expectEqual(@as(u16, 10), rd2.NSEC3.iterations);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5 }, rd2.NSEC3.next_hashed_owner);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 }, rd2.NSEC3.next_hashed_owner);
     var it = rd2.NSEC3.types.iterator();
     try std.testing.expectEqual(@as(u16, 1), (try it.next()).?);
     try std.testing.expectEqual(@as(u16, 15), (try it.next()).?);
     try std.testing.expect((try it.next()) == null);
+}
+
+test "Message.Builder addNSEC3Record rejects non-20-byte SHA-1 hash (RFC 5155)" {
+    // SHA-1（算法 1）哈希须 20 字节；5 字节须在构造端即拒绝，避免发出解析器会拒的记录。
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    try std.testing.expectError(error.InvalidRData, builder.addNSEC3Record("example.com", 3600, .{
+        .hash_algorithm = 1,
+        .flags = 0,
+        .iterations = 0,
+        .salt = "",
+        .next_hashed_owner = "\x01\x02\x03\x04\x05",
+        .types = &[_]u16{},
+    }));
 }
 
 test "Message.Builder addMXRecord" {
