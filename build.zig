@@ -5,7 +5,9 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // === DNS 库 ===
-    const dns_module = b.createModule(.{
+    // addModule（非 createModule）：公开导出 "dns" 模块，使消费方（nexus-nsd 等）
+    // 可经 dns_dep.module("dns") 解析。createModule 只建私有模块，跨包不可见。
+    const dns_module = b.addModule("dns", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
