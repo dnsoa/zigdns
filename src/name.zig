@@ -8,6 +8,10 @@ const MAX_NAME = 255;
 // 指针环导致死循环（纯指针跳转不增长 total，故必须独立限次）。
 const MAX_POINTER_JUMPS = 128;
 
+/// 完整 DNS 报文中压缩指针目标的最小合法偏移：域名不可能起始于 12 字节 header 内，
+/// 指向 header 的指针是畸形输入。裸缓冲区（不是整个报文）用 0 表示不约束。
+pub const MESSAGE_POINTER_FLOOR = 12;
+
 /// 域名遍历游标：所有「读出标签」的压缩指针逻辑的唯一实现。
 /// 逐标签推进，跟随 0xC0 压缩指针，统一强制 RFC 上限（label≤63 / name≤255 含根）、
 /// 边界检查与指针跳转限次（防环）。零拷贝——返回指向原缓冲区的标签切片。
@@ -20,9 +24,17 @@ pub const NameCursor = struct {
     pos: usize,
     total: usize = 0,
     jumps: usize = 0,
+    /// 压缩指针目标的最小合法偏移，见 `MESSAGE_POINTER_FLOOR`。
+    pointer_floor: usize = 0,
 
+    /// 裸缓冲区：不约束指针目标（缓冲区不是一整个 DNS 报文时用）。
     pub fn init(buffer: []const u8, offset: usize) NameCursor {
         return .{ .buffer = buffer, .pos = offset };
+    }
+
+    /// 完整 DNS 报文：指针不得指向 12 字节 header。
+    pub fn initInMessage(msg: []const u8, offset: usize) NameCursor {
+        return .{ .buffer = msg, .pos = offset, .pointer_floor = MESSAGE_POINTER_FLOOR };
     }
 
     /// 推进到下一个标签，返回其字节切片；遇结束符返回 null。
@@ -41,7 +53,7 @@ pub const NameCursor = struct {
             if (len & 0xC0 == 0xC0) {
                 if (self.pos + 1 >= self.buffer.len) return error.PacketTooShort;
                 const offset = (@as(usize, len & 0x3F) << 8) | self.buffer[self.pos + 1];
-                if (offset >= self.buffer.len) return error.InvalidOffset;
+                if (offset < self.pointer_floor or offset >= self.buffer.len) return error.InvalidOffset;
                 if (self.jumps >= MAX_POINTER_JUMPS) return error.MalformedName;
                 self.jumps += 1;
                 self.pos = offset;
@@ -72,12 +84,13 @@ pub const NameCursor = struct {
 /// 指针越界与成环。跳过名字的快路径（`MessageParser.skipName` / RDATA 内推进）
 /// 必须走这里，否则「只跳过不展开」的服务端会放行 NameCursor 本会拒绝的名字。
 ///
-/// `pointer_floor`：压缩指针目标的最小合法偏移。完整报文上下文传 12（域名不可能
-/// 起始于 12 字节 header 内，指向 header 的指针是畸形输入）；裸缓冲区传 0。
+/// `pointer_floor`：压缩指针目标的最小合法偏移，完整报文传 `MESSAGE_POINTER_FLOOR`，
+/// 裸缓冲区传 0；与 `NameCursor.pointer_floor` 同义。
 ///
-/// 这是 `NameCursor.next` 的同规则副本，区别仅在于不返回标签切片——跳过名字是
-/// 服务端最热的路径，省掉 `!?[]const u8` 的错误联合+可选切片返回值是值得的。
-/// 两者的判定必须保持一致（见 "skipName agrees with NameCursor" 测试）。
+/// 这是 `NameCursor.next` 的同规则副本（含 pointer_floor），区别仅在于不返回标签
+/// 切片——跳过名字是服务端最热的路径，省掉 `!?[]const u8` 的错误联合+可选切片返回值
+/// 是值得的。两者的判定必须保持一致（见 "skipName agrees with NameCursor" 测试，
+/// floor=0 与 floor=12 两种语义都覆盖）。
 pub fn skipName(buffer: []const u8, start: usize, pointer_floor: usize) !usize {
     var pos = start;
     var total: usize = 1; // 根结束符计入 255（RFC 1035 §2.3.4）
@@ -162,12 +175,19 @@ pub const NameIterator = struct {
     /// 跟随压缩指针后，它是首个指针之后 2 字节的位置（而非指针目标之后），
     /// 与 `skipName` 一致，因此可安全用于续读其后的 type/class。
     pos: usize,
+    /// 压缩指针目标的最小合法偏移。`buffer` 是完整报文时置为
+    /// `MESSAGE_POINTER_FLOOR`，可一并拒绝指向 header 的指针；默认 0（不约束）。
+    pointer_floor: usize = 0,
     cursor: ?NameCursor = null,
     /// 线格式已在首个压缩指针处结束，`pos` 不再随游标推进。
     wire_done: bool = false,
 
     pub fn next(self: *NameIterator) !?[]const u8 {
-        if (self.cursor == null) self.cursor = NameCursor.init(self.buffer, self.pos);
+        if (self.cursor == null) self.cursor = .{
+            .buffer = self.buffer,
+            .pos = self.pos,
+            .pointer_floor = self.pointer_floor,
+        };
         const cur = &self.cursor.?;
         const before = cur.pos;
         const jumps_before = cur.jumps;
@@ -257,13 +277,25 @@ test "NameIterator empty domain" {
     try std.testing.expect((try iter.next()) == null);
 }
 
-/// 将 DNS 线路格式域名转换为点分隔格式
+/// 将 DNS 线路格式域名转换为点分隔格式（裸缓冲区语义：不约束压缩指针目标）。
 /// buffer: 包含 DNS 数据包的缓冲区
 /// pos: 域名起始位置
 /// out_buf: 输出缓冲区，必须足够大（最多 253 字节 + 1）
 /// 返回: 写入 out_buf 的字符串切片
+///
+/// buffer 是一整个 DNS 报文时请用 `formatDnsNameInMessage`，它会一并拒绝指向
+/// header 的压缩指针。
 pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 {
-    var cur = NameCursor.init(buffer, pos);
+    return formatName(NameCursor.init(buffer, pos), out_buf);
+}
+
+/// 同 `formatDnsName`，但按完整报文语义校验（指针不得指向 12 字节 header）。
+pub fn formatDnsNameInMessage(msg: []const u8, pos: usize, out_buf: []u8) ![]const u8 {
+    return formatName(NameCursor.initInMessage(msg, pos), out_buf);
+}
+
+fn formatName(cursor: NameCursor, out_buf: []u8) ![]const u8 {
+    var cur = cursor;
     var write_pos: usize = 0;
     var first_label = true;
 
@@ -301,8 +333,9 @@ pub const Name = struct {
 
     /// 解析为点分格式写入 out_buf（跟随压缩指针，带循环检测）。
     /// 返回指向 out_buf 的切片。
+    /// `buffer` 按定义是完整报文，故指向 header 的压缩指针会被拒绝。
     pub fn str(self: Name, out_buf: []u8) ![]const u8 {
-        return formatDnsName(self.buffer, self.offset, out_buf);
+        return formatDnsNameInMessage(self.buffer, self.offset, out_buf);
     }
 };
 
@@ -316,21 +349,34 @@ test "Name.str resolves uncompressed name" {
 test "Name.str follows compression pointer" {
     var msg: [64]u8 = undefined;
     @memset(&msg, 0);
-    // "example.com\0" 位于偏移 4
-    msg[4] = 7;
-    @memcpy(msg[5..12], "example");
-    msg[12] = 3;
-    @memcpy(msg[13..16], "com");
-    msg[16] = 0;
-    // 偏移 20: "www" + 指向偏移 4 的压缩指针
+    // "example.com\0" 位于偏移 12（header 之后——真实报文里名字不会更靠前）
+    msg[12] = 7;
+    @memcpy(msg[13..20], "example");
     msg[20] = 3;
-    @memcpy(msg[21..24], "www");
-    msg[24] = 0xC0;
-    msg[25] = 0x04;
+    @memcpy(msg[21..24], "com");
+    msg[24] = 0;
+    // 偏移 28: "www" + 指向偏移 12 的压缩指针
+    msg[28] = 3;
+    @memcpy(msg[29..32], "www");
+    msg[32] = 0xC0;
+    msg[33] = 12;
 
-    const name = Name{ .buffer = &msg, .offset = 20 };
+    const name = Name{ .buffer = &msg, .offset = 28 };
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("www.example.com", try name.str(&buf));
+}
+
+test "Name.str rejects a pointer into the header" {
+    // Name.buffer 按定义是完整报文，指向 header 的指针是畸形 RDATA，
+    // 不得因为「只是解析 RDATA 内的名字」就绕过 owner name 那条路径的判定。
+    var msg: [32]u8 = undefined;
+    @memset(&msg, 0);
+    msg[12] = 0xC0;
+    msg[13] = 0x02;
+
+    const name = Name{ .buffer = &msg, .offset = 12 };
+    var buf: [256]u8 = undefined;
+    try std.testing.expectError(error.InvalidOffset, name.str(&buf));
 }
 
 test "formatDnsName simple domain" {
@@ -470,27 +516,52 @@ test "skipName enforces 255 including the root octet (RFC 1035 2.3.4)" {
 test "skipName agrees with NameCursor" {
     // skipName 是 NameCursor.next 的无切片副本；两者对「接受/拒绝」的判定必须一致，
     // 否则「只跳过」与「展开」两条路径又会重新分叉（issue #2 的根因）。
+    // floor=0（裸缓冲区）与 floor=12（完整报文）两种语义都要对齐——parser 用的是后者。
     const cases = [_][]const u8{
         "\x00", // 根
         "\x07example\x03com\x00", // 普通名
-        "\x03www\xC0\x01", // 指针（目标在缓冲区内）
+        "\x03www\xC0\x01", // 指针（目标在缓冲区内，但 <12）
         "\x40aaaa\x00", // 标签 >63
         "\x03www", // 缺结束符
         "\xC0", // 悬挂指针
         "\xC0\x00", // 自指成环
         "\xC0\x02\xC0\x00", // 互指成环
         "\x01a\xC0\x00", // 带标签的环
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03com\x00\xC0\x0c", // 指针 -> 12（合法）
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03com\x00\xC0\x0b", // 指针 -> 11（<floor）
     };
     for (cases) |buf| {
-        const skip_err: ?anyerror = if (skipName(buf, 0, 0)) |_| null else |e| e;
-        var cur = NameCursor.init(buf, 0);
-        const cursor_err: ?anyerror = while (true) {
-            if (cur.next()) |label| {
-                if (label == null) break null;
-            } else |e| break e;
-        };
-        try std.testing.expectEqual(cursor_err, skip_err);
+        for ([_]usize{ 0, MESSAGE_POINTER_FLOOR }) |floor| {
+            // 两种语义下名字的起点不同：报文语义从 header 之后开始。
+            const start = if (floor == 0) 0 else @min(MESSAGE_POINTER_FLOOR + 4, buf.len -| 1);
+            const skip_err: ?anyerror = if (skipName(buf, start, floor)) |_| null else |e| e;
+            var cur = NameCursor{ .buffer = buf, .pos = start, .pointer_floor = floor };
+            const cursor_err: ?anyerror = while (true) {
+                if (cur.next()) |label| {
+                    if (label == null) break null;
+                } else |e| break e;
+            };
+            try std.testing.expectEqual(cursor_err, skip_err);
+        }
     }
+}
+
+test "NameCursor.initInMessage rejects pointers into the header" {
+    // formatNameAt / nameEqualsAt / Name.str 都走 Cursor；它们必须和 skipName
+    // 一样拒绝指向 header 的指针，否则同一个报文在两条路径上判定不同。
+    var msg: [32]u8 = undefined;
+    @memset(&msg, 0);
+    msg[12] = 0xC0;
+    msg[13] = 0x02; // 指向偏移 2（header 内）
+
+    var cur = NameCursor.initInMessage(&msg, 12);
+    try std.testing.expectError(error.InvalidOffset, cur.next());
+    try std.testing.expectEqual(@as(usize, MESSAGE_POINTER_FLOOR), cur.pointer_floor);
+
+    var out: [256]u8 = undefined;
+    try std.testing.expectError(error.InvalidOffset, formatDnsNameInMessage(&msg, 12, &out));
+    // 裸缓冲区语义下同一输入只按普通名字校验（此处目标是 0 字节 -> 根）。
+    try std.testing.expectEqualStrings(".", try formatDnsName(&msg, 12, &out));
 }
 
 test "skipName rejects pointer below the floor" {

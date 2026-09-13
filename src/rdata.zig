@@ -7,6 +7,7 @@ const CookieData = @import("types.zig").CookieData;
 const Error = @import("errors.zig").Error;
 const Name = @import("name.zig").Name;
 const skipNameAt = @import("name.zig").skipName;
+const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 
 fn parseECSOption(option_payload: []const u8) !ECSData {
     if (option_payload.len < 4) return error.MalformedECS;
@@ -294,11 +295,13 @@ pub const RData = union(Type) {
     /// 在 RDATA 内推进越过一个域名（含压缩指针），仅校验与定位，不复制。
     /// 用于跳到域名之后的定长字段。
     ///
-    /// 压缩指针会被**跟随并完整校验**（目标越界、成环、展开后 >255），推进量仍是
-    /// 线格式的 2 字节；名字的线格式必须整体落在本条 RDATA 内。
+    /// 压缩指针会被**跟随并完整校验**（目标越界、指向 header、成环、展开后 >255），
+    /// 推进量仍是线格式的 2 字节；名字的线格式必须整体落在本条 RDATA 内。
     /// `base` 为 RDATA 在完整报文 `msg` 中的绝对偏移，`pos` 相对 RDATA 起点。
+    /// 与 owner name 的 skip 路径共用 `MESSAGE_POINTER_FLOOR`：RDATA 里的域名同样
+    /// 不得指向 header，否则 owner 被拒的输入换个位置又能通过。
     fn advanceName(msg: []const u8, base: usize, data: []const u8, pos: *usize) Error!void {
-        const end = try skipNameAt(msg, base + pos.*, 0);
+        const end = try skipNameAt(msg, base + pos.*, POINTER_FLOOR);
         // 名字（及其尾部指针）必须落在 RDLENGTH 划定的范围内。
         if (end > base + data.len) return error.PacketTooShort;
         pos.* = end - base;
@@ -957,19 +960,37 @@ test "parseECS fast path parses first option" {
 test "RData CNAME resolves compression pointer against full message" {
     var msg: [64]u8 = undefined;
     @memset(&msg, 0);
-    // "example.com\0" 位于偏移 4
-    msg[4] = 7;
-    @memcpy(msg[5..12], "example");
-    msg[12] = 3;
-    @memcpy(msg[13..16], "com");
-    msg[16] = 0;
-    // CNAME RDATA 位于偏移 20: "www" + 指向偏移 4 的压缩指针，rdlength=6
+    // "example.com\0" 位于偏移 12（header 之后——真实报文里名字不会更靠前）
+    msg[12] = 7;
+    @memcpy(msg[13..20], "example");
     msg[20] = 3;
-    @memcpy(msg[21..24], "www");
-    msg[24] = 0xC0;
-    msg[25] = 0x04;
+    @memcpy(msg[21..24], "com");
+    msg[24] = 0;
+    // CNAME RDATA 位于偏移 28: "www" + 指向偏移 12 的压缩指针，rdlength=6
+    msg[28] = 3;
+    @memcpy(msg[29..32], "www");
+    msg[32] = 0xC0;
+    msg[33] = 12;
 
-    const rdata = try RData.parse(.CNAME, &msg, 20, 6);
+    const rdata = try RData.parse(.CNAME, &msg, 28, 6);
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("www.example.com", try rdata.CNAME.str(&buf));
+}
+
+test "RData rejects RDATA names pointing into the header" {
+    // owner name 的 skip 路径已按 #2 拒绝这类指针；RDATA 内的域名必须同样拒绝，
+    // 否则同一个畸形指针换个位置就能通过（CNAME/NS/MX/SOA/SRV 都走 advanceName）。
+    var msg: [64]u8 = undefined;
+    @memset(&msg, 0);
+    msg[12] = 0xC0;
+    msg[13] = 0x02; // 指向偏移 2（header 内）
+    try std.testing.expectError(error.InvalidOffset, RData.parse(.CNAME, &msg, 12, 2));
+    try std.testing.expectError(error.InvalidOffset, RData.parse(.NS, &msg, 12, 2));
+
+    // MX: preference(2) + 指向 header 的 exchange
+    msg[12] = 0;
+    msg[13] = 10;
+    msg[14] = 0xC0;
+    msg[15] = 0x02;
+    try std.testing.expectError(error.InvalidOffset, RData.parse(.MX, &msg, 12, 4));
 }

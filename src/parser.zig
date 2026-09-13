@@ -9,11 +9,9 @@ const parseOptOptions = @import("rdata.zig").parseOptOptions;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
 const skipNameAt = @import("name.zig").skipName;
-const formatDnsName = @import("name.zig").formatDnsName;
+const formatDnsNameInMessage = @import("name.zig").formatDnsNameInMessage;
+const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 const Error = @import("errors.zig").Error;
-
-/// 压缩指针目标的最小合法偏移：域名不可能起始于 12 字节 header 内。
-const POINTER_FLOOR = 12;
 
 pub const Question = struct {
     name_pos: usize, // Where the owner name starts in the buffer (for zero-copy echo / name resolution)
@@ -252,7 +250,7 @@ pub const MessageParser = struct {
             break :blk expected;
         };
 
-        var cur = NameCursor.init(self.buffer, offset);
+        var cur = NameCursor.initInMessage(self.buffer, offset);
         var expected_pos: usize = 0;
         var first_label = true;
 
@@ -274,11 +272,11 @@ pub const MessageParser = struct {
 
     /// Format a DNS name at a specific offset in the packet.
     /// Follows compression pointers and returns dotted format.
-    /// 委托给 name.zig 的 `formatDnsName`（基于统一的 `NameCursor`），
-    /// 保留入口 InvalidOffset 语义。
+    /// 委托给 name.zig 的 `formatDnsNameInMessage`（基于统一的 `NameCursor`，
+    /// 按完整报文语义拒绝指向 header 的压缩指针），保留入口 InvalidOffset 语义。
     pub fn formatNameAt(self: *const MessageParser, offset: usize, out_buf: []u8) ![]const u8 {
         if (offset >= self.buffer.len) return error.InvalidOffset;
-        return formatDnsName(self.buffer, offset, out_buf);
+        return formatDnsNameInMessage(self.buffer, offset, out_buf);
     }
 
     /// Parse a resource record's RDATA. Domain names inside RDATA are returned as

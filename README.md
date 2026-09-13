@@ -213,14 +213,16 @@ if (try parser.findEdns(message.header.arcount)) |edns| {
 | Condition | Error |
 |-----------|-------|
 | More than one OPT record (§6.1.1) | `error.MultipleOptRecords` |
+| A name points into the header | `error.InvalidOffset` |
 | OPT owner name is not the root | `error.MalformedName` |
 | OPT RDATA options do not exactly tile the RDATA | `error.InvalidRData` |
 
 `findOptRecord`, `findECS` and `findCookie` are **fast paths**: they stop at the first OPT
 and skip those checks. Use them only on input you have already validated; for untrusted
 packets prefer `findEdns`. The builder enforces the same rule from the other side — a
-second `addOptRecord` / `addOptRecordRaw` returns `error.MultipleOptRecords`, so a
-Builder-only server cannot emit a packet its own strict parse path would FORMERR.
+second OPT via `addOptRecord`, `addOptRecordRaw`, or `addRecordRaw(..., 41, ...)` returns
+`error.MultipleOptRecords`, so a Builder-only server cannot emit a packet its own strict
+parse path would FORMERR.
 
 OPT is not an ordinary record: `parseRData` on type 41 returns `error.UseEdns`, so a
 generic "walk every additional RR" loop gets an unambiguous signal to branch to the
@@ -308,6 +310,15 @@ matches where `MessageParser` leaves off, but reaching for it means doing by han
 All name reading enforces RFC 1035 §2.3.4 identically across the library — labels ≤ 63
 bytes, and ≤ 255 bytes for the whole name *including* the root octet. A name the parser
 accepts can always be re-encoded by the builder.
+
+Every message-level entry point also rejects compression pointers aimed at the 12-byte
+header, since no name can start there. That applies uniformly to `MessageParser`
+(`skipName` / `formatNameAt` / `nameEqualsAt`), to `Name.str()`, and to names inside
+RDATA (`parseRData` on CNAME/NS/MX/SOA/SRV) — a pointer rejected in an owner name cannot
+slip through by moving into RDATA. The generic helpers that take an arbitrary buffer
+rather than a whole message (`formatDnsName`, `NameIterator`, `NameCursor.init`) default
+to no such restriction; use `formatDnsNameInMessage`, `NameCursor.initInMessage`, or set
+`pointer_floor = dns.MESSAGE_POINTER_FLOOR` to opt in.
 
 ### Supported Record Types
 

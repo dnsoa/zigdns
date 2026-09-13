@@ -457,10 +457,17 @@ pub const Message = struct {
         /// 通用记录写入（RFC 3597）：type/class 为原始 u16，RDATA 原样写入。
         /// 用于本库未建模的类型、非 IN class、以及需按 RFC 3597 §4 视 RDATA 为不透明
         /// （其中的域名不得压缩）的场景。owner name 仍照常压缩。
+        ///
+        /// rtype == 41 (OPT) 时同样受「至多一个 OPT」约束（RFC 6891 §6.1.1）——
+        /// 否则这里就是绕过 `addOptRecord` 检查、写出第二条 OPT 的后门。
         pub fn addRecordRaw(self: *Builder, name: []const u8, rtype: u16, class: u16, ttl: u32, rdata: []const u8) !void {
             if (rdata.len > 0xFFFF) return Error.MessageTooLong;
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            if (rtype == @intFromEnum(Type.OPT)) {
+                if (self.opt_added) return Error.MultipleOptRecords;
+                self.opt_added = true;
+            }
             try self.writeName(name);
             try self.writeU16(rtype);
             try self.writeU16(class);
@@ -1908,6 +1915,31 @@ test "Message.Builder rejects a second OPT record (RFC 6891 6.1.1)" {
     var parser = MessageParser.init(packet);
     try parser.skipQuestions(msg.header.qdcount);
     try std.testing.expectEqual(@as(u16, 1232), (try parser.findEdns(msg.header.arcount)).?.opt.class);
+}
+
+test "Message.Builder addRecordRaw cannot smuggle in a second OPT" {
+    // addRecordRaw 接受原始 u16 type，若不认 41 就是绕过 addOptRecord 检查的后门：
+    // 仍能发出自家 findEdns 判 MultipleOptRecords 的报文。
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    try builder.addOptRecord(.{ .udp_payload_size = 1232 });
+
+    const snap_pos = builder.pos;
+    const snap_ar = builder.ar;
+    try std.testing.expectError(error.MultipleOptRecords, builder.addRecordRaw("", @intFromEnum(Type.OPT), 4096, 0, &[_]u8{}));
+    try std.testing.expectEqual(snap_pos, builder.pos);
+    try std.testing.expectEqual(snap_ar, builder.ar);
+
+    // 反向：先用 addRecordRaw 写 OPT，再走 addOptRecord 同样要被挡住。
+    var builder2 = try Message.Builder.init(&buf);
+    try builder2.setSection(.additional);
+    try builder2.addRecordRaw("", @intFromEnum(Type.OPT), 1232, 0, &[_]u8{});
+    try std.testing.expectError(error.MultipleOptRecords, builder2.addOptRecord(.{ .udp_payload_size = 4096 }));
+    try std.testing.expectError(error.MultipleOptRecords, builder2.addRecordRaw("", @intFromEnum(Type.OPT), 4096, 0, &[_]u8{}));
+
+    // 非 OPT 类型不受影响，可以写任意多条。
+    try builder2.addRecordRaw("example.com", 99, 1, 60, "\x01\x02");
+    try builder2.addRecordRaw("example.com", 99, 1, 60, "\x03\x04");
 }
 
 test "Message.Builder addOptRecord with ECS round-trips" {
