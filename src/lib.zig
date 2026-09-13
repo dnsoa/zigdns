@@ -4,6 +4,8 @@ pub const Header = @import("header.zig").Header;
 pub const NameIterator = @import("name.zig").NameIterator;
 pub const Name = @import("name.zig").Name;
 pub const formatDnsName = @import("name.zig").formatDnsName;
+pub const formatDnsNameInMessage = @import("name.zig").formatDnsNameInMessage;
+pub const MESSAGE_POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 pub const Type = @import("types.zig").Type;
 pub const Class = @import("types.zig").Class;
 pub const Opcode = @import("types.zig").Opcode;
@@ -38,6 +40,9 @@ pub const Error = @import("errors.zig").Error;
 pub const Question = @import("parser.zig").Question;
 pub const ResourceRecord = @import("parser.zig").ResourceRecord;
 
-// 导出 ECS / Cookie 解析函数
+// 导出 EDNS 选项解析：parseOptOptions 单趟取出全部已识别选项，
+// parseECS / parseCookie 是只要其中一项时的薄封装。
+pub const parseOptOptions = @import("rdata.zig").parseOptOptions;
+pub const OptOptions = @import("rdata.zig").OptOptions;
 pub const parseECS = @import("rdata.zig").parseECS;
 pub const parseCookie = @import("rdata.zig").parseCookie;

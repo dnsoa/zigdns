@@ -188,21 +188,45 @@ while (try answers.next()) |rr| {
 }
 ```
 
-To inspect EDNS without consuming the parser cursor, scan the additional section directly:
+To inspect EDNS without consuming the parser cursor, scan the additional section directly.
+`findEdns` is the **strict** entry point: one pass, full RFC 6891 §6.1.1 checking, and it
+returns the OPT record together with its ECS and Cookie options:
 
 ```zig
 var parser = dns.MessageParser.init(buffer);
 try parser.skipQuestions(message.header.qdcount);
 try parser.skipResourceRecords(message.header.ancount + message.header.nscount);
 
-if (try parser.findOptRecord(message.header.arcount)) |opt| {
-    std.debug.print("EDNS UDP size: {d}\n", .{opt.class});
-}
+if (try parser.findEdns(message.header.arcount)) |edns| {
+    std.debug.print("EDNS UDP size: {d}\n", .{edns.opt.class});
+    if (edns.ecs) |ecs| std.debug.print("ECS family={d} prefix={d}\n", .{ ecs.family, ecs.source_prefix });
+    if (edns.cookie) |c| std.debug.print("cookie server bytes: {d}\n", .{c.server.len});
 
-if (try parser.findECS(message.header.arcount)) |ecs| {
-    std.debug.print("ECS family={d} prefix={d}\n", .{ ecs.family, ecs.source_prefix });
+    // Header fields (version / extended RCODE / DO) decode from the OPT record itself:
+    const params = try dns.Edns.fromOpt(edns.opt);
+    std.debug.print("DO={}\n", .{params.dnssec_ok});
 }
 ```
+
+`findEdns` returns an error when the message violates RFC 6891:
+
+| Condition | Error |
+|-----------|-------|
+| More than one OPT record (§6.1.1) | `error.MultipleOptRecords` |
+| A name points into the header | `error.InvalidOffset` |
+| OPT owner name is not the root | `error.MalformedName` |
+| OPT RDATA options do not exactly tile the RDATA | `error.InvalidRData` |
+
+`findOptRecord`, `findECS` and `findCookie` are **fast paths**: they stop at the first OPT
+and skip those checks. Use them only on input you have already validated; for untrusted
+packets prefer `findEdns`. The builder enforces the same rule from the other side — a
+second OPT via `addOptRecord`, `addOptRecordRaw`, or `addRecordRaw(..., 41, ...)` returns
+`error.MultipleOptRecords`, so a Builder-only server cannot emit a packet its own strict
+parse path would FORMERR.
+
+OPT is not an ordinary record: `parseRData` on type 41 returns `error.UseEdns`, so a
+generic "walk every additional RR" loop gets an unambiguous signal to branch to the
+EDNS helpers instead of a vague `InvalidRData`.
 
 ### Server-side building: TCP framing, truncation, auto-counting
 
@@ -273,6 +297,28 @@ while (try iter.next()) |label| {
     std.debug.print("Label: {s}\n", .{label});
 }
 ```
+
+`NameIterator` walks the labels of **one** name — it is not a packet cursor. To walk a
+whole message (names, then type/class, then the next record), use `MessageParser`, which
+validates every name as it goes.
+
+`iter.pos` tracks the name's **wire-form** end: for a compressed name that is the two
+bytes of the first pointer, not the end of whatever the pointer targets. It therefore
+matches where `MessageParser` leaves off, but reaching for it means doing by hand what
+`MessageParser` already does for you.
+
+All name reading enforces RFC 1035 §2.3.4 identically across the library — labels ≤ 63
+bytes, and ≤ 255 bytes for the whole name *including* the root octet. A name the parser
+accepts can always be re-encoded by the builder.
+
+Every message-level entry point also rejects compression pointers aimed at the 12-byte
+header, since no name can start there. That applies uniformly to `MessageParser`
+(`skipName` / `formatNameAt` / `nameEqualsAt`), to `Name.str()`, and to names inside
+RDATA (`parseRData` on CNAME/NS/MX/SOA/SRV) — a pointer rejected in an owner name cannot
+slip through by moving into RDATA. The generic helpers that take an arbitrary buffer
+rather than a whole message (`formatDnsName`, `NameIterator`, `NameCursor.init`) default
+to no such restriction; use `formatDnsNameInMessage`, `NameCursor.initInMessage`, or set
+`pointer_floor = dns.MESSAGE_POINTER_FLOOR` to opt in.
 
 ### Supported Record Types
 
@@ -360,7 +406,7 @@ zig test src/rdata.zig
 - `Message` - Message parsing wrapper
 - `Message.Builder` - Zero-allocation packet builder
 - `MessageParser` - Incremental packet parser
-- `NameIterator` - Zero-copy domain name iterator
+- `NameIterator` - Zero-copy label iterator for a single name (not a packet cursor)
 - `ResourceData` - Union type for all RDATA formats
 
 ### Enums
@@ -383,15 +429,20 @@ on your own hardware, these are not authoritative):
 
 | Operation | ~ns/op |
 |-----------|-------:|
-| Decode header | 0.7 |
-| Parse one question | 3 |
-| Skip question + parse one answer | 4 |
+| Decode header | 0.9 |
+| Parse one question (uncompressed name) | 2 |
+| Skip question + parse one answer (compressed owner) | 10 |
 | Iterate a qname (labels) | 4 |
-| Compare a compressed name | 10 |
-| Format a compressed name (dotted) | 20 |
-| Find OPT / `findEdns` (OPT+ECS, one scan) | 6–8 |
-| Encode a query | 37 |
-| Encode a response with compression | 60 |
+| Compare a compressed name | 18 |
+| Format a compressed name (dotted) | 16 |
+| Find OPT / `findEdns` (OPT+ECS+Cookie, one scan) | 17–19 |
+| Encode a query | 33 |
+| Encode a response with compression | 72 |
+
+Skipping a name now **follows and validates** its compression pointers instead of
+accepting "+2 bytes and done", so a fast-path server that only skips rejects the same
+malformed names that `formatNameAt` does. That costs roughly 7 ns per compressed name
+compared to the old unchecked skip; names without pointers are unaffected.
 
 On server fast paths prefer comparing names (`nameEqualsAt`) or scanning EDNS with the
 single-pass `findEdns` over formatting names to strings.

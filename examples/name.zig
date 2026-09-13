@@ -48,7 +48,9 @@ pub fn main() !void {
         }
         std.debug.print("\n", .{});
 
-        // 使用 NameIterator 解析域名
+        // 使用 NameIterator 逐标签解析「一个」域名。
+        // 它不是报文游标：要继续读 type/class 或下一条记录，请用 MessageParser
+        // （iter.pos 停在名字的线格式结束处，但整包遍历交给 MessageParser 更稳妥）。
         var iter = dns.NameIterator{ .buffer = packet, .pos = 12 };
         var label_count: usize = 0;
         std.debug.print("  Labels: ", .{});
