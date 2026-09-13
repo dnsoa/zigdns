@@ -10,8 +10,14 @@ const ResourceRecord = @import("parser.zig").ResourceRecord;
 const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
 const validateSvcParams = @import("rdata.zig").validateSvcParams;
+const parseOptOptions = @import("rdata.zig").parseOptOptions;
 
-const MAX_COMPRESSION = 32; // 最多追踪 32 个域名
+/// 压缩表槽位数。NSEC 链、大量胶水记录、ANY 应答很容易写出几十个不同后缀；
+/// 表一满后续名字只能整名展开，报文变大 -> TC -> 退回 TCP。
+const MAX_COMPRESSION = 128;
+/// 14 位压缩指针可寻址的最大偏移。超过此偏移的名字永远不能作为指针目标，
+/// 不占用压缩表槽位。
+const MAX_POINTER_OFFSET = 0x3FFF;
 const MAX_NAME_LENGTH = 255;
 
 /// DNS 报文分区（RFC 1035 4.1）。构造时记录必须按此顺序添加。
@@ -30,13 +36,15 @@ pub const Edns = struct {
     /// CLASS 字段承载 UDP 载荷大小；TTL 承载 扩展 RCODE 高 8 位 / 版本 / flags。
     /// RDATA 中若含 ECS / COOKIE 选项则一并解出（RFC 7871 / 7873）。
     pub fn fromOpt(rr: ResourceRecord) !Edns {
+        const options = try parseOptOptions(rr.rdata);
         return .{
             .udp_payload_size = rr.class,
             .extended_rcode = @truncate(rr.ttl >> 24),
             .version = @truncate(rr.ttl >> 16),
             .dnssec_ok = (rr.ttl & 0x8000) != 0,
-            .ecs = try parseECS(rr.rdata),
-            .cookie = try parseCookie(rr.rdata),
+            // 选项只遍历一趟：ECS 与 Cookie 同时取出。
+            .ecs = options.ecs,
+            .cookie = options.cookie,
         };
     }
 };
@@ -83,6 +91,7 @@ pub const Message = struct {
         compression_table: [MAX_COMPRESSION]struct { hash: u64, pos: u16 },
         compression_count: u8,
         section: Section, // 当前分区，用于自动计数
+        opt_added: bool, // RFC 6891 §6.1.1: 一个报文至多一个 OPT 记录
         qd: u16,
         an: u16,
         ns: u16,
@@ -111,6 +120,7 @@ pub const Message = struct {
                 .compression_table = undefined,
                 .compression_count = 0,
                 .section = .answer, // RR 默认写入回答区
+                .opt_added = false,
                 .qd = 0,
                 .an = 0,
                 .ns = 0,
@@ -118,10 +128,15 @@ pub const Message = struct {
             };
         }
 
-        const Snapshot = struct { pos: usize, compression_count: u8, section: Section };
+        const Snapshot = struct { pos: usize, compression_count: u8, section: Section, opt_added: bool };
 
         fn snapshot(self: *const Builder) Snapshot {
-            return .{ .pos = self.pos, .compression_count = self.compression_count, .section = self.section };
+            return .{
+                .pos = self.pos,
+                .compression_count = self.compression_count,
+                .section = self.section,
+                .opt_added = self.opt_added,
+            };
         }
 
         /// 回滚到快照（用于 add* 失败时保持原子性，使截断可安全恢复）。
@@ -130,6 +145,7 @@ pub const Message = struct {
             self.pos = s.pos;
             self.compression_count = s.compression_count;
             self.section = s.section;
+            self.opt_added = s.opt_added;
         }
 
         /// 切换当前分区（后续 RR 计入 authority/additional）。分区只能向后推进；
@@ -139,8 +155,10 @@ pub const Message = struct {
             self.section = s;
         }
 
-        /// 校验 buf[pos..] 处已写入的（展开的）线格式域名是否等于 canonical 点分名。
+        /// 校验 buf[pos..] 处已写入的线格式域名是否等于 canonical 点分名。
         /// 用于压缩指针复用前的字节级确认，防止 64 位 hash 碰撞导致指向错误域名。
+        /// 表中的名字本身可能以压缩指针结尾（前缀标签 + 指向更早后缀的指针），
+        /// 故此处需跟随指针。Builder 只会写出「指向更小偏移」的指针，据此天然防环。
         fn nameMatchesAt(self: *const Builder, pos: u16, canonical: []const u8) bool {
             var read: usize = pos;
             var exp: usize = 0;
@@ -148,7 +166,13 @@ pub const Message = struct {
             while (read < self.pos) {
                 const len = self.buf[read];
                 if (len == 0) return exp == canonical.len;
-                if (len & 0xC0 == 0xC0) return false; // 压缩表仅记录展开写入的名字，不应出现指针
+                if (len & 0xC0 == 0xC0) {
+                    if (read + 2 > self.pos) return false;
+                    const target = (@as(usize, len & 0x3F) << 8) | self.buf[read + 1];
+                    if (target >= read) return false; // 只允许向前跳（防环）
+                    read = target;
+                    continue;
+                }
                 if (len > 63) return false;
                 if (read + 1 + len > self.pos) return false;
                 if (!first) {
@@ -701,9 +725,13 @@ pub const Message = struct {
 
         /// 写入 EDNS(0) OPT 记录（RFC 6891）。自动置于附加区（additional）。
         /// 若 edns.ecs 非空，附带 ECS 选项（RFC 7871）。
+        /// RFC 6891 §6.1.1: 一个报文至多一个 OPT；第二次调用返回
+        /// error.MultipleOptRecords 且完全回滚（pos / 计数 / 分区均不变）。
         pub fn addOptRecord(self: *Builder, edns: Edns) !void {
             const snap = self.snapshot(); // 先快照（含 section），失败可完全回滚
             errdefer self.restore(snap);
+            if (self.opt_added) return Error.MultipleOptRecords;
+            self.opt_added = true;
             try self.setSection(.additional);
 
             try self.writeU8(0); // OPT 的 owner name 必须为根
@@ -724,10 +752,13 @@ pub const Message = struct {
         }
 
         /// 低级：写入 OPT 记录，options 为调用方自行编码的完整 RDATA。
+        /// 与 `addOptRecord` 共用「至多一个 OPT」的约束（RFC 6891 §6.1.1）。
         pub fn addOptRecordRaw(self: *Builder, udp_payload_size: u16, ttl: u32, options: []const u8) !void {
             if (options.len > 0xFFFF) return Error.MessageTooLong;
             const snap = self.snapshot(); // 先快照（含 section），失败可完全回滚
             errdefer self.restore(snap);
+            if (self.opt_added) return Error.MultipleOptRecords;
+            self.opt_added = true;
             try self.setSection(.additional);
 
             try self.writeU8(0);
@@ -792,6 +823,26 @@ pub const Message = struct {
             }
         }
 
+        /// 把 canonical 在 `start` 处新写出的各后缀登记到压缩表，供后续名字复用。
+        /// 只登记 canonical 内偏移 < `limit` 的后缀边界：整名展开时 limit = 名字长度
+        /// （全部后缀）；压缩写出时 limit 为新写出的前缀长度——后缀部分是指针，其目标
+        /// 早已在表内。超出 14 位指针寻址范围的偏移不占槽位（永远不可能被指向）。
+        fn registerSuffixes(self: *Builder, canonical: []const u8, start: usize, limit: usize) void {
+            var label_it = mem.splitScalar(u8, canonical, '.');
+            var suffix_offset: usize = 0;
+            while (label_it.next()) |label| : (suffix_offset += label.len + 1) {
+                if (suffix_offset >= limit) return;
+                if (self.compression_count >= MAX_COMPRESSION) return;
+                const pos = start + suffix_offset;
+                if (pos > MAX_POINTER_OFFSET) return; // 后续后缀偏移只会更大
+                self.compression_table[self.compression_count] = .{
+                    .hash = std.hash.Wyhash.hash(0, canonical[suffix_offset..]),
+                    .pos = @intCast(pos),
+                };
+                self.compression_count += 1;
+            }
+        }
+
         /// 写入域名，支持压缩指针（含共享后缀压缩）。
         fn writeName(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
@@ -803,6 +854,7 @@ pub const Message = struct {
 
             const analyzed = try analyzeName(name);
             const canonical = analyzed.canonical;
+            const start = self.pos;
 
             // 从最长后缀（整名）开始逐段缩短，寻找压缩表中已写入的可复用后缀。
             // 命中后写「前缀标签 + 指向该后缀的指针」；hash 命中须字节级确认防碰撞。
@@ -812,13 +864,17 @@ pub const Message = struct {
                     const suffix = canonical[s..];
                     const suffix_hash = if (s == 0) analyzed.hash else std.hash.Wyhash.hash(0, suffix);
                     for (self.compression_table[0..self.compression_count]) |entry| {
-                        // 14 位指针可寻址偏移 0..=0x3FFF（含 0x3FFF）。
-                        if (entry.hash == suffix_hash and entry.pos <= 0x3FFF and self.nameMatchesAt(entry.pos, suffix)) {
+                        if (entry.hash == suffix_hash and self.nameMatchesAt(entry.pos, suffix)) {
                             if (s > 0) try self.writeLabels(canonical[0 .. s - 1]); // 后缀前的前缀标签（去掉分隔点）
                             try self.ensureCapacity(2);
                             self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
                             self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
                             self.pos += 2;
+                            // 新写出的前缀（如 www.example.com 里的 www）本身也是合法指针
+                            // 目标——其编码是「前缀标签 + 指针」，展开后仍等于整名。
+                            // 不登记的话，后续 foo.www.example.com 只能退回指向 example.com。
+                            // 前缀标签的编码长度恰为 s（每个点变成一个长度字节，另加首字节）。
+                            self.registerSuffixes(canonical, start, s);
                             return;
                         }
                     }
@@ -828,27 +884,11 @@ pub const Message = struct {
             }
 
             // 无可复用后缀：写完整域名并把其各后缀记入压缩表。
-            const start = self.pos;
             try self.writeLabels(canonical);
             try self.ensureCapacity(1);
             self.buf[self.pos] = 0;
             self.pos += 1;
-
-            if (self.compression_count < MAX_COMPRESSION) {
-                var label_it = mem.splitScalar(u8, canonical, '.');
-                var suffix_offset: usize = 0;
-                while (label_it.next()) |label| {
-                    const suffix = canonical[suffix_offset..];
-                    const suffix_hash = std.hash.Wyhash.hash(0, suffix);
-                    self.compression_table[self.compression_count] = .{
-                        .hash = suffix_hash,
-                        .pos = @intCast(start + suffix_offset),
-                    };
-                    self.compression_count += 1;
-                    if (self.compression_count >= MAX_COMPRESSION) break;
-                    suffix_offset += label.len + 1; // 跳过标签和点
-                }
-            }
+            self.registerSuffixes(canonical, start, canonical.len);
         }
 
         /// 写入完整展开、不压缩的域名（用于 RFC 2782 规定不得压缩的 SRV target）。
@@ -925,6 +965,46 @@ test "Message.Builder caps effective buffer at 65535 even with larger dest" {
     @memset(big, 0);
     // 该记录会使 pos 超过 65535 -> 必须以 BufferTooSmall 拒绝，而非成功写入。
     try std.testing.expectError(error.BufferTooSmall, builder.addRecordRaw("", 1, 1, 0, big));
+}
+
+test "Parser and Builder share the 255-including-root name limit (RFC 1035 2.3.4)" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    // 3×63 + 1×61 标签：线格式 = 64*3 + 62 + 1(根) = 255 -> 双方都必须接受；
+    // 末标签改成 62 -> 256 -> 双方都必须拒绝。
+    // 两侧规则若不一致，解析得到的 QNAME 就可能无法原样回显（权威/递归的常见路径）。
+    const S = struct {
+        fn dotted(out: []u8, last: usize) []const u8 {
+            var pos: usize = 0;
+            for (0..3) |_| {
+                @memset(out[pos..][0..63], 'a');
+                out[pos + 63] = '.';
+                pos += 64;
+            }
+            @memset(out[pos..][0..last], 'b');
+            return out[0 .. pos + last];
+        }
+    };
+
+    var name_buf: [512]u8 = undefined;
+    const ok_name = S.dotted(&name_buf, 61);
+
+    // Builder 接受 255，且写出的线格式恰为 255 字节。
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    try builder.addQuestion(ok_name, .A, 1);
+    try std.testing.expectEqual(@as(usize, 12 + 255 + 4), builder.pos);
+
+    // 该报文能被解析回来，名字一致（解析 -> 重建的闭环）。
+    const packet = builder.finish(.{ .id = 1, .rd = 0, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0 });
+    var parser = MessageParser.init(packet);
+    const q = (try parser.nextQuestion()).?;
+    try std.testing.expect(try parser.nameEqualsAt(q.name_pos, ok_name));
+
+    // 256 在构造侧同样是 NameTooLong（解析侧见 parser.zig 的对应测试）。
+    var long_buf: [512]u8 = undefined;
+    const too_long = S.dotted(&long_buf, 62);
+    var builder2 = try Message.Builder.init(&buf);
+    try std.testing.expectError(error.NameTooLong, builder2.addQuestion(too_long, .A, 1));
 }
 
 test "Message.Builder.init rejects buffer too small for header" {
@@ -1063,6 +1143,60 @@ test "Message.Builder compresses shorter shared suffix (com)" {
     var parser = MessageParser.init(packet);
     var nbuf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("other.com", try parser.formatNameAt(name2_off, &nbuf));
+}
+
+test "Message.Builder registers prefixes of compressed names" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+
+    // "example.com" 展开写入。
+    try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 1 });
+    // "www.example.com" 压缩为 "www" + 指针；此处新写出的 www.example.com 本身
+    // 也必须进表，否则下面的 foo.www.example.com 只能指向 example.com。
+    const www_off = builder.pos;
+    try builder.addARecord("www.example.com", 3600, [_]u8{ 192, 0, 2, 2 });
+
+    const pos1 = builder.pos;
+    try builder.addARecord("foo.www.example.com", 3600, [_]u8{ 192, 0, 2, 3 });
+    // owner = "foo"(4) + 指向 www.example.com 的指针(2) = 6 字节；固定部分 14。
+    // 未登记前缀时只能指向 example.com，owner 会是 "foo"+"www"+指针 = 10 字节。
+    try std.testing.expectEqual(@as(usize, 6 + 14), builder.pos - pos1);
+    // 指针确实指向 www.example.com 的起点。
+    try std.testing.expectEqual(@as(u16, 0xC000 | @as(u16, @intCast(www_off))), mem.readInt(u16, buf[pos1 + 4 ..][0..2], .big));
+
+    const packet = builder.finish(.{ .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0 });
+    var parser = MessageParser.init(packet);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("www.example.com", try parser.formatNameAt(www_off, &nbuf));
+    try std.testing.expectEqualStrings("foo.www.example.com", try parser.formatNameAt(pos1, &nbuf));
+}
+
+test "Message.Builder compression table survives more than 32 distinct suffixes" {
+    // 32 槽的老表在 NSEC 链 / 大量胶水这类多名字应答里很快填满，之后所有名字整名展开。
+    const MessageParser = @import("parser.zig").MessageParser;
+    const dest = try std.testing.allocator.alloc(u8, 8192);
+    defer std.testing.allocator.free(dest);
+    var builder = try Message.Builder.init(dest);
+
+    // 40 个互不相同的二级域，每个占 2 个后缀槽（nsN.example / example）——
+    // 前 32 个之后老实现的表已满。
+    var name_buf: [64]u8 = undefined;
+    for (0..40) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "ns{d}.zone{d}.example", .{ i, i });
+        try builder.addARecord(name, 60, [_]u8{ 10, 0, 0, @intCast(i) });
+    }
+
+    // 复用第 39 个域名：表未满则应压缩成 2 字节指针（owner 6+14=20 -> 2+14=16）。
+    const last = try std.fmt.bufPrint(&name_buf, "ns39.zone39.example", .{});
+    const pos1 = builder.pos;
+    try builder.addARecord(last, 60, [_]u8{ 10, 0, 1, 1 });
+    try std.testing.expectEqual(@as(usize, 2 + 14), builder.pos - pos1);
+
+    const packet = builder.finish(.{ .id = 1, .rd = 0, .tc = 0, .aa = 1, .opcode = 0, .qr = 1, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0 });
+    var parser = MessageParser.init(packet);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("ns39.zone39.example", try parser.formatNameAt(pos1, &nbuf));
 }
 
 test "Message.Builder compresses NS rdata name (RFC 1035 type)" {
@@ -1733,17 +1867,47 @@ test "Edns.fromOpt decodes payload size, version, DO flag and ECS" {
 
 test "MessageParser findEdns rejects multiple OPT records (RFC 6891)" {
     const MessageParser = @import("parser.zig").MessageParser;
+    // 非法报文必须手工拼字节：Builder 本身已拒绝写第二个 OPT（见下一条测试），
+    // 用它构造这个 fixture 就等于用被测约束去证明另一处约束。
+    var packet: [64]u8 = undefined;
+    @memset(packet[0..12], 0);
+    var pos: usize = 12;
+    inline for (.{ 1232, 4096 }) |udp_size| {
+        packet[pos] = 0; // 根 owner
+        pos += 1;
+        mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+        mem.writeInt(u16, packet[pos + 2 ..][0..2], udp_size, .big);
+        mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
+        mem.writeInt(u16, packet[pos + 8 ..][0..2], 0, .big); // RDLENGTH=0
+        pos += 10;
+    }
+
+    var parser = MessageParser.init(packet[0..pos]);
+    try std.testing.expectError(error.MultipleOptRecords, parser.findEdns(2));
+}
+
+test "Message.Builder rejects a second OPT record (RFC 6891 6.1.1)" {
+    // 只用 Builder 的服务端不得发出自家严格解析路径会判 FORMERR 的报文。
+    const MessageParser = @import("parser.zig").MessageParser;
     var buf: [512]u8 = undefined;
     var builder = try Message.Builder.init(&buf);
     try builder.addQuestion("example.com", .A, 1);
     try builder.addOptRecord(.{ .udp_payload_size = 1232 });
-    try builder.addOptRecord(.{ .udp_payload_size = 4096 }); // 第二个 OPT，非法
-    const packet = builder.finish(.{ .id = 1, .rd = 1, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0 });
 
+    const snap_pos = builder.pos;
+    const snap_ar = builder.ar;
+    try std.testing.expectError(error.MultipleOptRecords, builder.addOptRecord(.{ .udp_payload_size = 4096 }));
+    try std.testing.expectError(error.MultipleOptRecords, builder.addOptRecordRaw(4096, 0, &[_]u8{}));
+    // 失败必须完全原子：pos 与计数都不动。
+    try std.testing.expectEqual(snap_pos, builder.pos);
+    try std.testing.expectEqual(snap_ar, builder.ar);
+
+    const packet = builder.finish(.{ .id = 1, .rd = 1, .tc = 0, .aa = 0, .opcode = 0, .qr = 0, .rcode = 0, .z = 0, .ra = 0, .qdcount = 0, .ancount = 0, .nscount = 0, .arcount = 0 });
     const msg = try Message.parse(packet);
+    try std.testing.expectEqual(@as(u16, 1), msg.header.arcount);
     var parser = MessageParser.init(packet);
     try parser.skipQuestions(msg.header.qdcount);
-    try std.testing.expectError(error.MultipleOptRecords, parser.findEdns(msg.header.arcount));
+    try std.testing.expectEqual(@as(u16, 1232), (try parser.findEdns(msg.header.arcount)).?.opt.class);
 }
 
 test "Message.Builder addOptRecord with ECS round-trips" {

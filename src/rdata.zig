@@ -6,6 +6,7 @@ const ECSData = @import("types.zig").ECSData;
 const CookieData = @import("types.zig").CookieData;
 const Error = @import("errors.zig").Error;
 const Name = @import("name.zig").Name;
+const skipNameAt = @import("name.zig").skipName;
 
 fn parseECSOption(option_payload: []const u8) !ECSData {
     if (option_payload.len < 4) return error.MalformedECS;
@@ -35,14 +36,17 @@ fn parseECSOption(option_payload: []const u8) !ECSData {
     };
 }
 
-/// Parses an OPT record's RDATA to find the ECS option
-pub fn parseECS(rdata: []const u8) !?ECSData {
-    if (rdata.len >= 11 and rdata[0] == 0 and rdata[1] == @intFromEnum(OptionCode.ECS)) {
-        const len = (@as(u16, rdata[2]) << 8) | rdata[3];
-        if (len > rdata.len - 4) return error.PacketTooShort;
-        return try parseECSOption(rdata[4 .. 4 + len]);
-    }
+/// OPT RDATA 中已识别的 EDNS 选项。同一选项码出现多次时取第一个。
+pub const OptOptions = struct { ecs: ?ECSData = null, cookie: ?CookieData = null };
 
+/// 单趟遍历 OPT 记录的 RDATA（RFC 6891 §6.1.2：{code(2), len(2), value} TLV 序列），
+/// 解出已识别的选项。
+///
+/// TLV 必须**恰好平铺**整个 RDATA：即使目标选项已找到也要走完全程，残留字节一律
+/// error.InvalidRData。提前返回会让「合法 ECS 后面跟一段垃圾」被静默接受，
+/// 形成选项夹带 / FORMERR 判定不一致的窗口。
+pub fn parseOptOptions(rdata: []const u8) !OptOptions {
+    var out = OptOptions{};
     var pos: usize = 0;
     while (pos + 4 <= rdata.len) {
         const code = (@as(u16, rdata[pos]) << 8) | rdata[pos + 1];
@@ -50,15 +54,24 @@ pub fn parseECS(rdata: []const u8) !?ECSData {
         pos += 4;
 
         if (len > rdata.len -| pos) return error.PacketTooShort;
+        const payload = rdata[pos .. pos + len];
+        pos += len;
 
         if (code == @intFromEnum(OptionCode.ECS)) {
-            return try parseECSOption(rdata[pos .. pos + len]);
+            if (out.ecs == null) out.ecs = try parseECSOption(payload);
+        } else if (code == @intFromEnum(OptionCode.COOKIE)) {
+            if (out.cookie == null) out.cookie = try parseCookieOption(payload);
         }
-        pos += len;
     }
     // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
     if (pos != rdata.len) return error.InvalidRData;
-    return null;
+    return out;
+}
+
+/// Parses an OPT record's RDATA to find the ECS option (RFC 7871)。
+/// 同时需要 Cookie 时用 `parseOptOptions`，只遍历一趟。
+pub fn parseECS(rdata: []const u8) !?ECSData {
+    return (try parseOptOptions(rdata)).ecs;
 }
 
 /// TXT RDATA：一个或多个 character-string（RFC 1035 §3.3.14），零拷贝。
@@ -242,21 +255,9 @@ fn parseCookieOption(payload: []const u8) !CookieData {
 }
 
 /// 扫描 OPT 记录 RDATA，查找 COOKIE 选项（RFC 7873）。无则返回 null。
+/// 同时需要 ECS 时用 `parseOptOptions`，只遍历一趟。
 pub fn parseCookie(rdata: []const u8) !?CookieData {
-    var pos: usize = 0;
-    while (pos + 4 <= rdata.len) {
-        const code = (@as(u16, rdata[pos]) << 8) | rdata[pos + 1];
-        const len = (@as(u16, rdata[pos + 2]) << 8) | rdata[pos + 3];
-        pos += 4;
-        if (len > rdata.len -| pos) return error.PacketTooShort;
-        if (code == @intFromEnum(OptionCode.COOKIE)) {
-            return try parseCookieOption(rdata[pos .. pos + len]);
-        }
-        pos += len;
-    }
-    // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
-    if (pos != rdata.len) return error.InvalidRData;
-    return null;
+    return (try parseOptOptions(rdata)).cookie;
 }
 
 /// RDATA 表示 (零拷贝)。
@@ -292,28 +293,21 @@ pub const RData = union(Type) {
 
     /// 在 RDATA 内推进越过一个域名（含压缩指针），仅校验与定位，不复制。
     /// 用于跳到域名之后的定长字段。
-    fn advanceName(data: []const u8, pos: *usize) Error!void {
-        while (pos.* < data.len) {
-            const len = data[pos.*];
-            if (len == 0) {
-                pos.* += 1;
-                return;
-            }
-            if (len & 0xC0 == 0xC0) { // 压缩指针
-                if (data.len - pos.* < 2) return error.PacketTooShort;
-                pos.* += 2;
-                return;
-            }
-            if (len > 63) return error.LabelTooLong;
-            if (data.len - pos.* < 1 + len) return error.PacketTooShort;
-            pos.* += 1 + len;
-        }
-        return error.MalformedName;
+    ///
+    /// 压缩指针会被**跟随并完整校验**（目标越界、成环、展开后 >255），推进量仍是
+    /// 线格式的 2 字节；名字的线格式必须整体落在本条 RDATA 内。
+    /// `base` 为 RDATA 在完整报文 `msg` 中的绝对偏移，`pos` 相对 RDATA 起点。
+    fn advanceName(msg: []const u8, base: usize, data: []const u8, pos: *usize) Error!void {
+        const end = try skipNameAt(msg, base + pos.*, 0);
+        // 名字（及其尾部指针）必须落在 RDLENGTH 划定的范围内。
+        if (end > base + data.len) return error.PacketTooShort;
+        pos.* = end - base;
     }
 
     /// 同 advanceName，但禁止压缩指针（RFC 4034 §3.1.7/§4.1.1、RFC 9460 §2.2
     /// 规定 RRSIG signer / NSEC next_domain / SVCB target 不得压缩）。
     fn advanceNameNoPointer(data: []const u8, pos: *usize) Error!void {
+        var total: usize = 1; // RFC 1035 §2.3.4 的 255 含根结束符
         while (pos.* < data.len) {
             const len = data[pos.*];
             if (len == 0) {
@@ -323,6 +317,8 @@ pub const RData = union(Type) {
             if (len & 0xC0 == 0xC0) return error.MalformedName; // 禁止压缩
             if (len > 63) return error.LabelTooLong;
             if (data.len - pos.* < 1 + len) return error.PacketTooShort;
+            total += 1 + len;
+            if (total > 255) return error.NameTooLong;
             pos.* += 1 + len;
         }
         return error.MalformedName;
@@ -351,7 +347,7 @@ pub const RData = union(Type) {
             },
             .NS, .CNAME, .PTR => {
                 var pos: usize = 0;
-                try advanceName(data, &pos);
+                try advanceName(msg, rdata_offset, data, &pos);
                 if (pos != data.len) return error.InvalidRData; // 名字须精确覆盖 RDATA
                 const name = Name{ .buffer = msg, .offset = rdata_offset };
                 return switch (rtype) {
@@ -365,7 +361,7 @@ pub const RData = union(Type) {
                 if (data.len < 2) return error.InvalidRData;
                 const preference = mem.readInt(u16, data[0..2], .big);
                 var pos: usize = 2;
-                try advanceName(data, &pos);
+                try advanceName(msg, rdata_offset, data, &pos);
                 if (pos != data.len) return error.InvalidRData; // exchange 须精确覆盖 RDATA
                 return RData{ .MX = .{
                     .preference = preference,
@@ -388,9 +384,9 @@ pub const RData = union(Type) {
             .SOA => {
                 var pos: usize = 0;
                 const mname_off = rdata_offset + pos;
-                try advanceName(data, &pos);
+                try advanceName(msg, rdata_offset, data, &pos);
                 const rname_off = rdata_offset + pos;
-                try advanceName(data, &pos);
+                try advanceName(msg, rdata_offset, data, &pos);
                 if (data.len != pos + 20) return error.InvalidRData; // 两名 + 20 字节须精确覆盖
                 const serial = mem.readInt(u32, data[pos..][0..4], .big);
                 const refresh = mem.readInt(u32, data[pos + 4 ..][0..4], .big);
@@ -413,7 +409,7 @@ pub const RData = union(Type) {
                 const weight = mem.readInt(u16, data[2..4], .big);
                 const port = mem.readInt(u16, data[4..6], .big);
                 var pos: usize = 6;
-                try advanceName(data, &pos);
+                try advanceName(msg, rdata_offset, data, &pos);
                 if (pos != data.len) return error.InvalidRData; // target 须精确覆盖 RDATA
                 return RData{ .SRV = .{
                     .priority = priority,
@@ -528,7 +524,7 @@ pub const RData = union(Type) {
                     .salt = data[5 .. 5 + salt_len],
                 } };
             },
-            .OPT => return error.InvalidRData, // OPT 需要特殊处理
+            .OPT => return error.UseEdns, // OPT 不是普通 RR：RDATA 是 EDNS 选项 TLV，用 findEdns / Edns.fromOpt
             _ => return error.UnknownType,
         };
     }
@@ -829,6 +825,45 @@ test "parseCookie rejects invalid cookie length" {
     // len=9：既非 8 也不在 16..40 -> 非法
     const rdata = "\x00\x0a\x00\x09" ++ "\x01\x02\x03\x04\x05\x06\x07\x08\x09";
     try std.testing.expectError(error.MalformedCookie, parseCookie(rdata));
+}
+
+test "parseECS rejects trailing garbage after a valid ECS option" {
+    // RFC 6891 §6.1.2: OPT RDATA 是恰好平铺的 TLV 序列。找到 ECS 就返回会放过
+    // 后面的残尾字节，形成选项夹带 / FORMERR 判定不一致的窗口。
+    const ecs = "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02";
+    try std.testing.expectError(error.InvalidRData, parseECS(ecs ++ "\xff\xff"));
+    // COOKIE 在前的慢路径与 ECS 在前的快路径必须同规则。
+    const cookie = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
+    try std.testing.expectError(error.InvalidRData, parseCookie(cookie ++ "\xff\xff"));
+    // 残尾后面跟的若是畸形 TLV（长度越界）同样要拒。
+    try std.testing.expectError(error.PacketTooShort, parseECS(ecs ++ "\x00\x0b\x00\x10\x01"));
+}
+
+test "parseECS still returns ECS when a well-formed option follows" {
+    // 严格的尾部检查不得误伤「ECS 后面跟另一个合法选项」这种正常报文。
+    const rdata = "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02" ++
+        "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
+    const ecs = (try parseECS(rdata)).?;
+    try std.testing.expectEqual(@as(u8, 24), ecs.source_prefix);
+    const cookie = (try parseCookie(rdata)).?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &cookie.client);
+}
+
+test "parseOptOptions yields ECS and Cookie in a single walk" {
+    const rdata = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08" ++
+        "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02";
+    const opts = try parseOptOptions(rdata);
+    try std.testing.expectEqual(@as(u16, 1), opts.ecs.?.family);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &opts.cookie.?.client);
+    // 无选项的空 RDATA 合法。
+    const empty = try parseOptOptions("");
+    try std.testing.expect(empty.ecs == null and empty.cookie == null);
+}
+
+test "RData.parse on OPT returns a dedicated error (RFC 6891)" {
+    // 泛化的「遍历附加区每条 RR」循环需要一个明确信号分流到 EDNS 路径，
+    // 而不是与真正畸形的 RDATA 共用 InvalidRData。
+    try std.testing.expectError(error.UseEdns, RData.parse(.OPT, "", 0, 0));
 }
 
 test "parseECS rejects trailing bytes that don't form a TLV" {

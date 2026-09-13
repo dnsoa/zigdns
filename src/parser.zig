@@ -5,10 +5,15 @@ const CookieData = @import("types.zig").CookieData;
 const Type = @import("types.zig").Type;
 const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
+const parseOptOptions = @import("rdata.zig").parseOptOptions;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
+const skipNameAt = @import("name.zig").skipName;
 const formatDnsName = @import("name.zig").formatDnsName;
 const Error = @import("errors.zig").Error;
+
+/// 压缩指针目标的最小合法偏移：域名不可能起始于 12 字节 header 内。
+const POINTER_FLOOR = 12;
 
 pub const Question = struct {
     name_pos: usize, // Where the owner name starts in the buffer (for zero-copy echo / name resolution)
@@ -29,7 +34,12 @@ pub const ResourceRecord = struct {
 
     /// RFC 2181 §8: 收到的 TTL 是 31 位无符号；最高位置位时应视为 0。
     /// 保留原始 `ttl` 不变，缓存/回显请使用此规范化值。
+    ///
+    /// OPT（类型 41）除外：RFC 6891 §6.1.3 把 TTL 字段挪作扩展 RCODE(8) + 版本(8) +
+    /// flags(16)，扩展 RCODE ≥128 时最高位本就置位。对其套用 RFC 2181 会把 DO/版本/
+    /// 扩展 RCODE 一起清零，故原样返回；OPT 本来也没有可缓存的 TTL 语义。
     pub fn effectiveTtl(self: ResourceRecord) u32 {
+        if (self.rtype == .OPT) return self.ttl;
         return if (self.ttl > 0x7FFFFFFF) 0 else self.ttl;
     }
 };
@@ -65,31 +75,13 @@ pub const MessageParser = struct {
 
     /// Skips a DNS name (including compression pointers) without copying it.
     /// Crucial for jumping to the Type/Class fields.
-    /// RFC 1035: label max 63 bytes, total name max 255 bytes
+    ///
+    /// 委托给 `name.skipName`：压缩指针会被**跟随并完整校验**（RFC 1035 §2.3.4 的
+    /// 标签 ≤63 / 整名 ≤255 含根、目标越界、指向 header、指针成环），而 `pos` 仍落在
+    /// 线格式结束处（指针后 2 字节）。只 skip 不展开的快路径服务端因此与
+    /// `formatNameAt` / `nameEqualsAt` 走同一套校验，不会放行畸形名字。
     fn skipName(self: *MessageParser) !void {
-        var total_len: usize = 0;
-        while (self.pos < self.buffer.len) {
-            const len = self.buffer[self.pos];
-            if (len == 0) {
-                self.pos += 1;
-                return;
-            }
-            if (len & 0xC0 == 0xC0) { // Pointer
-                // 指针占 2 字节；末尾仅剩 1 字节（悬挂指针）时直接报错，不得把 pos
-                // 推过缓冲区末尾后依赖下游兜底（与 NameCursor.next 的守卫一致）。
-                if (self.pos + 2 > self.buffer.len) return error.PacketTooShort;
-                self.pos += 2;
-                return;
-            }
-            // RFC 1035 2.3.4: label max 63 bytes
-            if (len > 63) return error.LabelTooLong;
-            // RFC 1035: total name max 255 bytes
-            total_len += 1 + len;
-            if (total_len > 255) return error.NameTooLong;
-            if (self.pos + 1 + len > self.buffer.len) return error.PacketTooShort;
-            self.pos += 1 + len;
-        }
-        return error.MalformedName;
+        self.pos = try skipNameAt(self.buffer, self.pos, POINTER_FLOOR);
     }
 
     /// Parses the next Question in the packet
@@ -179,8 +171,10 @@ pub const MessageParser = struct {
         }
     }
 
-    /// 返回附加区第一个 OPT 记录（快路径，不检测重复、不校验 owner 为根）。
-    /// 需要 RFC 6891 §6.1.1 严格语义（多 OPT/非根 owner → FORMERR）时用 `findEdns`。
+    /// **快路径**：返回附加区第一个 OPT 记录，遇到即停。
+    /// 不检测第二个 OPT，也不校验 owner name 为根——即不做 RFC 6891 §6.1.1 的
+    /// FORMERR 判定。只在你已用别的手段确认过报文合法时使用；
+    /// 面向不可信输入的严格入口是 `findEdns`。
     pub fn findOptRecord(self: *const MessageParser, count: u16) !?ResourceRecord {
         var scan = self.*;
         var remaining = count;
@@ -191,8 +185,9 @@ pub const MessageParser = struct {
         return null;
     }
 
-    /// 便捷：返回第一个 OPT 中的 ECS（快路径，不检测重复 OPT）。严格校验用 `findEdns`。
-
+    /// **快路径**：返回第一个 OPT 中的 ECS（RFC 7871）。
+    /// 与 `findOptRecord` 同样跳过 RFC 6891 §6.1.1 检查（多 OPT / 非根 owner）。
+    /// 严格校验且同时要 OPT+ECS+Cookie 时用 `findEdns`（单趟扫描）。
     pub fn findECS(self: *const MessageParser, count: u16) !?ECSData {
         var scan = self.*;
         var remaining = count;
@@ -203,7 +198,9 @@ pub const MessageParser = struct {
         return null;
     }
 
-    /// 扫描附加区第一个 OPT 记录并解出其 DNS Cookie（RFC 7873；快路径，不检测重复 OPT）。
+    /// **快路径**：返回第一个 OPT 中的 DNS Cookie（RFC 7873）。
+    /// 与 `findOptRecord` 同样跳过 RFC 6891 §6.1.1 检查（多 OPT / 非根 owner）。
+    /// 严格校验用 `findEdns`。
     pub fn findCookie(self: *const MessageParser, count: u16) !?CookieData {
         var scan = self.*;
         var remaining = count;
@@ -214,12 +211,17 @@ pub const MessageParser = struct {
         return null;
     }
 
-    pub const Edns = struct { opt: ResourceRecord, ecs: ?ECSData };
+    /// `findEdns` 的结果：OPT 记录本身 + 其 RDATA 中已识别的选项。
+    /// EDNS 头部字段（UDP 载荷大小 / 版本 / 扩展 RCODE / DO）在 `opt` 的
+    /// CLASS 与 TTL 里，用 `dns.Edns.fromOpt(result.opt)` 可一次解出，
+    /// 与 Builder 侧的 `dns.Edns` 是同一个类型。
+    pub const Edns = struct { opt: ResourceRecord, ecs: ?ECSData, cookie: ?CookieData };
 
-    /// 单趟扫描附加区：一次返回 OPT 记录及其中的 ECS（若有），
-    /// 避免同时需要 OPT 与 ECS 时 findOptRecord + findECS 的双次扫描。
-    /// 严格模式：扫描全程，若发现多于一个 OPT 记录则报 error.MultipleOptRecords
-    /// （RFC 6891 §6.1.1：多 OPT 必须回 FORMERR）。
+    /// **严格入口**（RFC 6891 §6.1.1）：单趟扫描附加区，一次返回 OPT 记录及其
+    /// RDATA 中的 ECS 与 Cookie，避免 findOptRecord + findECS + findCookie 的三次扫描。
+    /// - 多于一个 OPT -> error.MultipleOptRecords（必须回 FORMERR）
+    /// - OPT 的 owner name 非根 -> error.MalformedName
+    /// - OPT RDATA 的 TLV 未恰好平铺 -> error.InvalidRData
     pub fn findEdns(self: *const MessageParser, count: u16) !?Edns {
         var scan = self.*;
         var remaining = count;
@@ -230,7 +232,9 @@ pub const MessageParser = struct {
                 if (found != null) return error.MultipleOptRecords;
                 // RFC 6891 §6.1.1: OPT 的 owner name 必须为根（单个 0 字节）。
                 if (rr.name_pos >= self.buffer.len or self.buffer[rr.name_pos] != 0) return error.MalformedName;
-                found = .{ .opt = rr, .ecs = try parseECS(rr.rdata) };
+                // 选项只遍历一趟，ECS 与 Cookie 同时取出。
+                const options = try parseOptOptions(rr.rdata);
+                found = .{ .opt = rr, .ecs = options.ecs, .cookie = options.cookie };
             }
         }
         return found;
@@ -280,6 +284,10 @@ pub const MessageParser = struct {
     /// Parse a resource record's RDATA. Domain names inside RDATA are returned as
     /// self-contained `Name` values bound to this parser's buffer, so they resolve
     /// compression pointers without any pointer arithmetic or aliasing assumptions.
+    ///
+    /// OPT（类型 41）不是普通 RR：其 RDATA 是 EDNS 选项 TLV 序列，CLASS/TTL 也另作他用。
+    /// 对 OPT 调用本方法返回 `error.UseEdns`——泛化的「遍历附加区每条 RR」循环据此
+    /// 明确分流到 `findEdns` / `dns.Edns.fromOpt`，而不是撞上含混的 InvalidRData。
     pub fn parseRData(self: *const MessageParser, rr: ResourceRecord) !RData {
         return RData.parse(rr.rtype, self.buffer, rr.rdata_offset, rr.rdlength);
     }
@@ -478,7 +486,7 @@ test "MessageParser nextRR returns null at end" {
 
 test "MessageParser with compression pointer" {
     var packet: [100]u8 = undefined;
-    @memset(packet[0..12], 0);
+    @memset(&packet, 0);
 
     // 在偏移 30 处放置 "com\x00"
     packet[30] = 3;
@@ -498,11 +506,101 @@ test "MessageParser with compression pointer" {
     mem.writeInt(u16, packet[pos..][0..2], 1, .big); // A
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1, .big); // IN
 
-    var parser = MessageParser.init(packet[0 .. pos + 4]);
+    // 报文须覆盖指针目标（35）：skipName 会跟随并校验展开结果，
+    // 目标落在切片之外即为越界指针。
+    var parser = MessageParser.init(packet[0..35]);
     const question = (try parser.nextQuestion()).?;
 
     try std.testing.expectEqual(Type.A, question.qtype);
     try std.testing.expectEqual(@as(u16, 1), question.qclass);
+    // 名字止于指针之后（22），而非指针目标之后。
+    try std.testing.expectEqual(@as(usize, 22), question.qname_end_pos);
+}
+
+test "MessageParser rejects compression pointer into the header" {
+    // 域名不可能起始于 12 字节 header 内；指向 header 的 QNAME 是畸形输入，
+    // 必须在 skip 阶段就被拒（快路径服务端只 skip 不展开）。
+    var packet: [32]u8 = undefined;
+    @memset(&packet, 0);
+    packet[12] = 0xC0;
+    packet[13] = 0x02; // 指向偏移 2（header 内）
+    var parser = MessageParser.init(&packet);
+    try std.testing.expectError(error.InvalidOffset, parser.nextQuestion());
+}
+
+test "MessageParser skipName validates the name behind a pointer" {
+    // 指针目标处是超长标签：只跳过不展开会放行，导致 skipQuestions 后
+    // 按类型直接应答的服务端接受 formatNameAt 会拒绝的 QNAME。
+    var packet: [64]u8 = undefined;
+    @memset(&packet, 0);
+    packet[12] = 0xC0;
+    packet[13] = 20;
+    packet[20] = 64; // 非法标签长度（>63）
+    var parser = MessageParser.init(&packet);
+    try std.testing.expectError(error.LabelTooLong, parser.nextQuestion());
+
+    // 指针成环同样必须在 skip 阶段被拒，而不是靠下游兜底。
+    var loop: [32]u8 = undefined;
+    @memset(&loop, 0);
+    loop[12] = 0xC0;
+    loop[13] = 14;
+    loop[14] = 0xC0;
+    loop[15] = 12;
+    var loop_parser = MessageParser.init(&loop);
+    try std.testing.expectError(error.MalformedName, loop_parser.nextQuestion());
+}
+
+test "MessageParser enforces 255 including root on parse (RFC 1035 2.3.4)" {
+    // 3×63 + 1×61 标签的线格式恰为 255 -> 合法；末标签改成 62 则为 256 -> 拒绝。
+    // 与 Builder.validateName 同一边界，保证「能解析的名字一定能重新构造」。
+    const S = struct {
+        fn build(packet: []u8, last: u8) []const u8 {
+            @memset(packet[0..12], 0);
+            var pos: usize = 12;
+            for (0..3) |_| {
+                packet[pos] = 63;
+                @memset(packet[pos + 1 ..][0..63], 'a');
+                pos += 64;
+            }
+            packet[pos] = last;
+            @memset(packet[pos + 1 ..][0..last], 'b');
+            pos += 1 + last;
+            packet[pos] = 0;
+            pos += 1;
+            mem.writeInt(u16, packet[pos..][0..2], 1, .big); // A
+            mem.writeInt(u16, packet[pos + 2 ..][0..2], 1, .big); // IN
+            return packet[0 .. pos + 4];
+        }
+    };
+
+    var ok_buf: [512]u8 = undefined;
+    const ok = S.build(&ok_buf, 61);
+    var ok_parser = MessageParser.init(ok);
+    const q = (try ok_parser.nextQuestion()).?;
+    try std.testing.expectEqual(@as(usize, 12 + 255), q.qname_end_pos);
+
+    var bad_buf: [512]u8 = undefined;
+    var bad_parser = MessageParser.init(S.build(&bad_buf, 62));
+    try std.testing.expectError(error.NameTooLong, bad_parser.nextQuestion());
+}
+
+test "ResourceRecord.effectiveTtl keeps OPT TTL intact (RFC 6891 6.1.3)" {
+    // OPT 的 TTL 是 扩展RCODE(8)+版本(8)+flags(16)：扩展 RCODE=128 时最高位置位，
+    // 套用 RFC 2181 会把 DO/版本/扩展 RCODE 一起清零。
+    const ttl: u32 = (@as(u32, 128) << 24) | (@as(u32, 0) << 16) | 0x8000; // DO=1
+    const opt = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .OPT,
+        .class = 1232,
+        .ttl = ttl,
+        .rdlength = 0,
+        .rdata = &[_]u8{},
+        .rdata_offset = 0,
+    };
+    try std.testing.expectEqual(ttl, opt.effectiveTtl());
+    try std.testing.expect(opt.effectiveTtl() & 0x8000 != 0); // DO 仍在
+    try std.testing.expectEqual(@as(u8, 128), @as(u8, @truncate(opt.effectiveTtl() >> 24)));
 }
 
 test "MessageParser counted question iterator" {
@@ -670,6 +768,36 @@ test "MessageParser findEdns returns OPT and ECS in one scan" {
     try std.testing.expectEqual(@as(u16, 1), edns.ecs.?.family);
     try std.testing.expectEqual(@as(u8, 24), edns.ecs.?.source_prefix);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2 }, edns.ecs.?.address);
+}
+
+test "MessageParser findEdns returns OPT, ECS and Cookie in one scan" {
+    // 单趟扫描即可满足「OPT + ECS + Cookie」的常见服务端需求，
+    // 不必再叠加 findCookie 的第二次扫描。
+    var packet: [96]u8 = undefined;
+    @memset(&packet, 0);
+
+    const rdata = "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02" ++ // ECS 192.0.2/24
+        "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08"; // COOKIE（仅客户端）
+
+    var pos: usize = 12;
+    packet[pos] = 0; // 根 owner
+    pos += 1;
+    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
+    mem.writeInt(u32, packet[pos + 4 ..][0..4], 0x00008000, .big); // DO=1
+    mem.writeInt(u16, packet[pos + 8 ..][0..2], @intCast(rdata.len), .big);
+    pos += 10;
+    @memcpy(packet[pos..][0..rdata.len], rdata);
+    pos += rdata.len;
+
+    const parser = MessageParser.init(packet[0..pos]);
+    const edns = (try parser.findEdns(1)).?;
+    try std.testing.expectEqual(@as(u16, 1232), edns.opt.class);
+    try std.testing.expectEqual(@as(u8, 24), edns.ecs.?.source_prefix);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &edns.cookie.?.client);
+
+    // OPT 走通用 RDATA 解析必须给出明确的分流信号。
+    try std.testing.expectError(error.UseEdns, parser.parseRData(edns.opt));
 }
 
 test "MessageParser findECS extracts ECS from OPT record" {

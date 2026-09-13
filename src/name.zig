@@ -8,9 +8,10 @@ const MAX_NAME = 255;
 // 指针环导致死循环（纯指针跳转不增长 total，故必须独立限次）。
 const MAX_POINTER_JUMPS = 128;
 
-/// 域名遍历游标：所有「跟随压缩指针」的读取逻辑的唯一实现。
-/// 逐标签推进，跟随 0xC0 压缩指针，统一强制 RFC 上限（label≤63 / name≤255）、
+/// 域名遍历游标：所有「读出标签」的压缩指针逻辑的唯一实现。
+/// 逐标签推进，跟随 0xC0 压缩指针，统一强制 RFC 上限（label≤63 / name≤255 含根）、
 /// 边界检查与指针跳转限次（防环）。零拷贝——返回指向原缓冲区的标签切片。
+/// 只需跳过名字（不要标签）时用同规则但不返回切片的 `skipName`。
 ///
 /// 语义：一个游标实例遍历「一个」完整域名——`total`（累计长度，用于 255 上限）
 /// 与 `jumps`（指针跳转计数，用于防环）跨多次 `next()` 累积。
@@ -52,13 +53,59 @@ pub const NameCursor = struct {
             if (start + len > self.buffer.len) return error.PacketTooShort;
 
             self.total += 1 + len;
-            if (self.total > MAX_NAME) return error.NameTooLong;
+            // RFC 1035 §2.3.4 的 255 上限「含根结束符」：已累计的标签字节再加 1 字节
+            // 根终止符即为线格式总长，故边界是 total+1（否则 256 字节的名字会被放行，
+            // 而 Builder.validateName 以同一规则拒绝，形成解析/构造不一致）。
+            if (self.total + 1 > MAX_NAME) return error.NameTooLong;
 
             self.pos = start + len;
             return self.buffer[start .. start + len];
         }
     }
 };
+
+/// 跳过 `buffer` 中起始于 `start` 的域名，返回其**线格式**结束偏移：
+/// 未压缩名为根结束符之后；压缩名为首个压缩指针的 2 字节之后（**不是**指针目标之后）——
+/// 也就是下一个字段（type/class 等）的起点。
+///
+/// 全程按 `NameCursor` 的规则校验展开结果：标签 ≤63、整名 ≤255（含根）、
+/// 指针越界与成环。跳过名字的快路径（`MessageParser.skipName` / RDATA 内推进）
+/// 必须走这里，否则「只跳过不展开」的服务端会放行 NameCursor 本会拒绝的名字。
+///
+/// `pointer_floor`：压缩指针目标的最小合法偏移。完整报文上下文传 12（域名不可能
+/// 起始于 12 字节 header 内，指向 header 的指针是畸形输入）；裸缓冲区传 0。
+///
+/// 这是 `NameCursor.next` 的同规则副本，区别仅在于不返回标签切片——跳过名字是
+/// 服务端最热的路径，省掉 `!?[]const u8` 的错误联合+可选切片返回值是值得的。
+/// 两者的判定必须保持一致（见 "skipName agrees with NameCursor" 测试）。
+pub fn skipName(buffer: []const u8, start: usize, pointer_floor: usize) !usize {
+    var pos = start;
+    var total: usize = 1; // 根结束符计入 255（RFC 1035 §2.3.4）
+    var jumps: usize = 0;
+    var wire_end: ?usize = null; // 线格式止于首个指针；在此之前即整名末尾
+    while (true) {
+        if (pos >= buffer.len) return error.PacketTooShort;
+        const len = buffer[pos];
+        if (len == 0) return wire_end orelse pos + 1;
+
+        if (len & 0xC0 == 0xC0) { // 压缩指针：跟随以校验展开结果
+            if (pos + 2 > buffer.len) return error.PacketTooShort;
+            const target = (@as(usize, len & 0x3F) << 8) | buffer[pos + 1];
+            if (target < pointer_floor or target >= buffer.len) return error.InvalidOffset;
+            if (jumps >= MAX_POINTER_JUMPS) return error.MalformedName; // 防指针环
+            jumps += 1;
+            if (wire_end == null) wire_end = pos + 2;
+            pos = target;
+            continue;
+        }
+
+        if (len > MAX_LABEL) return error.LabelTooLong;
+        if (pos + 1 + len > buffer.len) return error.PacketTooShort;
+        total += 1 + len;
+        if (total > MAX_NAME) return error.NameTooLong;
+        pos += 1 + len;
+    }
+}
 
 /// 将点分域名切成标签数组（根 "." 或 "" -> 0 个标签）。返回标签数。
 /// out 长度上限即为可容纳的标签数；超出则截断到上限（域名 ≤255 -> ≤127 标签）。
@@ -102,19 +149,38 @@ pub fn canonicalCompare(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(na, nb); // 共有后缀相同 -> 标签更少者在前
 }
 
-/// 零拷贝域名解析器
+/// 零拷贝域名解析器：只负责「逐标签遍历一个域名」，不是报文游标。
 /// 不分配内存，仅返回指向原始数据包的切片迭代器。
 /// 内部持有一个贯穿整次遍历的 `NameCursor`，使 jumps/total 跨 next() 累积——
 /// 这是防指针环与 255 上限的前提（每次新建游标会重置计数，导致死循环 DoS）。
+///
+/// 走整个报文（跳到 type/class、下一条记录）请用 `MessageParser`；
+/// 本迭代器只保证 `pos` 停在**线格式**结束处（见下）。
 pub const NameIterator = struct {
     buffer: []const u8,
+    /// 入参为域名起始偏移；迭代中被更新为目前已知的**线格式**结束偏移。
+    /// 跟随压缩指针后，它是首个指针之后 2 字节的位置（而非指针目标之后），
+    /// 与 `skipName` 一致，因此可安全用于续读其后的 type/class。
     pos: usize,
     cursor: ?NameCursor = null,
+    /// 线格式已在首个压缩指针处结束，`pos` 不再随游标推进。
+    wire_done: bool = false,
 
     pub fn next(self: *NameIterator) !?[]const u8 {
         if (self.cursor == null) self.cursor = NameCursor.init(self.buffer, self.pos);
-        const label = try self.cursor.?.next();
-        self.pos = self.cursor.?.pos;
+        const cur = &self.cursor.?;
+        const before = cur.pos;
+        const jumps_before = cur.jumps;
+        const label = try cur.next();
+        if (!self.wire_done) {
+            if (cur.jumps > jumps_before) {
+                // 首次跳转发生在进入本次 next 时的游标位置：该处是 2 字节指针。
+                self.pos = before + 2;
+                self.wire_done = true;
+            } else {
+                self.pos = cur.pos;
+            }
+        }
         return label;
     }
 };
@@ -340,6 +406,121 @@ test "formatDnsName rejects name exceeding 255 bytes" {
 
     var out: [512]u8 = undefined;
     try std.testing.expectError(error.NameTooLong, formatDnsName(&buf, 0, &out));
+}
+
+test "NameIterator.pos is the wire end after a compression pointer" {
+    // "example" + 指向偏移 12 的指针；线格式在指针后结束（偏移 10），
+    // 而非指针目标 "com" 之后（偏移 17）。调用方按 pos 续读才能拿到正确字节。
+    var buffer: [20]u8 = undefined;
+    @memset(&buffer, 0);
+    buffer[12] = 3;
+    @memcpy(buffer[13..16], "com");
+    buffer[16] = 0;
+    buffer[0] = 7;
+    @memcpy(buffer[1..8], "example");
+    buffer[8] = 0xC0;
+    buffer[9] = 0x0C;
+
+    var iter = NameIterator{ .buffer = &buffer, .pos = 0 };
+    try std.testing.expectEqualStrings("example", (try iter.next()).?);
+    try std.testing.expectEqualStrings("com", (try iter.next()).?);
+    try std.testing.expect((try iter.next()) == null);
+    try std.testing.expectEqual(@as(usize, 10), iter.pos);
+    // 与 skipName 给出的线格式结束点一致。
+    try std.testing.expectEqual(@as(usize, 10), try skipName(&buffer, 0, 0));
+}
+
+test "NameIterator.pos ends after terminator for uncompressed name" {
+    const domain = "\x07example\x03com\x00";
+    var iter = NameIterator{ .buffer = domain, .pos = 0 };
+    while (try iter.next()) |_| {}
+    try std.testing.expectEqual(@as(usize, 13), iter.pos);
+}
+
+test "skipName enforces 255 including the root octet (RFC 1035 2.3.4)" {
+    // 3×63 + 1×61 标签：线格式 = 64*3 + 62 + 1 = 255 -> 合法。
+    // 同构造改成 62 字节末标签：= 256 -> NameTooLong。
+    const S = struct {
+        fn build(buf: []u8, last: u8) []const u8 {
+            var pos: usize = 0;
+            for (0..3) |_| {
+                buf[pos] = 63;
+                @memset(buf[pos + 1 ..][0..63], 'a');
+                pos += 64;
+            }
+            buf[pos] = last;
+            @memset(buf[pos + 1 ..][0..last], 'b');
+            pos += 1 + last;
+            buf[pos] = 0;
+            return buf[0 .. pos + 1];
+        }
+    };
+    var buf: [512]u8 = undefined;
+
+    const ok = S.build(&buf, 61);
+    try std.testing.expectEqual(@as(usize, 255), ok.len);
+    try std.testing.expectEqual(@as(usize, 255), try skipName(ok, 0, 0));
+
+    var buf2: [512]u8 = undefined;
+    const too_long = S.build(&buf2, 62);
+    try std.testing.expectEqual(@as(usize, 256), too_long.len);
+    try std.testing.expectError(error.NameTooLong, skipName(too_long, 0, 0));
+}
+
+test "skipName agrees with NameCursor" {
+    // skipName 是 NameCursor.next 的无切片副本；两者对「接受/拒绝」的判定必须一致，
+    // 否则「只跳过」与「展开」两条路径又会重新分叉（issue #2 的根因）。
+    const cases = [_][]const u8{
+        "\x00", // 根
+        "\x07example\x03com\x00", // 普通名
+        "\x03www\xC0\x01", // 指针（目标在缓冲区内）
+        "\x40aaaa\x00", // 标签 >63
+        "\x03www", // 缺结束符
+        "\xC0", // 悬挂指针
+        "\xC0\x00", // 自指成环
+        "\xC0\x02\xC0\x00", // 互指成环
+        "\x01a\xC0\x00", // 带标签的环
+    };
+    for (cases) |buf| {
+        const skip_err: ?anyerror = if (skipName(buf, 0, 0)) |_| null else |e| e;
+        var cur = NameCursor.init(buf, 0);
+        const cursor_err: ?anyerror = while (true) {
+            if (cur.next()) |label| {
+                if (label == null) break null;
+            } else |e| break e;
+        };
+        try std.testing.expectEqual(cursor_err, skip_err);
+    }
+}
+
+test "skipName rejects pointer below the floor" {
+    // 报文上下文中，域名不可能起始于 12 字节 header 内；指向 header 的指针是畸形输入。
+    var msg: [32]u8 = undefined;
+    @memset(&msg, 0);
+    msg[12] = 0xC0;
+    msg[13] = 0x02; // 指向偏移 2（header 内）
+    try std.testing.expectError(error.InvalidOffset, skipName(&msg, 12, 12));
+    // 裸缓冲区语义（floor=0）下同一输入仅按普通名字校验。
+    _ = try skipName(&msg, 12, 0);
+}
+
+test "skipName validates the expansion behind a pointer" {
+    // 指针目标处是超长标签：只跳过不展开的实现会放行，skipName 必须报错。
+    var msg: [64]u8 = undefined;
+    @memset(&msg, 0);
+    msg[12] = 0xC0;
+    msg[13] = 20;
+    msg[20] = 64; // 非法标签长度
+    try std.testing.expectError(error.LabelTooLong, skipName(&msg, 12, 12));
+
+    // 指针成环同样必须在跳过阶段被拒。
+    var loop: [32]u8 = undefined;
+    @memset(&loop, 0);
+    loop[12] = 0xC0;
+    loop[13] = 14;
+    loop[14] = 0xC0;
+    loop[15] = 12;
+    try std.testing.expectError(error.MalformedName, skipName(&loop, 12, 12));
 }
 
 test "NameCursor terminates on pointer loop" {
