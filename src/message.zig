@@ -2117,6 +2117,6 @@ test "Message.Builder addAAAARecord guards final RDATA copy" {
     // 仅 16 字节 RDATA 拷贝越界 (35+16=51 > 48)。
     var buf: [48]u8 = undefined;
     var builder = try Message.Builder.init(&buf);
-    const ip = [_]u8{0} ** 16;
+    const ip = @as([16]u8, @splat(0));
     try std.testing.expectError(error.BufferTooSmall, builder.addAAAARecord("example.com", 3600, ip));
 }
