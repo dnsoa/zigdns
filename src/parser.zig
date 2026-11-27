@@ -3,22 +3,30 @@ const mem = std.mem;
 const ECSData = @import("types.zig").ECSData;
 const CookieData = @import("types.zig").CookieData;
 const Type = @import("types.zig").Type;
+const Class = @import("types.zig").Class;
 const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
 const parseOptOptions = @import("rdata.zig").parseOptOptions;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
-const skipNameAt = @import("name.zig").skipName;
+const skipNameCounted = @import("name.zig").skipNameCounted;
 const formatDnsNameInMessage = @import("name.zig").formatDnsNameInMessage;
 const decodePresentationName = @import("name.zig").decodePresentationName;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 const Error = @import("errors.zig").Error;
+
+/// 单个 DNS 报文允许累计跟随的压缩指针总跳数上限，防御大规模压缩放大 DoS。
+pub const MAX_MESSAGE_POINTER_JUMPS: u32 = 8192;
 
 pub const Question = struct {
     name_pos: usize, // Where the owner name starts in the buffer (for zero-copy echo / name resolution)
     qname_end_pos: usize, // Where the name ends in the buffer
     qtype: Type,
     qclass: u16,
+
+    pub fn classEnum(self: Question) Class {
+        return @fromBackingInt(self.qclass);
+    }
 };
 
 pub const ResourceRecord = struct {
@@ -30,6 +38,10 @@ pub const ResourceRecord = struct {
     rdlength: u16,
     rdata: []const u8, // Slice pointing into the original packet
     rdata_offset: usize, // Absolute offset of rdata within the packet (for name resolution)
+
+    pub fn classEnum(self: ResourceRecord) Class {
+        return @fromBackingInt(self.class);
+    }
 
     /// RFC 2181 §8: 收到的 TTL 是 31 位无符号；最高位置位时应视为 0。
     /// 保留原始 `ttl` 不变，缓存/回显请使用此规范化值。
@@ -46,7 +58,7 @@ pub const ResourceRecord = struct {
 pub fn CountedIterator(comptime T: type) type {
     return struct {
         parser: *MessageParser,
-        remaining: u16,
+        remaining: usize,
 
         pub fn next(self: *@This()) Error!?T {
             if (self.remaining == 0) return null;
@@ -67,6 +79,7 @@ pub fn CountedIterator(comptime T: type) type {
 pub const MessageParser = struct {
     buffer: []const u8,
     pos: usize,
+    jump_budget: u32 = MAX_MESSAGE_POINTER_JUMPS,
 
     pub const QuestionIterator = CountedIterator(Question);
     pub const RRIterator = CountedIterator(ResourceRecord);
@@ -78,12 +91,14 @@ pub const MessageParser = struct {
     /// Skips a DNS name (including compression pointers) without copying it.
     /// Crucial for jumping to the Type/Class fields.
     ///
-    /// 委托给 `name.skipName`：压缩指针会被**跟随并完整校验**（RFC 1035 §2.3.4 的
-    /// 标签 ≤63 / 整名 ≤255 含根、目标越界、指向 header、指针成环），而 `pos` 仍落在
-    /// 线格式结束处（指针后 2 字节）。只 skip 不展开的快路径服务端因此与
-    /// `formatNameAt` / `nameEqualsAt` 走同一套校验，不会放行畸形名字。
+    /// 委托给 `name.skipNameCounted`：压缩指针会被**跟随并完整校验**（RFC 1035 §2.3.4 的
+    /// 标签 ≤63 / 整名 ≤255 含根、目标越界、指向 header、前向跳转、指针成环），并扣减整包
+    /// 解压缩跳转预算，而 `pos` 仍落在线格式结束处（指针后 2 字节）。
     fn skipName(self: *MessageParser) !void {
-        self.pos = try skipNameAt(self.buffer, self.pos, POINTER_FLOOR);
+        const res = try skipNameCounted(self.buffer, self.pos, POINTER_FLOOR);
+        if (res.jumps > self.jump_budget) return error.MalformedName;
+        self.jump_budget -= @intCast(res.jumps);
+        self.pos = res.end_pos;
     }
 
     /// Parses the next Question in the packet
@@ -145,39 +160,53 @@ pub const MessageParser = struct {
         };
     }
 
-    pub fn questions(self: *MessageParser, count: u16) QuestionIterator {
+    pub fn questions(self: *MessageParser, count: usize) QuestionIterator {
         return .{
             .parser = self,
             .remaining = count,
         };
     }
 
-    pub fn resourceRecords(self: *MessageParser, count: u16) RRIterator {
+    pub fn resourceRecords(self: *MessageParser, count: usize) RRIterator {
         return .{
             .parser = self,
             .remaining = count,
         };
     }
 
-    pub fn skipQuestions(self: *MessageParser, count: u16) !void {
+    pub fn skipQuestions(self: *MessageParser, count: usize) !void {
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
             if ((try self.nextQuestion()) == null) return error.PacketTooShort;
         }
     }
 
-    pub fn skipResourceRecords(self: *MessageParser, count: u16) !void {
+    pub fn skipResourceRecords(self: *MessageParser, count: usize) !void {
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
             if ((try self.nextRR()) == null) return error.PacketTooShort;
         }
     }
 
+    /// 跳过 Answer / Authority 等非附加区资源记录，同时按 RFC 6891 §6.1.1 拒绝混入其中的 OPT 记录。
+    pub fn skipNonAdditionalRecords(self: *MessageParser, count: usize) Error!void {
+        var remaining = count;
+        while (remaining > 0) : (remaining -= 1) {
+            const rr = (try self.nextRR()) orelse return error.PacketTooShort;
+            if (rr.rtype == .OPT) return error.MisplacedOptRecord;
+        }
+    }
+
+    /// 校验解析游标已精确抵达报文末尾，不存在未声明的尾随字节（防止走私记录或尾部垃圾）。
+    pub fn expectEnd(self: *const MessageParser) Error!void {
+        if (self.pos != self.buffer.len) return error.TrailingBytes;
+    }
+
     /// **快路径**：返回附加区第一个 OPT 记录，遇到即停。
     /// 不检测第二个 OPT，也不校验 owner name 为根——即不做 RFC 6891 §6.1.1 的
     /// FORMERR 判定。只在你已用别的手段确认过报文合法时使用；
-    /// 面向不可信输入的严格入口是 `findEdns`。
-    pub fn findOptRecord(self: *const MessageParser, count: u16) !?ResourceRecord {
+    /// 面向不可信输入的严格入口是 `findEdns`（或整包严格入口 `Message.findEdns`）。
+    pub fn findOptRecord(self: *const MessageParser, count: usize) !?ResourceRecord {
         var scan = self.*;
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
@@ -190,7 +219,7 @@ pub const MessageParser = struct {
     /// **快路径**：返回第一个 OPT 中的 ECS（RFC 7871）。
     /// 与 `findOptRecord` 同样跳过 RFC 6891 §6.1.1 检查（多 OPT / 非根 owner）。
     /// 严格校验且同时要 OPT+ECS+Cookie 时用 `findEdns`（单趟扫描）。
-    pub fn findECS(self: *const MessageParser, count: u16) !?ECSData {
+    pub fn findECS(self: *const MessageParser, count: usize) !?ECSData {
         var scan = self.*;
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
@@ -203,7 +232,7 @@ pub const MessageParser = struct {
     /// **快路径**：返回第一个 OPT 中的 DNS Cookie（RFC 7873）。
     /// 与 `findOptRecord` 同样跳过 RFC 6891 §6.1.1 检查（多 OPT / 非根 owner）。
     /// 严格校验用 `findEdns`。
-    pub fn findCookie(self: *const MessageParser, count: u16) !?CookieData {
+    pub fn findCookie(self: *const MessageParser, count: usize) !?CookieData {
         var scan = self.*;
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
@@ -224,7 +253,7 @@ pub const MessageParser = struct {
     /// - 多于一个 OPT -> error.MultipleOptRecords（必须回 FORMERR）
     /// - OPT 的 owner name 非根 -> error.MalformedName
     /// - OPT RDATA 的 TLV 未恰好平铺 -> error.InvalidRData
-    pub fn findEdns(self: *const MessageParser, count: u16) !?Edns {
+    pub fn findEdns(self: *const MessageParser, count: usize) !?Edns {
         var scan = self.*;
         var remaining = count;
         var found: ?Edns = null;
@@ -333,10 +362,20 @@ pub const MessageParser = struct {
     /// self-contained `Name` values bound to this parser's buffer, so they resolve
     /// compression pointers without any pointer arithmetic or aliasing assumptions.
     ///
-    /// OPT（类型 41）不是普通 RR：其 RDATA 是 EDNS 选项 TLV 序列，CLASS/TTL 也另作他用。
-    /// 对 OPT 调用本方法返回 `error.UseEdns`——泛化的「遍历附加区每条 RR」循环据此
-    /// 明确分流到 `findEdns` / `dns.Edns.fromOpt`，而不是撞上含混的 InvalidRData。
+    /// - OPT（类型 41）不是普通 RR：返回 `error.UseEdns`，分流到 `findEdns` / `Edns.fromOpt`。
+    /// - 伪类 `ANY(255)` / `NONE(254)`（如 RFC 2136 动态更新空记录）不承载常规 RDATA：返回 `error.InvalidClass`。
+    /// - 仅在 `CLASS = IN(1)` 下定义的地址/服务绑定类型（A/AAAA/SRV/SVCB/HTTPS）遇其他类返回 `error.UnknownClass`。
     pub fn parseRData(self: *const MessageParser, rr: ResourceRecord) !RData {
+        if (rr.rtype == .OPT) return error.UseEdns;
+        if (rr.class == @backingInt(Class.ANY) or rr.class == @backingInt(Class.NONE)) {
+            return error.InvalidClass;
+        }
+        switch (rr.rtype) {
+            .A, .AAAA, .SRV, .SVCB, .HTTPS => {
+                if (rr.class != @backingInt(Class.IN)) return error.UnknownClass;
+            },
+            else => {},
+        }
         return RData.parse(rr.rtype, self.buffer, rr.rdata_offset, rr.rdlength);
     }
 };
@@ -533,36 +572,36 @@ test "MessageParser nextRR returns null at end" {
 }
 
 test "MessageParser with compression pointer" {
-    var packet: [100]u8 = undefined;
-    @memset(&packet, 0);
+    var packet: [100]u8 = @splat(0);
 
-    // 在偏移 30 处放置 "com\x00"
-    packet[30] = 3;
-    @memcpy(packet[31..34], "com");
-    packet[34] = 0;
+    // 第一个 Question（偏移 12）："com\x00" + NS + IN（总长 5+4=9，结束于 21）
+    packet[12] = 3;
+    @memcpy(packet[13..16], "com");
+    packet[16] = 0;
+    mem.writeInt(u16, packet[17..19], 2, .big); // NS
+    mem.writeInt(u16, packet[19..21], 1, .big); // IN
 
-    // 在开头放置 "example" + 指向 "com" 的压缩指针
-    var pos: usize = 12;
+    // 第二个 Question（偏移 21）："example" + 指向偏移 12 ("com") 的向后压缩指针
+    var pos: usize = 21;
     packet[pos] = 7;
     @memcpy(packet[pos + 1 ..][0..7], "example");
     pos += 8;
-    // 压缩指针: 0xC0 | (30 >> 8), 30 & 0xFF
-    packet[pos] = 0xC0 | (30 >> 8);
-    packet[pos + 1] = 30 & 0xFF;
+    packet[pos] = 0xC0;
+    packet[pos + 1] = 12;
     pos += 2;
 
     mem.writeInt(u16, packet[pos..][0..2], 1, .big); // A
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1, .big); // IN
+    pos += 4;
 
-    // 报文须覆盖指针目标（35）：skipName 会跟随并校验展开结果，
-    // 目标落在切片之外即为越界指针。
-    var parser = MessageParser.init(packet[0..35]);
+    var parser = MessageParser.init(packet[0..pos]);
+    _ = (try parser.nextQuestion()).?;
     const question = (try parser.nextQuestion()).?;
 
     try std.testing.expectEqual(Type.A, question.qtype);
     try std.testing.expectEqual(@as(u16, 1), question.qclass);
-    // 名字止于指针之后（22），而非指针目标之后。
-    try std.testing.expectEqual(@as(usize, 22), question.qname_end_pos);
+    // 名字止于指针之后（31），而非指针目标之后。
+    try std.testing.expectEqual(@as(usize, 31), question.qname_end_pos);
 }
 
 test "MessageParser rejects compression pointer into the header" {
@@ -577,17 +616,17 @@ test "MessageParser rejects compression pointer into the header" {
 }
 
 test "MessageParser skipName validates the name behind a pointer" {
-    // 指针目标处是超长标签：只跳过不展开会放行，导致 skipQuestions 后
-    // 按类型直接应答的服务端接受 formatNameAt 会拒绝的 QNAME。
-    var packet: [64]u8 = undefined;
-    @memset(&packet, 0);
-    packet[12] = 0xC0;
-    packet[13] = 20;
-    packet[20] = 64; // 非法标签长度（>63）
+    // 指针目标处（更早偏移 13，紧随根名 12..13 之后）是超长标签：只跳过不展开会放行。
+    var packet: [96]u8 = @splat(0);
+    packet[12] = 64; // 偏移 12 处为非法标签长度（>63）
+    // 偏移 80 处放置指向更早偏移 12 的压缩指针
+    packet[80] = 0xC0;
+    packet[81] = 12;
     var parser = MessageParser.init(&packet);
+    parser.pos = 80;
     try std.testing.expectError(error.LabelTooLong, parser.nextQuestion());
 
-    // 指针成环同样必须在 skip 阶段被拒，而不是靠下游兜底。
+    // 指针成环或前向跳转同样必须在 skip 阶段被拒，而不是靠下游兜底。
     var loop: [32]u8 = undefined;
     @memset(&loop, 0);
     loop[12] = 0xC0;
@@ -899,20 +938,29 @@ test "MessageParser findEdns rejects OPT with non-root owner name (RFC 6891)" {
 }
 
 test "MessageParser nameEqualsAt matches compressed name" {
-    var packet: [64]u8 = undefined;
-    @memset(packet[0..12], 0);
+    var packet: [64]u8 = @splat(0);
 
-    packet[12] = 0xC0;
-    packet[13] = 0x20;
-    packet[32] = 7;
-    @memcpy(packet[33..40], "example");
-    packet[40] = 3;
-    @memcpy(packet[41..44], "com");
-    packet[44] = 0;
+    // 偏移 12 处放置更早出现的 "example.com\0"
+    packet[12] = 7;
+    @memcpy(packet[13..20], "example");
+    packet[20] = 3;
+    @memcpy(packet[21..24], "com");
+    packet[24] = 0;
+    // 偏移 32 处放置指向偏移 12 的向后压缩指针
+    packet[32] = 0xC0;
+    packet[33] = 0x0C;
 
-    const parser = MessageParser.init(packet[0..45]);
-    try std.testing.expect(try parser.nameEqualsAt(12, "example.com"));
-    try std.testing.expect(!(try parser.nameEqualsAt(12, "example.net")));
+    const parser = MessageParser.init(packet[0..34]);
+    try std.testing.expect(try parser.nameEqualsAt(32, "example.com"));
+    try std.testing.expect(!(try parser.nameEqualsAt(32, "example.net")));
+    // 偏移 12 处若放前向指针跳到 20 则须报 MalformedName
+    var bad: [32]u8 = @splat(0);
+    bad[12] = 0xC0;
+    bad[13] = 20;
+    bad[20] = 3;
+    @memcpy(bad[21..24], "com");
+    const bad_parser = MessageParser.init(&bad);
+    try std.testing.expectError(error.MalformedName, bad_parser.nameEqualsAt(12, "com"));
 }
 
 test "MessageParser nameEqualsAt matches root against both \".\" and \"\"" {
@@ -1036,4 +1084,46 @@ test "MessageParser rejects buffers shorter than 12-byte header" {
     var out: [64]u8 = undefined;
     try std.testing.expectError(error.PacketTooShort, short.formatNameAt(0, &out));
     try std.testing.expectError(error.PacketTooShort, short.nameEqualsAt(0, "a"));
+}
+
+test "MessageParser enforces class checks, non-additional OPT rejection, and expectEnd" {
+    var packet: [64]u8 = @splat(0);
+    // 偏移 12: OPT 混入 Answer 区 -> skipNonAdditionalRecords 须报 MisplacedOptRecord
+    packet[12] = 0;
+    mem.writeInt(u16, packet[13..15], @backingInt(Type.OPT), .big);
+    mem.writeInt(u16, packet[15..17], 1232, .big);
+    var p1 = MessageParser.init(packet[0..23]);
+    try std.testing.expectError(error.MisplacedOptRecord, p1.skipNonAdditionalRecords(1));
+
+    // CH A 记录（非 IN 类的互联网专有类型）-> parseRData 报 UnknownClass；ANY 伪类 -> InvalidClass
+    const ch_a = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .A,
+        .class = @backingInt(Class.CH),
+        .ttl = 60,
+        .rdlength = 4,
+        .rdata = &[_]u8{ 1, 2, 3, 4 },
+        .rdata_offset = 23,
+    };
+    const p2 = MessageParser.init(packet[0..27]);
+    try std.testing.expectError(error.UnknownClass, p2.parseRData(ch_a));
+
+    const update_empty = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .A,
+        .class = @backingInt(Class.ANY),
+        .ttl = 0,
+        .rdlength = 0,
+        .rdata = "",
+        .rdata_offset = 23,
+    };
+    try std.testing.expectError(error.InvalidClass, p2.parseRData(update_empty));
+
+    // 声明 0 条记录但末尾多了残尾字节 -> expectEnd 报 TrailingBytes
+    const p_trail = MessageParser.init(packet[0..14]);
+    try std.testing.expectError(error.TrailingBytes, p_trail.expectEnd());
+    const p_exact = MessageParser.init(packet[0..12]);
+    try p_exact.expectEnd();
 }

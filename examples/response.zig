@@ -69,26 +69,26 @@ pub fn main() !void {
     // 解析验证
     std.debug.print("=== Parsing Response ===\n", .{});
 
-    _ = try dns.Message.parse(packet);
+    const parsed_msg = try dns.Message.parse(packet);
     std.debug.print("Parsed header successfully\n", .{});
 
-    var parser = dns.MessageParser.init(packet);
+    var secs = parsed_msg.sections();
 
-    // 读取问题
-    if (try parser.nextQuestion()) |q| {
+    // 读取问题（按 QDCOUNT 边界安全遍历）
+    while (try secs.nextQuestion()) |q| {
         std.debug.print("  Question: Type={d}, Class={d}\n", .{
             @backingInt(q.qtype),
             q.qclass,
         });
     }
 
-    // 读取回答
+    // 读取回答（按 ANCOUNT 边界安全遍历）
     var i: u32 = 1;
-    while (try parser.nextRR()) |rr| {
+    while (try secs.nextAnswer()) |rr| {
         std.debug.print("  Answer {d}: ", .{i});
 
         // 使用 parseRData 解析 RDATA
-        const rdata = parser.parseRData(rr) catch |err| {
+        const rdata = secs.parseRData(rr) catch |err| {
             std.debug.print("(parse error: {}) Type={d}\n", .{ err, @backingInt(rr.rtype) });
             i += 1;
             continue;

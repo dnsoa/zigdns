@@ -18,4 +18,6 @@ pub const Error = error{
     InvalidRecordOrder, // Builder 误用：分区回退，或问题记录晚于资源记录
     MalformedCookie, // RFC 7873: DNS Cookie 长度非法（须 8 或 16..40 字节）
     UseEdns, // 对 OPT(41) 调用了通用 RDATA 解析：改用 findEdns / Edns.fromOpt
+    MisplacedOptRecord, // RFC 6891 §6.1.1: OPT 记录出现在 Answer/Authority 等非附加区 → FORMERR
+    TrailingBytes, // 声明的四个分区记录全部消费后，报文末尾仍有未声明的残留字节 → FORMERR
 };

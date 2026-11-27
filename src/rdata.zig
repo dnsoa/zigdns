@@ -6,8 +6,8 @@ const ECSData = @import("types.zig").ECSData;
 const CookieData = @import("types.zig").CookieData;
 const Error = @import("errors.zig").Error;
 const Name = @import("name.zig").Name;
-const skipNameAt = @import("name.zig").skipName;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
+const MAX_CHAINED_POINTERS = @import("name.zig").MAX_CHAINED_POINTERS;
 
 fn parseECSOption(option_payload: []const u8) !ECSData {
     if (option_payload.len < 4) return error.MalformedECS;
@@ -45,25 +45,61 @@ fn parseECSOption(option_payload: []const u8) !ECSData {
     };
 }
 
-/// OPT RDATA 中已识别的 EDNS 选项。
-pub const OptOptions = struct { ecs: ?ECSData = null, cookie: ?CookieData = null };
+/// 通用 EDNS(0) 选项 TLV（RFC 6891 §6.1.2），零拷贝引用 OPT RDATA 切片。
+pub const OptOption = struct {
+    code: OptionCode,
+    data: []const u8,
+};
+
+/// 零拷贝遍历 OPT RDATA 中的全部 EDNS 选项 TLV（含未知选项与 EDE/NSID/Padding 等）。
+pub const OptOptionIterator = struct {
+    raw: []const u8,
+    pos: usize = 0,
+
+    pub fn next(self: *OptOptionIterator) Error!?OptOption {
+        if (self.pos >= self.raw.len) return null;
+        if (self.raw.len - self.pos < 4) return error.InvalidRData;
+        const code_raw = mem.readInt(u16, self.raw[self.pos..][0..2], .big);
+        const len = mem.readInt(u16, self.raw[self.pos + 2 ..][0..2], .big);
+        self.pos += 4;
+        if (len > self.raw.len - self.pos) return error.InvalidRData;
+        const payload = self.raw[self.pos .. self.pos + len];
+        self.pos += len;
+        return OptOption{
+            .code = @fromBackingInt(code_raw),
+            .data = payload,
+        };
+    }
+};
+
+/// OPT RDATA 中已识别的 EDNS 选项及完整原始 TLV 切片。
+pub const OptOptions = struct {
+    ecs: ?ECSData = null,
+    cookie: ?CookieData = null,
+    raw: []const u8 = "",
+
+    /// 返回遍历全部原始 EDNS 选项 TLV 的迭代器。
+    pub fn iterator(self: OptOptions) OptOptionIterator {
+        return .{ .raw = self.raw };
+    }
+};
 
 /// 单趟遍历 OPT 记录的 RDATA（RFC 6891 §6.1.2：{code(2), len(2), value} TLV 序列），
 /// 解出已识别的选项。
 ///
-/// TLV 必须**恰好平铺**整个 RDATA：即使目标选项已找到也要走完全程，残留字节一律
-/// error.InvalidRData。
+/// TLV 必须**恰好平铺**整个 RDATA：即使目标选项已找到也要走完全程，选项长度越过
+/// RDLENGTH 或存在残留字节一律返回 error.InvalidRData（与 PacketTooShort 半包截断区分）。
 /// - 多条 COOKIE：按 RFC 7873 §5.2 / §5.3 只取第一条，忽略后续 COOKIE；
 /// - 多条 ECS：本库严格策略直接返回 error.MalformedECS，避免多子网歧义（非 RFC 强制）。
 pub fn parseOptOptions(rdata: []const u8) !OptOptions {
-    var out = OptOptions{};
+    var out = OptOptions{ .raw = rdata };
     var pos: usize = 0;
     while (pos + 4 <= rdata.len) {
         const code = (@as(u16, rdata[pos]) << 8) | rdata[pos + 1];
         const len = (@as(u16, rdata[pos + 2]) << 8) | rdata[pos + 3];
         pos += 4;
 
-        if (len > rdata.len -| pos) return error.PacketTooShort;
+        if (len > rdata.len -| pos) return error.InvalidRData;
         const payload = rdata[pos .. pos + len];
         pos += len;
 
@@ -149,11 +185,13 @@ pub const SvcbData = struct {
     }
 };
 
-/// 校验 SvcParams 原始字节（RFC 9460 §2.2）：各 TLV 恰好平铺，且 SvcParamKey
-/// 按数值严格递增（因而自动去重）。空 params（AliasMode）合法。
+/// 校验 SvcParams 原始字节（RFC 9460 §2.2 / §7）：各 TLV 恰好平铺、SvcParamKey
+/// 按数值严格递增去重，且知名键（mandatory/alpn/no-default-alpn/port/ipv4hint/ipv6hint）
+/// 符合规范值格式。空 params（AliasMode）合法。
 pub fn validateSvcParams(params: []const u8) !void {
     var pos: usize = 0;
     var prev_key: i32 = -1;
+    var mandatory_val: ?[]const u8 = null;
     while (pos < params.len) {
         if (pos + 4 > params.len) return error.InvalidRData;
         const key = mem.readInt(u16, params[pos..][0..2], .big);
@@ -162,7 +200,65 @@ pub fn validateSvcParams(params: []const u8) !void {
         prev_key = key;
         pos += 4;
         if (pos + plen > params.len) return error.InvalidRData;
+        const val = params[pos .. pos + plen];
         pos += plen;
+
+        switch (key) {
+            0 => { // mandatory (RFC 9460 §7 / §8): 非空 u16 列表，严格递增，禁止含 key 0
+                if (val.len < 2 or (val.len & 1) != 0) return error.InvalidRData;
+                var mprev: i32 = 0;
+                var mpos: usize = 0;
+                while (mpos < val.len) : (mpos += 2) {
+                    const mkey = mem.readInt(u16, val[mpos..][0..2], .big);
+                    if (@as(i32, mkey) <= mprev) return error.InvalidRData;
+                    mprev = mkey;
+                }
+                mandatory_val = val;
+            },
+            1 => { // alpn (RFC 9460 §7.1): 1 个或多个非空 1 字节长度前缀的 ALPN ID
+                if (val.len < 2) return error.InvalidRData;
+                var apos: usize = 0;
+                while (apos < val.len) {
+                    const alen = val[apos];
+                    apos += 1;
+                    if (alen == 0 or apos + alen > val.len) return error.InvalidRData;
+                    apos += alen;
+                }
+            },
+            2 => { // no-default-alpn (RFC 9460 §7.1): 必须为空值
+                if (val.len != 0) return error.InvalidRData;
+            },
+            3 => { // port (RFC 9460 §7.2): 固定 2 字节端口
+                if (val.len != 2) return error.InvalidRData;
+            },
+            4 => { // ipv4hint (RFC 9460 §7.3): 非空且为 4 字节整数倍
+                if (val.len < 4 or (val.len % 4) != 0) return error.InvalidRData;
+            },
+            6 => { // ipv6hint (RFC 9460 §7.3): 非空且为 16 字节整数倍
+                if (val.len < 16 or (val.len % 16) != 0) return error.InvalidRData;
+            },
+            else => {},
+        }
+    }
+
+    if (mandatory_val) |mval| {
+        var mpos: usize = 0;
+        var ppos: usize = 0;
+        while (mpos < mval.len) : (mpos += 2) {
+            const want = mem.readInt(u16, mval[mpos..][0..2], .big);
+            var found = false;
+            while (ppos < params.len) {
+                const k = mem.readInt(u16, params[ppos..][0..2], .big);
+                const l = mem.readInt(u16, params[ppos + 2 ..][0..2], .big);
+                ppos += 4 + l;
+                if (k == want) {
+                    found = true;
+                    break;
+                }
+                if (k > want) return error.InvalidRData;
+            }
+            if (!found) return error.InvalidRData;
+        }
     }
 }
 
@@ -302,9 +398,9 @@ pub fn parseCookie(rdata: []const u8) !?CookieData {
     return (try parseOptOptions(rdata)).cookie;
 }
 
-/// RDATA 表示 (零拷贝)。
+/// RDATA 表示 (零拷贝，与线格式 Type 枚举解耦以允许 Type 包含 ANY/AXFR/TSIG 等纯查询/元类型)。
 /// 域名字段为 `Name`（自包含，可跟随压缩指针）；定长/文本字段为数组或切片。
-pub const RData = union(Type) {
+pub const RData = union(enum) {
     A: [4]u8,
     NS: Name,
     CNAME: Name,
@@ -322,7 +418,7 @@ pub const RData = union(Type) {
     TXT: TxtData, // 一个或多个 character-string（RFC 1035 §3.3.14）
     AAAA: [16]u8,
     SRV: struct { priority: u16, weight: u16, port: u16, target: Name },
-    OPT: []const u8, // EDNS 选项数据
+    OPT: []const u8, // 保留兼容分支；对 OPT 调用 RData.parse 返回 error.UseEdns
     SVCB: SvcbData, // 服务绑定（RFC 9460）
     HTTPS: SvcbData, // HTTPS 服务绑定（RFC 9460，与 SVCB 同格式）
     CAA: CaaData, // 证书颁发机构授权（RFC 8659）
@@ -336,16 +432,18 @@ pub const RData = union(Type) {
     /// 在 RDATA 内推进越过一个域名（含压缩指针），仅校验与定位，不复制。
     /// 用于跳到域名之后的定长字段。
     ///
-    /// 压缩指针会被**跟随并完整校验**（目标越界、指向 header、成环、展开后 >255），
+    /// 压缩指针会被**跟随并完整校验**（目标越界、指向 header、前向跳转、成环、展开后 >255），
     /// 推进量仍是线格式的 2 字节；名字的线格式必须整体落在本条 RDATA 内。
     /// `base` 为 RDATA 在完整报文 `msg` 中的绝对偏移，`pos` 相对 RDATA 起点。
     /// 与 owner name 的 skip 路径共用 `MESSAGE_POINTER_FLOOR`：RDATA 里的域名同样
-    /// 不得指向 header，否则 owner 被拒的输入换个位置又能通过。
+    /// 不得指向 header，且须指向更早出现的位置（RFC 1035 §4.1.4）。
     fn advanceName(msg: []const u8, base: usize, data: []const u8, pos: *usize) Error!void {
         const wire_limit = base + data.len;
         var cur = base + pos.*;
+        var origin = cur;
         var total: usize = 1; // RFC 1035 §2.3.4 的 255 含根结束符
         var jumps: usize = 0;
+        var chained_jumps: u8 = 0;
         var wire_end: ?usize = null;
 
         while (true) {
@@ -365,9 +463,13 @@ pub const RData = union(Type) {
                 if (cur + 2 > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
                 const target = (@as(usize, len & 0x3F) << 8) | msg[cur + 1];
                 if (target < POINTER_FLOOR or target >= msg.len) return error.InvalidOffset;
-                if (jumps >= 128) return error.MalformedName;
+                if (target >= origin or jumps >= 128 or chained_jumps >= MAX_CHAINED_POINTERS) {
+                    return error.MalformedName;
+                }
                 jumps += 1;
+                chained_jumps += 1;
                 if (wire_end == null) wire_end = cur + 2;
+                origin = target;
                 cur = target;
                 continue;
             }
@@ -376,6 +478,7 @@ pub const RData = union(Type) {
             if (cur + 1 + len > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
             total += 1 + len;
             if (total > 255) return error.NameTooLong;
+            chained_jumps = 0;
             cur += 1 + len;
         }
     }
@@ -539,7 +642,8 @@ pub const RData = union(Type) {
                 } };
             },
             .DS => {
-                if (data.len < 4) return error.InvalidRData;
+                // RFC 4034 §5.1 / §5.3: 固定 4 字节头 + 非空 Digest。
+                if (data.len < 5) return error.InvalidRData;
                 return RData{ .DS = .{
                     .key_tag = mem.readInt(u16, data[0..2], .big),
                     .algorithm = data[2],
@@ -548,14 +652,17 @@ pub const RData = union(Type) {
                 } };
             },
             .RRSIG => {
-                // 固定字段 18 字节 + signer name + signature（RFC 4034 §3.1）。
+                // 固定字段 18 字节 + signer name + 非空 signature（RFC 4034 §3.1）。
                 if (data.len < 18) return error.InvalidRData;
+                const labels = data[3];
+                if (labels > 127) return error.InvalidRData; // 255 字节域名最多含 127 个非根标签
                 var pos: usize = 18;
                 try advanceNameNoPointer(data, &pos); // signer 不得压缩（RFC 4034 §3.1.7）
+                if (pos >= data.len) return error.InvalidRData; // RFC 4034 §3.1.8: signature 不可为空
                 return RData{ .RRSIG = .{
                     .type_covered = mem.readInt(u16, data[0..2], .big),
                     .algorithm = data[2],
-                    .labels = data[3],
+                    .labels = labels,
                     .original_ttl = mem.readInt(u32, data[4..8], .big),
                     .expiration = mem.readInt(u32, data[8..12], .big),
                     .inception = mem.readInt(u32, data[12..16], .big),
@@ -582,9 +689,9 @@ pub const RData = union(Type) {
                 if (5 + salt_len + 1 > data.len) return error.InvalidRData;
                 const hash_len: usize = data[5 + salt_len];
                 const hash_start = 6 + salt_len;
-                if (hash_start + hash_len > data.len) return error.InvalidRData;
+                if (hash_len == 0 or hash_start + hash_len > data.len) return error.InvalidRData;
                 // RFC 5155 §3.1.1/§3.1.7: 仅定义 SHA-1（算法 1），其哈希固定 20 字节。
-                // 已知算法的非法哈希长度视为畸形；未定义算法长度不可校验，保持宽松。
+                // 已知算法的非法哈希长度视为畸形；未定义算法仍须非空（§3.2 无空哈希表示）。
                 if (data[0] == 1 and hash_len != 20) return error.InvalidRData;
                 // RFC 5155 §3.2.1: NSEC3 允许空位图（空非终端），但非空时须符合窗口规范。
                 try validateTypeBitmap(data[hash_start + hash_len ..], true);
@@ -609,7 +716,7 @@ pub const RData = union(Type) {
                 } };
             },
             .OPT => return error.UseEdns, // OPT 不是普通 RR：RDATA 是 EDNS 选项 TLV，用 findEdns / Edns.fromOpt
-            _ => return error.UnknownType,
+            else => return error.UnknownType,
         };
     }
 };
@@ -919,8 +1026,8 @@ test "parseECS rejects trailing garbage after a valid ECS option" {
     // COOKIE 在前的慢路径与 ECS 在前的快路径必须同规则。
     const cookie = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
     try std.testing.expectError(error.InvalidRData, parseCookie(cookie ++ "\xff\xff"));
-    // 残尾后面跟的若是畸形 TLV（长度越界）同样要拒。
-    try std.testing.expectError(error.PacketTooShort, parseECS(ecs ++ "\x00\x0b\x00\x10\x01"));
+    // 残尾后面跟的若是畸形 TLV（长度越过 OPT RDLENGTH）统一归类为 InvalidRData。
+    try std.testing.expectError(error.InvalidRData, parseECS(ecs ++ "\x00\x0b\x00\x10\x01"));
 }
 
 test "parseECS still returns ECS when a well-formed option follows" {
@@ -987,7 +1094,7 @@ test "parseECS rejects truncated option payload" {
         0x18,
     };
 
-    try std.testing.expectError(error.PacketTooShort, parseECS(&rdata));
+    try std.testing.expectError(error.InvalidRData, parseECS(&rdata));
 }
 
 test "parseECS rejects address length mismatch" {
@@ -1194,4 +1301,55 @@ test "RData.advanceName agrees with NameCursor on pointer/limit validation" {
         };
         try std.testing.expectEqual(cur_err, rdata_err);
     }
+}
+
+test "validateSvcParams enforces RFC 9460 §7 well-known SvcParamValue formats" {
+    // mandatory(0) 列出 port(3)，且 port(3)=443 实际存在 -> 合法
+    try validateSvcParams("\x00\x00\x00\x02\x00\x03" ++ "\x00\x03\x00\x02\x01\xbb");
+    // mandatory(0) 列出的 key(4) 未出现 -> InvalidRData
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x00\x00\x02\x00\x04" ++ "\x00\x03\x00\x02\x01\xbb"));
+    // mandatory(0) 包含 0 自身 -> InvalidRData
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x00\x00\x02\x00\x00"));
+    // alpn(1) 含零长协议名或截断 -> InvalidRData；合法 "h2" 通过
+    try validateSvcParams("\x00\x01\x00\x03\x02h2");
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x01\x00\x01\x00"));
+    // no-default-alpn(2) 必须为空值
+    try validateSvcParams("\x00\x02\x00\x00");
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x02\x00\x01\x00"));
+    // ipv4hint(4) 须 4N 非空；ipv6hint(6) 须 16N 非空
+    try validateSvcParams("\x00\x04\x00\x04\xc0\x00\x02\x01");
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x04\x00\x03\xc0\x00\x02"));
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x06\x00\x08\x20\x01\x0d\xb8\x00\x00\x00\x01"));
+}
+
+test "OptOptionIterator iterates recognized and generic EDNS options (EDE/NSID)" {
+    // NSID(3)="ns1" + EDE(15, info_code=18 Prohibited) + COOKIE(10)
+    const raw = "\x00\x03\x00\x03ns1" ++
+        "\x00\x0f\x00\x02\x00\x12" ++
+        "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
+    const opts = try parseOptOptions(raw);
+    try std.testing.expect(opts.cookie != null);
+    var it = opts.iterator();
+    const o1 = (try it.next()).?;
+    try std.testing.expectEqual(OptionCode.NSID, o1.code);
+    try std.testing.expectEqualStrings("ns1", o1.data);
+    const o2 = (try it.next()).?;
+    try std.testing.expectEqual(OptionCode.EDE, o2.code);
+    try std.testing.expectEqualSlices(u8, "\x00\x12", o2.data);
+    const o3 = (try it.next()).?;
+    try std.testing.expectEqual(OptionCode.COOKIE, o3.code);
+    try std.testing.expect((try it.next()) == null);
+}
+
+test "DS, RRSIG and NSEC3 reject empty cryptographic payloads and invalid RRSIG labels" {
+    // DS 仅 4 字节头无 digest -> InvalidRData
+    try std.testing.expectError(error.InvalidRData, RData.parse(.DS, "\x30\x39\x08\x02", 0, 4));
+    // RRSIG 无 signature（signer 根后立即结束） -> InvalidRData
+    const rrsig_empty_sig = "\x00\x01\x08\x02\x00\x00\x0e\x10\x5f\x00\x00\x00\x5e\x00\x00\x00\x30\x39\x00";
+    try std.testing.expectError(error.InvalidRData, RData.parse(.RRSIG, rrsig_empty_sig, 0, rrsig_empty_sig.len));
+    // RRSIG labels=128 (>127) -> InvalidRData
+    const rrsig_bad_labels = "\x00\x01\x08\x80\x00\x00\x0e\x10\x5f\x00\x00\x00\x5e\x00\x00\x00\x30\x39\x00SIG";
+    try std.testing.expectError(error.InvalidRData, RData.parse(.RRSIG, rrsig_bad_labels, 0, rrsig_bad_labels.len));
+    // NSEC3 未知哈希算法但 hash_len=0 -> InvalidRData
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC3, "\x02\x00\x00\x01\x00\x00", 0, 6));
 }

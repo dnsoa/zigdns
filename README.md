@@ -188,24 +188,35 @@ while (try answers.next()) |rr| {
 }
 ```
 
-To inspect EDNS without consuming the parser cursor, scan the additional section directly.
-`findEdns` is the **strict** entry point: one pass, full RFC 6891 §6.1.1 checking, and it
-returns the OPT record together with its ECS and Cookie options:
+To inspect EDNS and validate section boundaries across the entire message in one call, use `message.findEdns()` (which rejects `OPT` records misplaced in Answer/Authority via `error.MisplacedOptRecord` and trailing bytes past `ARCOUNT` via `error.TrailingBytes`):
+
+```zig
+if (try message.findEdns()) |edns| {
+    std.debug.print("EDNS effective UDP size: {d}\n", .{edns.effectiveUdpPayloadSize()});
+    std.debug.print("Full 12-bit RCODE: {}\n", .{edns.fullRcode(message.header)});
+    if (edns.ecs) |ecs| std.debug.print("ECS family={d} prefix={d}\n", .{ ecs.family, ecs.source_prefix });
+    if (edns.cookie) |c| std.debug.print("cookie server bytes: {d}\n", .{c.server.len});
+
+    // Iterate all raw EDNS options (including EDE, NSID, Padding, etc.)
+    var opt_it = edns.optionsIterator();
+    while (try opt_it.next()) |opt| {
+        std.debug.print("Option code={d} len={d}\n", .{ @backingInt(opt.code), opt.data.len });
+    }
+}
+```
+
+Or scan the additional section directly with `MessageParser.findEdns`:
 
 ```zig
 var parser = dns.MessageParser.init(buffer);
 try parser.skipQuestions(message.header.qdcount);
-try parser.skipResourceRecords(message.header.ancount + message.header.nscount);
+try parser.skipNonAdditionalRecords(@as(usize, message.header.ancount) + message.header.nscount);
 
 if (try parser.findEdns(message.header.arcount)) |edns| {
-    std.debug.print("EDNS UDP size: {d}\n", .{edns.opt.class});
-    if (edns.ecs) |ecs| std.debug.print("ECS family={d} prefix={d}\n", .{ ecs.family, ecs.source_prefix });
-    if (edns.cookie) |c| std.debug.print("cookie server bytes: {d}\n", .{c.server.len});
-
-    // Header fields (version / extended RCODE / DO) decode from the OPT record itself:
     const params = try dns.Edns.fromOpt(edns.opt);
     std.debug.print("DO={}\n", .{params.dnssec_ok});
 }
+try parser.expectEnd();
 ```
 
 `findEdns` returns an error when the message violates RFC 6891 or option validation:
@@ -262,18 +273,18 @@ header.tc = if (truncated) 1 else 0;
 const packet = builder.finish(header);
 ```
 
-Attach EDNS(0) — an OPT record goes in the additional section, and `addOptRecord`
-places it there and counts it automatically:
+Attach EDNS(0) safely with `setEdns` — it reserves exact trailing space for the `OPT` record without changing the active section, so `OPT` is still emitted in the Additional section even when Answer records hit `error.BufferTooSmall` (`TC=1` truncation per RFC 6891 §7):
 
 ```zig
 try builder.addQuestion("example.com", .A, 1);
-try builder.addOptRecord(.{
+try builder.setEdns(.{
     .udp_payload_size = 1232,
     .dnssec_ok = true,
     .ecs = .{ .family = 1, .source_prefix = 24, .scope_prefix = 0,
               .address = &[_]u8{ 192, 0, 2 } }, // 192.0.2.0/24
 });
-// use addOptRecordRaw(udp_size, ttl, options) to supply your own option bytes
+// Answer / Authority records can still be added normally; finish() appends OPT at the end.
+// (addOptRecord / addOptRecordRaw remain available for immediate Additional-section emission.)
 ```
 
 For DNS-over-TCP, use the 2-byte length-prefix framing helpers:
@@ -377,6 +388,8 @@ pub const Error = error{
     MultipleOptRecords, // RFC 6891 §6.1.1: more than one OPT record → FORMERR
     InvalidRecordOrder, // Builder misuse: section regression, or question after an RR
     UseEdns,            // parseRData called on OPT(41): use findEdns / Edns.fromOpt instead
+    MisplacedOptRecord, // RFC 6891 §6.1.1: OPT record in Answer or Authority section → FORMERR
+    TrailingBytes,      // Unaccounted trailing bytes past the declared section counts → FORMERR
 };
 ```
 

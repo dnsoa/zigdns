@@ -26,6 +26,20 @@ fn draw(s: *Smith, buf: []u8, hash: u32) []const u8 {
 fn walk(input: []const u8) void {
     const msg = Message.parse(input) catch return;
 
+    // 整包严格 EDNS 与 SectionParser 路径也一并走过
+    if (msg.findEdns() catch null) |full_edns| {
+        var opt_it = full_edns.optionsIterator();
+        while (opt_it.next() catch null) |_| {}
+    }
+    {
+        var secs = msg.sections();
+        while (secs.nextQuestion() catch null) |_| {}
+        while (secs.nextAnswer() catch null) |_| {}
+        while (secs.nextAuthority() catch null) |_| {}
+        while (secs.nextAdditional() catch null) |_| {}
+        _ = secs.expectEnd() catch {};
+    }
+
     var parser = MessageParser.init(input);
     var qi = parser.questions(msg.header.qdcount);
     while (qi.next() catch return) |_| {}
@@ -34,7 +48,7 @@ fn walk(input: []const u8) void {
     // 严格 EDNS 入口也一并走过（在跳过回答与权威区后扫描附加区）
     {
         var edns_parser = parser;
-        if (edns_parser.skipResourceRecords(msg.header.ancount +| msg.header.nscount)) |_| {
+        if (edns_parser.skipNonAdditionalRecords(@as(usize, msg.header.ancount) + msg.header.nscount)) |_| {
             if (edns_parser.findEdns(msg.header.arcount) catch null) |edns| {
                 _ = Edns.fromOpt(edns.opt) catch {};
             }
