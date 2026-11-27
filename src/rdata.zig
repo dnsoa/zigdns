@@ -28,6 +28,14 @@ fn parseECSOption(option_payload: []const u8) !ECSData {
     if (source_prefix > max_prefix or scope_prefix > max_prefix) return error.MalformedECS;
     const expected_len = (@as(usize, source_prefix) + 7) / 8;
     if (address.len != expected_len) return error.MalformedECS;
+    // RFC 7871 §6 / §7.1.2: 超出 source_prefix 的地址位必须为 0，否则接收方 MUST 返回 FORMERR。
+    if (expected_len > 0) {
+        const rem: u3 = @intCast(source_prefix % 8);
+        if (rem != 0) {
+            const host_mask = (@as(u8, 1) << @intCast(8 - @as(u4, rem))) - 1;
+            if ((address[expected_len - 1] & host_mask) != 0) return error.MalformedECS;
+        }
+    }
 
     return ECSData{
         .family = family,
@@ -37,15 +45,15 @@ fn parseECSOption(option_payload: []const u8) !ECSData {
     };
 }
 
-/// OPT RDATA 中已识别的 EDNS 选项。同一选项码出现多次时取第一个。
+/// OPT RDATA 中已识别的 EDNS 选项。
 pub const OptOptions = struct { ecs: ?ECSData = null, cookie: ?CookieData = null };
 
 /// 单趟遍历 OPT 记录的 RDATA（RFC 6891 §6.1.2：{code(2), len(2), value} TLV 序列），
 /// 解出已识别的选项。
 ///
 /// TLV 必须**恰好平铺**整个 RDATA：即使目标选项已找到也要走完全程，残留字节一律
-/// error.InvalidRData。提前返回会让「合法 ECS 后面跟一段垃圾」被静默接受，
-/// 形成选项夹带 / FORMERR 判定不一致的窗口。
+/// error.InvalidRData。重复 COOKIE（RFC 7873 §5.2.2 MUST FORMERR）或重复 ECS
+/// （RFC 7871 §7.1）分别返回 error.MalformedCookie / error.MalformedECS。
 pub fn parseOptOptions(rdata: []const u8) !OptOptions {
     var out = OptOptions{};
     var pos: usize = 0;
@@ -58,10 +66,12 @@ pub fn parseOptOptions(rdata: []const u8) !OptOptions {
         const payload = rdata[pos .. pos + len];
         pos += len;
 
-        if (code == @intFromEnum(OptionCode.ECS)) {
-            if (out.ecs == null) out.ecs = try parseECSOption(payload);
-        } else if (code == @intFromEnum(OptionCode.COOKIE)) {
-            if (out.cookie == null) out.cookie = try parseCookieOption(payload);
+        if (code == @backingInt(OptionCode.ECS)) {
+            if (out.ecs != null) return error.MalformedECS;
+            out.ecs = try parseECSOption(payload);
+        } else if (code == @backingInt(OptionCode.COOKIE)) {
+            if (out.cookie != null) return error.MalformedCookie;
+            out.cookie = try parseCookieOption(payload);
         }
     }
     // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
@@ -156,6 +166,31 @@ pub fn validateSvcParams(params: []const u8) !void {
     }
 }
 
+/// 校验 NSEC/NSEC3 类型位图原始字节（RFC 4034 §4.1.2 / RFC 5155 §3.2.1）：
+/// 窗口严格递增、1 ≤ blen ≤ 32、禁止全零窗口块与尾部零字节（末字节必须非零）。
+/// NSEC 要求至少一个窗口块（`allow_empty = false`），NSEC3 允许空位图（`allow_empty = true`）。
+pub fn validateTypeBitmap(raw: []const u8, allow_empty: bool) Error!void {
+    if (raw.len == 0) {
+        if (!allow_empty) return error.InvalidRData;
+        return;
+    }
+    var hdr: usize = 0;
+    var prev_window: i16 = -1;
+    while (hdr < raw.len) {
+        if (hdr + 2 > raw.len) return error.InvalidRData;
+        const window = raw[hdr];
+        const blen = raw[hdr + 1];
+        if (blen < 1 or blen > 32) return error.InvalidRData;
+        if (@as(i16, window) <= prev_window) return error.InvalidRData;
+        prev_window = window;
+        const bstart = hdr + 2;
+        if (bstart + blen > raw.len) return error.InvalidRData;
+        // RFC 4034 §4.1.2: 禁止无置位类型的空块，且尾部零字节必须省略 -> 末字节必非 0。
+        if (raw[bstart + blen - 1] == 0) return error.InvalidRData;
+        hdr = bstart + blen;
+    }
+}
+
 /// NSEC/NSEC3 类型位图（RFC 4034 §4.1.2）：window块(1)+位图长度(1)+位图 的窗口序列。
 /// 零拷贝保留原始字节；迭代产出所有置位的 RR 类型编号（升序）。
 pub const TypeBitmap = struct {
@@ -174,13 +209,14 @@ pub const TypeBitmap = struct {
                 const window = self.data[self.hdr];
                 const blen = self.data[self.hdr + 1];
                 if (blen < 1 or blen > 32) return error.InvalidRData;
-                // RFC 4034 §4.1.2: 窗口块须按编号严格递增；否则升序输出的不变量被破坏。
-                if (self.bit == 0) {
-                    if (@as(i16, window) <= self.prev_window) return error.InvalidRData;
-                    self.prev_window = window;
-                }
                 const bstart = self.hdr + 2;
                 if (bstart + blen > self.data.len) return error.InvalidRData;
+                // RFC 4034 §4.1.2 / RFC 5155 §3.2.1: 窗口严格递增，且禁止全零块与尾部零字节。
+                if (self.bit == 0) {
+                    if (@as(i16, window) <= self.prev_window) return error.InvalidRData;
+                    if (self.data[bstart + blen - 1] == 0) return error.InvalidRData;
+                    self.prev_window = window;
+                }
                 const total_bits = @as(usize, blen) * 8;
                 while (self.bit < total_bits) {
                     const byte = self.data[bstart + self.bit / 8];
@@ -237,11 +273,16 @@ pub const Nsec3Data = struct {
 pub const Nsec3ParamData = struct { hash_algorithm: u8, flags: u8, iterations: u16, salt: []const u8 };
 
 /// RFC 4034 附录 B：由 DNSKEY 的 RDATA 计算 key tag（用于关联 DS/RRSIG）。
-/// 对算法 1(RSA/MD5) 之外的所有算法适用（算法 1 已废弃，不支持）。
+/// 算法 1（RSA/MD5，附录 B.1）取公钥模数末 3 字节的前 16 位；其余算法走通用 16 位累加。
 pub fn keyTag(dnskey_rdata: []const u8) u16 {
-    var acc: u32 = 0;
+    if (dnskey_rdata.len >= 4 and dnskey_rdata[3] == 1) {
+        const pubkey = dnskey_rdata[4..];
+        if (pubkey.len < 4) return 0;
+        return mem.readInt(u16, pubkey[pubkey.len - 3 ..][0..2], .big);
+    }
+    var acc: u64 = 0;
     for (dnskey_rdata, 0..) |b, i| {
-        acc += if (i & 1 == 0) @as(u32, b) << 8 else @as(u32, b);
+        acc += if (i & 1 == 0) @as(u64, b) << 8 else @as(u64, b);
     }
     acc += (acc >> 16) & 0xFFFF;
     return @intCast(acc & 0xFFFF);
@@ -301,10 +342,42 @@ pub const RData = union(Type) {
     /// 与 owner name 的 skip 路径共用 `MESSAGE_POINTER_FLOOR`：RDATA 里的域名同样
     /// 不得指向 header，否则 owner 被拒的输入换个位置又能通过。
     fn advanceName(msg: []const u8, base: usize, data: []const u8, pos: *usize) Error!void {
-        const end = try skipNameAt(msg, base + pos.*, POINTER_FLOOR);
-        // 名字（及其尾部指针）必须落在 RDLENGTH 划定的范围内。
-        if (end > base + data.len) return error.PacketTooShort;
-        pos.* = end - base;
+        const wire_limit = base + data.len;
+        var cur = base + pos.*;
+        var total: usize = 1; // RFC 1035 §2.3.4 的 255 含根结束符
+        var jumps: usize = 0;
+        var wire_end: ?usize = null;
+
+        while (true) {
+            // 首个压缩指针之前的线格式字节必须严格落在本条记录 RDLENGTH 之内，
+            // 不得越界读入后续 RR；超出 RDLENGTH 一律归类为 InvalidRData。
+            const limit = if (wire_end == null) wire_limit else msg.len;
+            if (cur >= limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
+
+            const len = msg[cur];
+            if (len == 0) {
+                const end = wire_end orelse (cur + 1);
+                pos.* = end - base;
+                return;
+            }
+
+            if (len & 0xC0 == 0xC0) {
+                if (cur + 2 > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
+                const target = (@as(usize, len & 0x3F) << 8) | msg[cur + 1];
+                if (target < POINTER_FLOOR or target >= msg.len) return error.InvalidOffset;
+                if (jumps >= 128) return error.MalformedName;
+                jumps += 1;
+                if (wire_end == null) wire_end = cur + 2;
+                cur = target;
+                continue;
+            }
+
+            if (len > 63) return error.LabelTooLong;
+            if (cur + 1 + len > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
+            total += 1 + len;
+            if (total > 255) return error.NameTooLong;
+            cur += 1 + len;
+        }
     }
 
     /// 同 advanceName，但禁止压缩指针（RFC 4034 §3.1.7/§4.1.1、RFC 9460 §2.2
@@ -319,12 +392,12 @@ pub const RData = union(Type) {
             }
             if (len & 0xC0 == 0xC0) return error.MalformedName; // 禁止压缩
             if (len > 63) return error.LabelTooLong;
-            if (data.len - pos.* < 1 + len) return error.PacketTooShort;
+            if (data.len - pos.* < 1 + len) return error.InvalidRData;
             total += 1 + len;
             if (total > 255) return error.NameTooLong;
             pos.* += 1 + len;
         }
-        return error.MalformedName;
+        return error.InvalidRData;
     }
 
     /// 从完整报文中解析某条记录的 RDATA。
@@ -422,14 +495,18 @@ pub const RData = union(Type) {
                 } };
             },
             .CAA => {
-                // RFC 8659 §4.1: flags(1) + tag长度(1) + tag + value（其余全部）。
+                // RFC 8659 §4.1 / §4.1.1: flags(1) + tag长度(1) + tag(仅限 [A-Za-z0-9]) + value。
                 if (data.len < 2) return error.InvalidRData;
                 const tag_len: usize = data[1];
                 if (tag_len == 0) return error.InvalidRData; // RFC 8659 §4.1: tag ≥1 字节
                 if (2 + tag_len > data.len) return error.InvalidRData;
+                const tag = data[2 .. 2 + tag_len];
+                for (tag) |c| {
+                    if (!std.ascii.isAlphanumeric(c)) return error.InvalidRData;
+                }
                 return RData{ .CAA = .{
                     .flags = data[0],
-                    .tag = data[2 .. 2 + tag_len],
+                    .tag = tag,
                     .value = data[2 + tag_len ..],
                 } };
             },
@@ -491,6 +568,8 @@ pub const RData = union(Type) {
                 // next_domain name + 类型位图（RFC 4034 §4.1）。
                 var pos: usize = 0;
                 try advanceNameNoPointer(data, &pos); // next_domain 不得压缩（RFC 4034 §4.1.1）
+                // RFC 4034 §4.1.2: NSEC 位图至少包含一个非空窗口块。
+                try validateTypeBitmap(data[pos..], false);
                 return RData{ .NSEC = .{
                     .next_domain = Name{ .buffer = msg, .offset = rdata_offset },
                     .types = .{ .raw = data[pos..] },
@@ -507,6 +586,8 @@ pub const RData = union(Type) {
                 // RFC 5155 §3.1.1/§3.1.7: 仅定义 SHA-1（算法 1），其哈希固定 20 字节。
                 // 已知算法的非法哈希长度视为畸形；未定义算法长度不可校验，保持宽松。
                 if (data[0] == 1 and hash_len != 20) return error.InvalidRData;
+                // RFC 5155 §3.2.1: NSEC3 允许空位图（空非终端），但非空时须符合窗口规范。
+                try validateTypeBitmap(data[hash_start + hash_len ..], true);
                 return RData{ .NSEC3 = .{
                     .hash_algorithm = data[0],
                     .flags = data[1],
@@ -993,4 +1074,56 @@ test "RData rejects RDATA names pointing into the header" {
     msg[14] = 0xC0;
     msg[15] = 0x02;
     try std.testing.expectError(error.InvalidOffset, RData.parse(.MX, &msg, 12, 4));
+}
+
+test "parseOptOptions rejects duplicate COOKIE and duplicate ECS (RFC 7873 / RFC 7871)" {
+    const cookie1 = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
+    const cookie2_ok = "\x00\x0a\x00\x08\x08\x07\x06\x05\x04\x03\x02\x01";
+    const cookie2_bad = "\x00\x0a\x00\x03\xff\xff\xff";
+    try std.testing.expectError(error.MalformedCookie, parseOptOptions(cookie1 ++ cookie2_ok));
+    try std.testing.expectError(error.MalformedCookie, parseOptOptions(cookie1 ++ cookie2_bad));
+
+    const ecs1 = "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02";
+    const ecs2_bad = "\x00\x08\x00\x04\x00\x09\x00\x00";
+    try std.testing.expectError(error.MalformedECS, parseOptOptions(ecs1 ++ ecs1));
+    try std.testing.expectError(error.MalformedECS, parseOptOptions(ecs1 ++ ecs2_bad));
+}
+
+test "parseECS rejects non-zero host bits beyond source_prefix (RFC 7871 7.1.2)" {
+    // IPv4 /20 末字节低 4 位须为 0：0xF1 非法，0xF0 合法
+    const bad = "\x00\x08\x00\x07\x00\x01\x14\x00\xc0\xa8\xf1";
+    try std.testing.expectError(error.MalformedECS, parseECS(bad));
+    const ok = "\x00\x08\x00\x07\x00\x01\x14\x00\xc0\xa8\xf0";
+    const ecs = (try parseECS(ok)).?;
+    try std.testing.expectEqual(@as(u8, 20), ecs.source_prefix);
+}
+
+test "NSEC/TypeBitmap/CAA/keyTag enforce RFC 4034 and RFC 8659 constraints" {
+    // NSEC 不允许空位图，也不允许带残尾/全零块/尾零字节的位图
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC, "\x00", 0, 1));
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC, "\x00\xff", 0, 2));
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC, "\x00\x00\x01\x00", 0, 4));
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC, "\x00\x00\x02\x40\x00", 0, 5));
+
+    // NSEC3 允许空位图（空非终端），但拒绝尾零字节位图
+    const n3_empty = "\x01\x00\x00\x01\x00" ++ "\x14\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14";
+    _ = try RData.parse(.NSEC3, n3_empty, 0, n3_empty.len);
+    const n3_bad = n3_empty ++ "\x00\x02\x40\x00";
+    try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC3, n3_bad, 0, n3_bad.len));
+
+    // CAA tag 仅允许 ASCII 字母与数字（RFC 8659 §4.1.1）
+    try std.testing.expectError(error.InvalidRData, RData.parse(.CAA, "\x00\x06issue;", 0, 8));
+
+    // keyTag 算法 1（RFC 4034 附录 B.1）：取公钥末 3 字节的前 16 位
+    const alg1 = "\x01\x00\x03\x01" ++ "\x01\x03\xaa\xbb\xcc\xdd";
+    try std.testing.expectEqual(@as(u16, 0xbbcc), keyTag(alg1));
+}
+
+test "RData.advanceName bounds wire scan to rdlength without reading into next RR" {
+    // 报文完整，但第一条 CNAME 的 rdlength=2 截断了 "\x03com\x00"，后面紧跟字节 0x40（原本会误报 LabelTooLong）
+    var msg: [32]u8 = @splat(0);
+    msg[20] = 3;
+    msg[21] = 'c';
+    msg[22] = 64; // 下一条记录中的字节，不应被本条 RDATA 读取
+    try std.testing.expectError(error.InvalidRData, RData.parse(.CNAME, &msg, 20, 2));
 }

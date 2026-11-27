@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const Error = @import("errors.zig").Error;
 
 // RFC 1035 2.3.4: 单标签 ≤63 字节，完整域名 ≤255 字节。
 const MAX_LABEL = 63;
@@ -120,18 +121,115 @@ pub fn skipName(buffer: []const u8, start: usize, pointer_floor: usize) !usize {
     }
 }
 
-/// 将点分域名切成标签数组（根 "." 或 "" -> 0 个标签）。返回标签数。
-/// out 长度上限即为可容纳的标签数；超出则截断到上限（域名 ≤255 -> ≤127 标签）。
-fn splitLabels(name: []const u8, out: [][]const u8) usize {
-    var n: usize = 0;
-    var it = mem.splitScalar(u8, name, '.');
-    while (it.next()) |label| {
-        if (label.len == 0) continue; // 跳过根/尾点产生的空标签
-        if (n >= out.len) break;
-        out[n] = label;
-        n += 1;
+pub const DecodedPresentationName = struct {
+    wire_len: usize,
+    n_labels: usize,
+};
+
+/// 将点分表示格式域名（RFC 1035 §5.1 / RFC 4343 §2.1）单趟解码并校验为线格式（含末尾 0 根字节）。
+/// 支持 `\.`、`\\` 等单字符转义与 `\DDD`（000..255）十进制字节转义；无反斜杠时走快路径。
+/// `offsets[0..n_labels]` 给出每个标签长度字节在 `wire` 中的偏移。
+pub fn decodePresentationName(
+    name: []const u8,
+    wire: *[MAX_NAME]u8,
+    offsets: *[128]u8,
+) Error!DecodedPresentationName {
+    if (name.len == 0 or mem.eql(u8, name, ".")) {
+        wire[0] = 0;
+        return .{ .wire_len = 1, .n_labels = 0 };
     }
-    return n;
+
+    // 快路径：无反斜杠转义（占绝大多数真实域名）
+    if (mem.indexOfScalar(u8, name, '\\') == null) {
+        const s = if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+        var wpos: usize = 0;
+        var n_labels: usize = 0;
+        var label_start: usize = 0;
+
+        for (s, 0..) |b, idx| {
+            if (b == '.') {
+                const llen = idx - label_start;
+                if (llen == 0) return Error.MalformedName;
+                if (llen > MAX_LABEL) return Error.LabelTooLong;
+                if (wpos + 1 + llen + 1 > MAX_NAME) return Error.NameTooLong;
+                offsets[n_labels] = @intCast(wpos);
+                n_labels += 1;
+                wire[wpos] = @intCast(llen);
+                @memcpy(wire[wpos + 1 ..][0..llen], s[label_start..idx]);
+                wpos += 1 + llen;
+                label_start = idx + 1;
+            }
+        }
+
+        const llen = s.len - label_start;
+        if (llen == 0) return Error.MalformedName;
+        if (llen > MAX_LABEL) return Error.LabelTooLong;
+        if (wpos + 1 + llen + 1 > MAX_NAME) return Error.NameTooLong;
+        offsets[n_labels] = @intCast(wpos);
+        n_labels += 1;
+        wire[wpos] = @intCast(llen);
+        @memcpy(wire[wpos + 1 ..][0..llen], s[label_start..]);
+        wpos += 1 + llen;
+        wire[wpos] = 0;
+        return .{ .wire_len = wpos + 1, .n_labels = n_labels };
+    }
+
+    // 转义路径（RFC 1035 §5.1）：逐字符解析 `\.`、`\\`、`\DDD`
+    var wpos: usize = 0;
+    var n_labels: usize = 0;
+    var i: usize = 0;
+    while (i < name.len) {
+        const len_pos = wpos;
+        if (wpos + 2 > MAX_NAME) return Error.NameTooLong;
+        wpos += 1; // 预留标签长度字节
+        var llen: usize = 0;
+
+        while (i < name.len) {
+            const c = name[i];
+            if (c == '.') {
+                if (llen == 0) return Error.MalformedName;
+                i += 1;
+                break;
+            }
+            const decoded: u8 = blk: {
+                if (c == '\\') {
+                    i += 1;
+                    if (i >= name.len) return Error.MalformedName;
+                    if (std.ascii.isDigit(name[i])) {
+                        if (i + 3 > name.len or !std.ascii.isDigit(name[i + 1]) or !std.ascii.isDigit(name[i + 2])) {
+                            return Error.MalformedName;
+                        }
+                        const val: u16 = (@as(u16, name[i] - '0') * 100) +
+                            (@as(u16, name[i + 1] - '0') * 10) +
+                            (name[i + 2] - '0');
+                        if (val > 255) return Error.MalformedName;
+                        i += 3;
+                        break :blk @intCast(val);
+                    } else {
+                        const esc = name[i];
+                        i += 1;
+                        break :blk esc;
+                    }
+                } else {
+                    i += 1;
+                    break :blk c;
+                }
+            };
+            if (llen >= MAX_LABEL) return Error.LabelTooLong;
+            if (wpos >= MAX_NAME - 1) return Error.NameTooLong; // 至少留 1 字节给根 0
+            wire[wpos] = decoded;
+            wpos += 1;
+            llen += 1;
+        }
+
+        if (llen == 0) return Error.MalformedName;
+        offsets[n_labels] = @intCast(len_pos);
+        n_labels += 1;
+        wire[len_pos] = @intCast(llen);
+    }
+
+    wire[wpos] = 0;
+    return .{ .wire_len = wpos + 1, .n_labels = n_labels };
 }
 
 fn compareLabelCI(x: []const u8, y: []const u8) std.math.Order {
@@ -145,21 +243,111 @@ fn compareLabelCI(x: []const u8, y: []const u8) std.math.Order {
     return std.math.order(x.len, y.len);
 }
 
+const BackwardLabels = struct {
+    s: []const u8,
+    rem: ?usize,
+
+    fn init(raw: []const u8) BackwardLabels {
+        if (raw.len == 0 or mem.eql(u8, raw, ".")) return .{ .s = raw, .rem = null };
+        const trimmed = if (raw.len > 1 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
+        return .{ .s = trimmed, .rem = trimmed.len };
+    }
+
+    fn next(self: *BackwardLabels) ?[]const u8 {
+        const end = self.rem orelse return null;
+        if (mem.lastIndexOfScalar(u8, self.s[0..end], '.')) |dot| {
+            self.rem = dot;
+            return self.s[dot + 1 .. end];
+        } else {
+            self.rem = null;
+            return self.s[0..end];
+        }
+    }
+};
+
+fn canonicalComparePlain(a: []const u8, b: []const u8) std.math.Order {
+    var ia = BackwardLabels.init(a);
+    var ib = BackwardLabels.init(b);
+    while (true) {
+        const la = ia.next();
+        const lb = ib.next();
+        if (la != null and lb != null) {
+            const ord = compareLabelCI(la.?, lb.?);
+            if (ord != .eq) return ord;
+        } else if (la == null and lb == null) {
+            return .eq;
+        } else {
+            // 共有后缀相同时标签更少者在前
+            return if (la == null) .lt else .gt;
+        }
+    }
+}
+
 /// DNSSEC canonical 名序（RFC 4034 §6.1）：从最右（TLD）标签起逐个比较，
 /// 每个标签按 US-ASCII 大小写折叠后的八位组序比较；共有后缀相同时标签更少者在前。
-/// 输入为点分域名（大小写不敏感），根用 "." 或 ""。
+/// 输入为表示格式域名（支持 RFC 1035 §5.1 转义 `\.` / `\\` / `\DDD`，大小写不敏感），根用 "." 或 ""。
+/// 无转义快路径原地逆向扫描，零栈数组分配。
 pub fn canonicalCompare(a: []const u8, b: []const u8) std.math.Order {
-    var la: [128][]const u8 = undefined;
-    var lb: [128][]const u8 = undefined;
-    const na = splitLabels(a, &la);
-    const nb = splitLabels(b, &lb);
+    if (mem.indexOfScalar(u8, a, '\\') == null and mem.indexOfScalar(u8, b, '\\') == null) {
+        return canonicalComparePlain(a, b);
+    }
+
+    var wire_a: [MAX_NAME]u8 = undefined;
+    var off_a: [128]u8 = undefined;
+    var wire_b: [MAX_NAME]u8 = undefined;
+    var off_b: [128]u8 = undefined;
+    const da = decodePresentationName(a, &wire_a, &off_a) catch return canonicalComparePlain(a, b);
+    const db = decodePresentationName(b, &wire_b, &off_b) catch return canonicalComparePlain(b, b_blk: {
+        break :b_blk b;
+    });
+
+    var i: usize = 0;
+    while (i < da.n_labels and i < db.n_labels) : (i += 1) {
+        const oa = off_a[da.n_labels - 1 - i];
+        const ob = off_b[db.n_labels - 1 - i];
+        const la = wire_a[oa + 1 ..][0..wire_a[oa]];
+        const lb = wire_b[ob + 1 ..][0..wire_b[ob]];
+        const ord = compareLabelCI(la, lb);
+        if (ord != .eq) return ord;
+    }
+    return std.math.order(da.n_labels, db.n_labels);
+}
+
+/// 零拷贝比较两个线格式域名的 DNSSEC canonical 顺序（RFC 4034 §6.1）。
+/// 跟随压缩指针，无需先格式化为字符串，精确处理含 '.' 或任意二进制字节的标签。
+pub fn canonicalCompareWire(
+    a_buf: []const u8,
+    a_off: usize,
+    b_buf: []const u8,
+    b_off: usize,
+    pointer_floor: usize,
+) Error!std.math.Order {
+    if (a_buf.len > std.math.maxInt(u32) or b_buf.len > std.math.maxInt(u32)) return error.MessageTooLong;
+    const Span = struct { start: u32, len: u8 };
+    var la: [128]Span = undefined;
+    var lb: [128]Span = undefined;
+    var na: usize = 0;
+    var nb: usize = 0;
+
+    var cur_a = NameCursor{ .buffer = a_buf, .pos = a_off, .pointer_floor = pointer_floor };
+    while (try cur_a.next()) |lbl| {
+        la[na] = .{ .start = @intCast(cur_a.pos - lbl.len), .len = @intCast(lbl.len) };
+        na += 1;
+    }
+    var cur_b = NameCursor{ .buffer = b_buf, .pos = b_off, .pointer_floor = pointer_floor };
+    while (try cur_b.next()) |lbl| {
+        lb[nb] = .{ .start = @intCast(cur_b.pos - lbl.len), .len = @intCast(lbl.len) };
+        nb += 1;
+    }
 
     var i: usize = 0;
     while (i < na and i < nb) : (i += 1) {
-        const ord = compareLabelCI(la[na - 1 - i], lb[nb - 1 - i]);
+        const sa = la[na - 1 - i];
+        const sb = lb[nb - 1 - i];
+        const ord = compareLabelCI(a_buf[sa.start..][0..sa.len], b_buf[sb.start..][0..sb.len]);
         if (ord != .eq) return ord;
     }
-    return std.math.order(na, nb); // 共有后缀相同 -> 标签更少者在前
+    return std.math.order(na, nb);
 }
 
 /// 零拷贝域名解析器：只负责「逐标签遍历一个域名」，不是报文游标。
@@ -277,29 +465,32 @@ test "NameIterator empty domain" {
     try std.testing.expect((try iter.next()) == null);
 }
 
-/// 将 DNS 线路格式域名转换为点分隔格式（裸缓冲区语义：不约束压缩指针目标）。
+/// 将 DNS 线路格式域名转换为 RFC 1035 §5.1 表示格式（裸缓冲区语义：不约束压缩指针目标）。
+/// 普通可打印 ASCII 直接写出；标签内的 '.' 与 '\\' 转义为 `\.` / `\\`，控制字符与非 ASCII 转义为 `\DDD`。
 /// buffer: 包含 DNS 数据包的缓冲区
 /// pos: 域名起始位置
-/// out_buf: 输出缓冲区，必须足够大（最多 253 字节 + 1）
+/// out_buf: 输出缓冲区（普通 ASCII 域名最多 253 字节；含全转义极端情况至多 1004 字节）
 /// 返回: 写入 out_buf 的字符串切片
 ///
 /// buffer 是一整个 DNS 报文时请用 `formatDnsNameInMessage`，它会一并拒绝指向
 /// header 的压缩指针。
-pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) ![]const u8 {
+pub fn formatDnsName(buffer: []const u8, pos: usize, out_buf: []u8) Error![]const u8 {
     return formatName(NameCursor.init(buffer, pos), out_buf);
 }
 
 /// 同 `formatDnsName`，但按完整报文语义校验（指针不得指向 12 字节 header）。
-pub fn formatDnsNameInMessage(msg: []const u8, pos: usize, out_buf: []u8) ![]const u8 {
+pub fn formatDnsNameInMessage(msg: []const u8, pos: usize, out_buf: []u8) Error![]const u8 {
     return formatName(NameCursor.initInMessage(msg, pos), out_buf);
 }
 
-fn formatName(cursor: NameCursor, out_buf: []u8) ![]const u8 {
+fn formatName(cursor: NameCursor, out_buf: []u8) Error![]const u8 {
     var cur = cursor;
     var write_pos: usize = 0;
     var first_label = true;
+    var has_any_label = false;
 
     while (try cur.next()) |label| {
+        has_any_label = true;
         // 添加点分隔符（第一个标签前不加）
         if (!first_label) {
             if (write_pos >= out_buf.len) return error.BufferTooSmall;
@@ -308,13 +499,43 @@ fn formatName(cursor: NameCursor, out_buf: []u8) ![]const u8 {
         }
         first_label = false;
 
-        if (write_pos + label.len > out_buf.len) return error.BufferTooSmall;
-        @memcpy(out_buf[write_pos .. write_pos + label.len], label);
-        write_pos += label.len;
+        // 快路径：无特殊字节的普通 ASCII 标签整段拷贝
+        var needs_escape = false;
+        for (label) |b| {
+            if (b <= 0x20 or b >= 0x7F or b == '.' or b == '\\') {
+                needs_escape = true;
+                break;
+            }
+        }
+        if (!needs_escape) {
+            if (write_pos + label.len > out_buf.len) return error.BufferTooSmall;
+            @memcpy(out_buf[write_pos .. write_pos + label.len], label);
+            write_pos += label.len;
+        } else {
+            for (label) |b| {
+                if (b == '.' or b == '\\') {
+                    if (write_pos + 2 > out_buf.len) return error.BufferTooSmall;
+                    out_buf[write_pos] = '\\';
+                    out_buf[write_pos + 1] = b;
+                    write_pos += 2;
+                } else if (b <= 0x20 or b >= 0x7F) {
+                    if (write_pos + 4 > out_buf.len) return error.BufferTooSmall;
+                    out_buf[write_pos] = '\\';
+                    out_buf[write_pos + 1] = '0' + (b / 100);
+                    out_buf[write_pos + 2] = '0' + ((b / 10) % 10);
+                    out_buf[write_pos + 3] = '0' + (b % 10);
+                    write_pos += 4;
+                } else {
+                    if (write_pos + 1 > out_buf.len) return error.BufferTooSmall;
+                    out_buf[write_pos] = b;
+                    write_pos += 1;
+                }
+            }
+        }
     }
 
     // 根域名（无标签）返回 "."
-    if (write_pos == 0) {
+    if (!has_any_label) {
         if (out_buf.len == 0) return error.BufferTooSmall;
         out_buf[0] = '.';
         return out_buf[0..1];
@@ -331,11 +552,16 @@ pub const Name = struct {
     /// 域名在报文中的起始偏移
     offset: usize,
 
-    /// 解析为点分格式写入 out_buf（跟随压缩指针，带循环检测）。
+    /// 解析为 RFC 1035 §5.1 表示格式写入 out_buf（跟随压缩指针，带循环检测）。
     /// 返回指向 out_buf 的切片。
     /// `buffer` 按定义是完整报文，故指向 header 的压缩指针会被拒绝。
-    pub fn str(self: Name, out_buf: []u8) ![]const u8 {
+    pub fn str(self: Name, out_buf: []u8) Error![]const u8 {
         return formatDnsNameInMessage(self.buffer, self.offset, out_buf);
+    }
+
+    /// 按完整报文语义零拷贝比较两个 Name 的 DNSSEC canonical 顺序（RFC 4034 §6.1）。
+    pub fn canonicalCompare(self: Name, other: Name) Error!std.math.Order {
+        return canonicalCompareWire(self.buffer, self.offset, other.buffer, other.offset, MESSAGE_POINTER_FLOOR);
     }
 };
 
@@ -532,18 +758,54 @@ test "skipName agrees with NameCursor" {
     };
     for (cases) |buf| {
         for ([_]usize{ 0, MESSAGE_POINTER_FLOOR }) |floor| {
-            // 两种语义下名字的起点不同：报文语义从 header 之后开始。
-            const start = if (floor == 0) 0 else @min(MESSAGE_POINTER_FLOOR + 4, buf.len -| 1);
-            const skip_err: ?anyerror = if (skipName(buf, start, floor)) |_| null else |e| e;
-            var cur = NameCursor{ .buffer = buf, .pos = start, .pointer_floor = floor };
-            const cursor_err: ?anyerror = while (true) {
-                if (cur.next()) |label| {
-                    if (label == null) break null;
-                } else |e| break e;
-            };
-            try std.testing.expectEqual(cursor_err, skip_err);
+            const starts = [_]usize{ 0, @min(12, buf.len -| 1), @min(17, buf.len -| 1) };
+            for (starts) |start| {
+                const skip_err: ?anyerror = if (skipName(buf, start, floor)) |_| null else |e| e;
+                var cur = NameCursor{ .buffer = buf, .pos = start, .pointer_floor = floor };
+                const cursor_err: ?anyerror = while (true) {
+                    if (cur.next()) |label| {
+                        if (label == null) break null;
+                    } else |e| break e;
+                };
+                try std.testing.expectEqual(cursor_err, skip_err);
+            }
         }
     }
+}
+
+test "formatDnsName escapes dots, backslashes and control bytes (RFC 1035 5.1)" {
+    var out: [256]u8 = undefined;
+    // 单字节标签 '.' 必须转义为 "\."，不得与根域名 "." 冲突
+    try std.testing.expectEqualStrings("\\.", try formatDnsName("\x01.\x00", 0, &out));
+    // 单标签内含点："example.com"（1 标签）-> "example\.com"
+    try std.testing.expectEqualStrings("example\\.com", try formatDnsName("\x0bexample.com\x00", 0, &out));
+    // 标签含反斜杠与控制字符/高位字节
+    try std.testing.expectEqualStrings("a\\\\b\\000\\255.com", try formatDnsName("\x05a\\b\x00\xff\x03com\x00", 0, &out));
+}
+
+test "Name.canonicalCompare and canonicalCompare preserve RFC 4034 6.1 order on labels with dots" {
+    const O = std.math.Order;
+    // Wire A: \x03b.a\x03com\x00（2 标签：b\.a, com）
+    // Wire B: \x01a\x01b\x03com\x00（3 标签：a, b, com）
+    // RFC 4034 §6.1 自右向左比较：com == com，次右标签 "b.a" > "b" -> .gt
+    var msg_a: [32]u8 = @splat(0);
+    @memcpy(msg_a[12..21], "\x03b.a\x03com\x00");
+    var msg_b: [32]u8 = @splat(0);
+    @memcpy(msg_b[12..21], "\x01a\x01b\x03com\x00");
+
+    const na = Name{ .buffer = msg_a[0..21], .offset = 12 };
+    const nb = Name{ .buffer = msg_b[0..21], .offset = 12 };
+    try std.testing.expectEqual(O.gt, try na.canonicalCompare(nb));
+    try std.testing.expectEqual(O.lt, try nb.canonicalCompare(na));
+
+    // 经 Name.str 转义后再调表示格式 canonicalCompare 也必须给出相同顺序
+    var ba: [256]u8 = undefined;
+    var bb: [256]u8 = undefined;
+    try std.testing.expectEqual(O.gt, canonicalCompare(try na.str(&ba), try nb.str(&bb)));
+
+    // 内部空标签不得与正常名字静默判等
+    try std.testing.expect(canonicalCompare("a..example.com", "a.example.com") != .eq);
+    try std.testing.expect(canonicalCompare(".example.com", "example.com") != .eq);
 }
 
 test "NameCursor.initInMessage rejects pointers into the header" {

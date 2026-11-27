@@ -10,6 +10,7 @@ const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
 const skipNameAt = @import("name.zig").skipName;
 const formatDnsNameInMessage = @import("name.zig").formatDnsNameInMessage;
+const decodePresentationName = @import("name.zig").decodePresentationName;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 const Error = @import("errors.zig").Error;
 
@@ -46,12 +47,15 @@ pub fn CountedIterator(comptime T: type) type {
     return struct {
         parser: *MessageParser,
         remaining: u16,
-        nextFn: *const fn (*MessageParser) Error!?T,
 
         pub fn next(self: *@This()) Error!?T {
             if (self.remaining == 0) return null;
 
-            const item = try self.nextFn(self.parser);
+            const item = try switch (T) {
+                Question => self.parser.nextQuestion(),
+                ResourceRecord => self.parser.nextRR(),
+                else => @compileError("CountedIterator only supports Question or ResourceRecord"),
+            };
             if (item == null) return error.PacketTooShort;
 
             self.remaining -= 1;
@@ -83,7 +87,8 @@ pub const MessageParser = struct {
     }
 
     /// Parses the next Question in the packet
-    pub fn nextQuestion(self: *MessageParser) !?Question {
+    pub fn nextQuestion(self: *MessageParser) Error!?Question {
+        if (self.buffer.len < 12) return error.PacketTooShort;
         if (self.pos >= self.buffer.len) return null;
 
         const name_pos = self.pos;
@@ -92,7 +97,7 @@ pub const MessageParser = struct {
 
         if (self.pos + 4 > self.buffer.len) return error.PacketTooShort;
 
-        const qtype = @as(Type, @enumFromInt(mem.readInt(u16, self.buffer[self.pos..][0..2], .big)));
+        const qtype = @as(Type, @fromBackingInt(@intCast(mem.readInt(u16, self.buffer[self.pos..][0..2], .big))));
         const qclass = mem.readInt(u16, self.buffer[self.pos + 2 ..][0..2], .big);
         self.pos += 4;
 
@@ -105,7 +110,8 @@ pub const MessageParser = struct {
     }
 
     /// Parses the next Resource Record (Answer/Authority/Additional)
-    pub fn nextRR(self: *MessageParser) !?ResourceRecord {
+    pub fn nextRR(self: *MessageParser) Error!?ResourceRecord {
+        if (self.buffer.len < 12) return error.PacketTooShort;
         if (self.pos >= self.buffer.len) return null;
 
         const name_pos = self.pos;
@@ -114,7 +120,7 @@ pub const MessageParser = struct {
 
         if (self.pos + 10 > self.buffer.len) return error.PacketTooShort;
 
-        const rtype = @as(Type, @enumFromInt(mem.readInt(u16, self.buffer[self.pos..][0..2], .big)));
+        const rtype = @as(Type, @fromBackingInt(@intCast(mem.readInt(u16, self.buffer[self.pos..][0..2], .big))));
         const class = mem.readInt(u16, self.buffer[self.pos + 2 ..][0..2], .big);
         const ttl = mem.readInt(u32, self.buffer[self.pos + 4 ..][0..4], .big);
         const rdlen = mem.readInt(u16, self.buffer[self.pos + 8 ..][0..2], .big);
@@ -143,7 +149,6 @@ pub const MessageParser = struct {
         return .{
             .parser = self,
             .remaining = count,
-            .nextFn = nextQuestion,
         };
     }
 
@@ -151,7 +156,6 @@ pub const MessageParser = struct {
         return .{
             .parser = self,
             .remaining = count,
-            .nextFn = nextRR,
         };
     }
 
@@ -238,43 +242,87 @@ pub const MessageParser = struct {
         return found;
     }
 
-    pub fn nameEqualsAt(self: *const MessageParser, offset: usize, expected: []const u8) !bool {
+    pub fn nameEqualsAt(self: *const MessageParser, offset: usize, expected: []const u8) Error!bool {
+        if (self.buffer.len < 12) return error.PacketTooShort;
         if (offset >= self.buffer.len) return error.InvalidOffset;
 
-        // 根域名以 "." 或 "" 表示（与 formatDnsName 输出 "." 一致）。
-        // 非根名字剥掉单个尾点，与 Builder.canonicalizeName 及区域文件 FQDN 约定一致；
-        // 否则带尾点的 "example.com." 会对实际为 example.com 的名字误报不匹配。
-        const want: []const u8 = blk: {
-            if (mem.eql(u8, expected, ".")) break :blk expected[0..0];
-            if (expected.len > 1 and expected[expected.len - 1] == '.') break :blk expected[0 .. expected.len - 1];
-            break :blk expected;
-        };
-
         var cur = NameCursor.initInMessage(self.buffer, offset);
-        var expected_pos: usize = 0;
-        var first_label = true;
 
-        while (try cur.next()) |label| {
-            if (!first_label) {
-                if (expected_pos >= want.len or want[expected_pos] != '.') return false;
-                expected_pos += 1;
+        // 快路径：expected 不含反斜杠转义
+        if (mem.indexOfScalar(u8, expected, '\\') == null) {
+            if (expected.len == 0 or mem.eql(u8, expected, ".")) {
+                return (try cur.next()) == null;
             }
-            first_label = false;
+            const want = if (expected.len > 1 and expected[expected.len - 1] == '.')
+                expected[0 .. expected.len - 1]
+            else
+                expected;
+            if (want.len == 0 or want[0] == '.' or want[want.len - 1] == '.') {
+                while (try cur.next()) |_| {}
+                return false;
+            }
 
-            if (expected_pos + label.len > want.len) return false;
-            // RFC 1035 §2.3.3 / RFC 4343: 域名比较对 ASCII 大小写不敏感。
-            if (!std.ascii.eqlIgnoreCase(label, want[expected_pos .. expected_pos + label.len])) return false;
-            expected_pos += label.len;
+            var expected_pos: usize = 0;
+            var first_label = true;
+
+            while (try cur.next()) |label| {
+                if (!first_label) {
+                    if (expected_pos >= want.len or want[expected_pos] != '.') {
+                        while (try cur.next()) |_| {}
+                        return false;
+                    }
+                    expected_pos += 1;
+                }
+                first_label = false;
+
+                if (expected_pos + label.len > want.len) {
+                    while (try cur.next()) |_| {}
+                    return false;
+                }
+                // RFC 1035 §2.3.3 / RFC 4343: 域名比较对 ASCII 大小写不敏感；
+                // 同时禁止线格式单标签内的 '.' 跨越 want 的标签分隔点。
+                for (label, want[expected_pos .. expected_pos + label.len]) |lb, wb| {
+                    if (wb == '.' or std.ascii.toLower(lb) != std.ascii.toLower(wb)) {
+                        while (try cur.next()) |_| {}
+                        return false;
+                    }
+                }
+                expected_pos += label.len;
+            }
+
+            return expected_pos == want.len;
         }
 
-        return expected_pos == want.len;
+        // 转义路径（RFC 1035 §5.1）：解码 expected 中的 `\.` / `\\` / `\DDD` 后逐标签比较
+        var exp_wire: [255]u8 = undefined;
+        var exp_off: [128]u8 = undefined;
+        const decoded = decodePresentationName(expected, &exp_wire, &exp_off) catch {
+            while (try cur.next()) |_| {}
+            return false;
+        };
+
+        var idx: usize = 0;
+        while (try cur.next()) |label| : (idx += 1) {
+            if (idx >= decoded.n_labels) {
+                while (try cur.next()) |_| {}
+                return false;
+            }
+            const off = exp_off[idx];
+            const want_label = exp_wire[off + 1 ..][0..exp_wire[off]];
+            if (!std.ascii.eqlIgnoreCase(label, want_label)) {
+                while (try cur.next()) |_| {}
+                return false;
+            }
+        }
+        return idx == decoded.n_labels;
     }
 
     /// Format a DNS name at a specific offset in the packet.
     /// Follows compression pointers and returns dotted format.
     /// 委托给 name.zig 的 `formatDnsNameInMessage`（基于统一的 `NameCursor`，
     /// 按完整报文语义拒绝指向 header 的压缩指针），保留入口 InvalidOffset 语义。
-    pub fn formatNameAt(self: *const MessageParser, offset: usize, out_buf: []u8) ![]const u8 {
+    pub fn formatNameAt(self: *const MessageParser, offset: usize, out_buf: []u8) Error![]const u8 {
+        if (self.buffer.len < 12) return error.PacketTooShort;
         if (offset >= self.buffer.len) return error.InvalidOffset;
         return formatDnsNameInMessage(self.buffer, offset, out_buf);
     }
@@ -715,7 +763,7 @@ test "MessageParser findOptRecord scans without consuming parser state" {
 
     packet[pos] = 0;
     pos += 1;
-    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos..][0..2], @backingInt(Type.OPT), .big);
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
     mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
     mem.writeInt(u16, packet[pos + 8 ..][0..2], 11, .big);
@@ -745,7 +793,7 @@ test "MessageParser findEdns returns OPT and ECS in one scan" {
     var pos: usize = 12;
     packet[pos] = 0;
     pos += 1;
-    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos..][0..2], @backingInt(Type.OPT), .big);
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
     mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
     mem.writeInt(u16, packet[pos + 8 ..][0..2], 11, .big);
@@ -780,7 +828,7 @@ test "MessageParser findEdns returns OPT, ECS and Cookie in one scan" {
     var pos: usize = 12;
     packet[pos] = 0; // 根 owner
     pos += 1;
-    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos..][0..2], @backingInt(Type.OPT), .big);
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
     mem.writeInt(u32, packet[pos + 4 ..][0..4], 0x00008000, .big); // DO=1
     mem.writeInt(u16, packet[pos + 8 ..][0..2], @intCast(rdata.len), .big);
@@ -805,7 +853,7 @@ test "MessageParser findECS extracts ECS from OPT record" {
     var pos: usize = 12;
     packet[pos] = 0;
     pos += 1;
-    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos..][0..2], @backingInt(Type.OPT), .big);
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
     mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
     mem.writeInt(u16, packet[pos + 8 ..][0..2], 11, .big);
@@ -838,7 +886,7 @@ test "MessageParser findEdns rejects OPT with non-root owner name (RFC 6891)" {
     packet[pos + 1] = 'a';
     packet[pos + 2] = 0;
     pos += 3;
-    mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+    mem.writeInt(u16, packet[pos..][0..2], @backingInt(Type.OPT), .big);
     mem.writeInt(u16, packet[pos + 2 ..][0..2], 1232, .big);
     mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
     mem.writeInt(u16, packet[pos + 8 ..][0..2], 0, .big);
@@ -949,4 +997,33 @@ test "MessageParser skipName rejects dangling compression pointer" {
     packet[16] = 0xC0; // 悬挂指针：缺少第二字节
     var parser = MessageParser.init(&packet);
     try std.testing.expectError(error.PacketTooShort, parser.nextQuestion());
+}
+
+test "MessageParser nameEqualsAt rejects cross-label dot spoofing and supports escaped dots" {
+    // 线格式单标签 \x0bexample.com\x00 是 1 个标签 "example\.com"，绝不等于双标签 "example.com"
+    var pkt: [32]u8 = @splat(0);
+    pkt[12] = 11;
+    @memcpy(pkt[13..24], "example.com");
+    pkt[24] = 0;
+
+    const parser = MessageParser.init(pkt[0..25]);
+    try std.testing.expect(!(try parser.nameEqualsAt(12, "example.com")));
+    try std.testing.expect(try parser.nameEqualsAt(12, "example\\.com"));
+    try std.testing.expect(try parser.nameEqualsAt(12, "EXAMPLE\\.COM."));
+
+    // 双标签 \x03a.b\x03com\x00 同样不得匹配三标签 "a.b.com"
+    var pkt2: [32]u8 = @splat(0);
+    @memcpy(pkt2[12..21], "\x03a.b\x03com\x00");
+    const parser2 = MessageParser.init(pkt2[0..21]);
+    try std.testing.expect(!(try parser2.nameEqualsAt(12, "a.b.com")));
+    try std.testing.expect(try parser2.nameEqualsAt(12, "a\\.b.com"));
+}
+
+test "MessageParser rejects buffers shorter than 12-byte header" {
+    var short = MessageParser.init("12345");
+    try std.testing.expectError(error.PacketTooShort, short.nextQuestion());
+    try std.testing.expectError(error.PacketTooShort, short.nextRR());
+    var out: [64]u8 = undefined;
+    try std.testing.expectError(error.PacketTooShort, short.formatNameAt(0, &out));
+    try std.testing.expectError(error.PacketTooShort, short.nameEqualsAt(0, "a"));
 }

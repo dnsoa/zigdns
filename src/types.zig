@@ -83,8 +83,8 @@ pub const CookieData = struct {
 
 test "Opcode/Rcode tolerate reserved/unknown values" {
     // 非穷举枚举：不可信输入里的保留值不得触发非法行为/panic
-    const oc: Opcode = @enumFromInt(3);
-    const rc: Rcode = @enumFromInt(15);
-    try std.testing.expectEqual(@as(u4, 3), @intFromEnum(oc));
-    try std.testing.expectEqual(@as(u4, 15), @intFromEnum(rc));
+    const oc: Opcode = @fromBackingInt(@intCast(3));
+    const rc: Rcode = @fromBackingInt(@intCast(15));
+    try std.testing.expectEqual(@as(u4, 3), @backingInt(oc));
+    try std.testing.expectEqual(@as(u4, 15), @backingInt(rc));
 }

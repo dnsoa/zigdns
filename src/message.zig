@@ -11,6 +11,7 @@ const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
 const validateSvcParams = @import("rdata.zig").validateSvcParams;
 const parseOptOptions = @import("rdata.zig").parseOptOptions;
+const decodePresentationName = @import("name.zig").decodePresentationName;
 
 /// 压缩表槽位数。NSEC 链、大量胶水记录、ANY 应答很容易写出几十个不同后缀；
 /// 表一满后续名字只能整名展开，报文变大 -> TC -> 退回 TCP。
@@ -36,6 +37,9 @@ pub const Edns = struct {
     /// CLASS 字段承载 UDP 载荷大小；TTL 承载 扩展 RCODE 高 8 位 / 版本 / flags。
     /// RDATA 中若含 ECS / COOKIE 选项则一并解出（RFC 7871 / 7873）。
     pub fn fromOpt(rr: ResourceRecord) !Edns {
+        if (rr.rtype != .OPT) return Error.InvalidType;
+        // RFC 6891 §6.1.2: OPT 的 owner name 必须为未压缩单字节根（0x00，线格式长度恰为 1）。
+        if (rr.name_end_pos -| rr.name_pos != 1) return Error.MalformedName;
         const options = try parseOptOptions(rr.rdata);
         return .{
             .udp_payload_size = rr.class,
@@ -76,6 +80,9 @@ pub const Message = struct {
     pub fn parseTcpFrame(raw: []const u8) !TcpFrame {
         if (raw.len < 2) return error.PacketTooShort;
         const msg_len = mem.readInt(u16, raw[0..2], .big);
+        // DNS 报文头固定 12 字节；声明长度 <12 的 TCP 帧永远不可能合法，
+        // 返回专用 MalformedHeader 以便与「半包未收齐」(PacketTooShort) 区分，防止流水线死等。
+        if (msg_len < 12) return error.MalformedHeader;
         const frame_len = 2 + @as(usize, msg_len);
         if (raw.len < frame_len) return error.PacketTooShort;
         return .{ .message = try Message.parse(raw[2..frame_len]), .frame_len = frame_len };
@@ -83,12 +90,24 @@ pub const Message = struct {
 
     /// 高性能响应构造器
     pub const Builder = struct {
+        const BUCKET_COUNT = 64;
+        const BUCKET_MASK: u8 = BUCKET_COUNT - 1;
+        const BUCKET_THRESHOLD: u8 = 16; // <16 项走 L1 顺序扫描（免掉 init 清零开销），≥16 项惰性建桶转 O(1)
+        const EMPTY_BUCKET: u8 = 0xFF;
+        const CompressionEntry = struct {
+            hash: u64,
+            pos: u16,
+            prev: u8,
+            bucket: u8,
+        };
+
         buf: []u8, // DNS 报文区域（TCP 时为 dest[2..]）
         dest: []u8, // 完整目标缓冲区（含可能的 2 字节 TCP 长度前缀）
         prefix_len: usize, // DNS 报文前保留字节数：0=UDP, 2=TCP
         pos: usize,
-        // 压缩指针表：域名哈希 -> 位置
-        compression_table: [MAX_COMPRESSION]struct { hash: u64, pos: u16 },
+        // 压缩指针表：小报文零初始化顺序扫描，多名字大报文自动切换 64 桶 O(1) 索引
+        compression_table: [MAX_COMPRESSION]CompressionEntry,
+        compression_buckets: [BUCKET_COUNT]u8,
         compression_count: u8,
         section: Section, // 当前分区，用于自动计数
         opt_added: bool, // RFC 6891 §6.1.1: 一个报文至多一个 OPT 记录
@@ -118,6 +137,7 @@ pub const Message = struct {
                 .prefix_len = prefix_len,
                 .pos = 12, // 跳过 header 空间（相对 DNS 报文起始）
                 .compression_table = undefined,
+                .compression_buckets = undefined,
                 .compression_count = 0,
                 .section = .answer, // RR 默认写入回答区
                 .opt_added = false,
@@ -140,10 +160,17 @@ pub const Message = struct {
         }
 
         /// 回滚到快照（用于 add* 失败时保持原子性，使截断可安全恢复）。
-        /// 包含 section，使 addOptRecord 等先切分区再写入的方法失败后完全原子。
+        /// 包含 section 与桶链逆序摘除，使失败后状态完全复原。
         fn restore(self: *Builder, s: Snapshot) void {
-            self.pos = s.pos;
+            if (self.compression_count > BUCKET_THRESHOLD) {
+                while (self.compression_count > s.compression_count and self.compression_count > BUCKET_THRESHOLD) {
+                    self.compression_count -= 1;
+                    const entry = self.compression_table[self.compression_count];
+                    self.compression_buckets[entry.bucket] = entry.prev;
+                }
+            }
             self.compression_count = s.compression_count;
+            self.pos = s.pos;
             self.section = s.section;
             self.opt_added = s.opt_added;
         }
@@ -151,15 +178,14 @@ pub const Message = struct {
         /// 切换当前分区（后续 RR 计入 authority/additional）。分区只能向后推进；
         /// 回退返回 error.InvalidRecordOrder（调用方误用，不做 UB）。
         pub fn setSection(self: *Builder, s: Section) !void {
-            if (@intFromEnum(s) < @intFromEnum(self.section)) return Error.InvalidRecordOrder;
+            if (@backingInt(s) < @backingInt(self.section)) return Error.InvalidRecordOrder;
             self.section = s;
         }
 
-        /// 校验 buf[pos..] 处已写入的线格式域名是否等于 canonical 点分名。
-        /// 用于压缩指针复用前的字节级确认，防止 64 位 hash 碰撞导致指向错误域名。
-        /// 表中的名字本身可能以压缩指针结尾（前缀标签 + 指向更早后缀的指针），
-        /// 故此处需跟随指针。Builder 只会写出「指向更小偏移」的指针，据此天然防环。
-        fn nameMatchesAt(self: *const Builder, pos: u16, canonical: []const u8) bool {
+        /// 校验 buf[pos..] 处已写入的线格式域名是否等于未转义点分名 canonical。
+        /// 用于压缩指针复用前的字节级确认（防 64 位 hash 碰撞，保持 0x20 大小写严格一致，
+        /// 并禁止含 '.' 的单标签与多标签点分名误匹配）。
+        fn nameMatchesPlainAt(self: *const Builder, pos: u16, canonical: []const u8) bool {
             var read: usize = pos;
             var exp: usize = 0;
             var first = true;
@@ -173,15 +199,16 @@ pub const Message = struct {
                     read = target;
                     continue;
                 }
-                if (len > 63) return false;
-                if (read + 1 + len > self.pos) return false;
+                if (len > 63 or read + 1 + len > self.pos) return false;
                 if (!first) {
                     if (exp >= canonical.len or canonical[exp] != '.') return false;
                     exp += 1;
                 }
                 first = false;
                 if (exp + len > canonical.len) return false;
-                if (!mem.eql(u8, self.buf[read + 1 .. read + 1 + len], canonical[exp .. exp + len])) return false;
+                const cand = canonical[exp .. exp + len];
+                if (mem.indexOfScalar(u8, cand, '.') != null) return false;
+                if (!mem.eql(u8, self.buf[read + 1 .. read + 1 + len], cand)) return false;
                 exp += len;
                 read += 1 + len;
             }
@@ -201,44 +228,8 @@ pub const Message = struct {
             if (need > self.buf.len -| self.pos) return Error.BufferTooSmall;
         }
 
-        fn canonicalizeName(name: []const u8) []const u8 {
-            if (name.len > 1 and name[name.len - 1] == '.') {
-                return name[0 .. name.len - 1];
-            }
-            return name;
-        }
-
-        fn validateName(name: []const u8) ![]const u8 {
-            const canonical = canonicalizeName(name);
-            var total_len: usize = 1; // root terminator
-            var label_len: usize = 0;
-
-            for (canonical) |byte| {
-                if (byte == '.') {
-                    if (label_len == 0) return Error.MalformedName;
-                    if (label_len > 63) return Error.LabelTooLong;
-                    total_len += 1 + label_len;
-                    if (total_len > MAX_NAME_LENGTH) return Error.NameTooLong;
-                    label_len = 0;
-                } else {
-                    label_len += 1;
-                }
-            }
-
-            if (label_len == 0) return Error.MalformedName;
-            if (label_len > 63) return Error.LabelTooLong;
-            total_len += 1 + label_len;
-            if (total_len > MAX_NAME_LENGTH) return Error.NameTooLong;
-
-            return canonical;
-        }
-
-        fn analyzeName(name: []const u8) !struct { canonical: []const u8, hash: u64 } {
-            const canonical = try validateName(name);
-            return .{
-                .canonical = canonical,
-                .hash = std.hash.Wyhash.hash(0, canonical),
-            };
+        fn validateOptRdata(rdata: []const u8) Error!void {
+            _ = parseOptOptions(rdata) catch |err| return if (err == error.PacketTooShort) Error.InvalidRData else err;
         }
 
         /// 写入 A 记录
@@ -246,7 +237,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.A));
+            try self.writeU16(@backingInt(Type.A));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             try self.writeU16(4); // RDLength
@@ -261,7 +252,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.AAAA));
+            try self.writeU16(@backingInt(Type.AAAA));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             try self.writeU16(16); // RDLength
@@ -276,7 +267,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.CNAME));
+            try self.writeU16(@backingInt(Type.CNAME));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -292,7 +283,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.MX));
+            try self.writeU16(@backingInt(Type.MX));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -309,7 +300,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.NS));
+            try self.writeU16(@backingInt(Type.NS));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -325,7 +316,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.PTR));
+            try self.writeU16(@backingInt(Type.PTR));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -352,7 +343,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.TXT));
+            try self.writeU16(@backingInt(Type.TXT));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -378,7 +369,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.TXT));
+            try self.writeU16(@backingInt(Type.TXT));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -410,7 +401,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.SOA));
+            try self.writeU16(@backingInt(Type.SOA));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -440,7 +431,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.SRV));
+            try self.writeU16(@backingInt(Type.SRV));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -464,8 +455,11 @@ pub const Message = struct {
             if (rdata.len > 0xFFFF) return Error.MessageTooLong;
             const snap = self.snapshot();
             errdefer self.restore(snap);
-            if (rtype == @intFromEnum(Type.OPT)) {
+            if (rtype == @backingInt(Type.OPT)) {
                 if (self.opt_added) return Error.MultipleOptRecords;
+                if (self.section != .additional) return Error.InvalidRecordOrder;
+                if (name.len != 0 and !mem.eql(u8, name, ".")) return Error.MalformedName;
+                try validateOptRdata(rdata);
                 self.opt_added = true;
             }
             try self.writeName(name);
@@ -479,14 +473,17 @@ pub const Message = struct {
             self.countRecord();
         }
 
-        /// 写入 CAA 记录（RFC 8659）。tag 须为 1..255 字节，value 原样写入。
+        /// 写入 CAA 记录（RFC 8659）。tag 须为 1..255 字节的 ASCII 字母数字，value 原样写入。
         pub fn addCAARecord(self: *Builder, name: []const u8, ttl: u32, flags: u8, tag: []const u8, value: []const u8) !void {
             if (tag.len == 0) return Error.InvalidRData;
             if (tag.len > 255) return Error.LabelTooLong;
+            for (tag) |c| {
+                if (!std.ascii.isAlphanumeric(c)) return Error.InvalidRData;
+            }
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.CAA));
+            try self.writeU16(@backingInt(Type.CAA));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen = 2 + tag.len + value.len;
@@ -517,7 +514,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(rtype));
+            try self.writeU16(@backingInt(rtype));
             try self.writeU16(1); // Class IN
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -570,7 +567,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.DNSKEY));
+            try self.writeU16(@backingInt(Type.DNSKEY));
             try self.writeU16(1);
             try self.writeU32(ttl);
             const rdlen = 4 + public_key.len;
@@ -590,7 +587,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.DS));
+            try self.writeU16(@backingInt(Type.DS));
             try self.writeU16(1);
             try self.writeU32(ttl);
             const rdlen = 4 + digest.len;
@@ -622,7 +619,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.RRSIG));
+            try self.writeU16(@backingInt(Type.RRSIG));
             try self.writeU16(1);
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -643,12 +640,13 @@ pub const Message = struct {
             self.countRecord();
         }
 
-        /// 写入 NSEC 记录（RFC 4034）。next_domain 不压缩；types 须升序去重。
+        /// 写入 NSEC 记录（RFC 4034）。next_domain 不压缩；types 非空且须升序去重。
         pub fn addNSECRecord(self: *Builder, name: []const u8, ttl: u32, next_domain: []const u8, types: []const u16) !void {
+            if (types.len == 0) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.NSEC));
+            try self.writeU16(@backingInt(Type.NSEC));
             try self.writeU16(1);
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -666,7 +664,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.NSEC3PARAM));
+            try self.writeU16(@backingInt(Type.NSEC3PARAM));
             try self.writeU16(1);
             try self.writeU32(ttl);
             try self.writeU16(@intCast(5 + salt.len));
@@ -697,7 +695,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(name);
-            try self.writeU16(@intFromEnum(Type.NSEC3));
+            try self.writeU16(@backingInt(Type.NSEC3));
             try self.writeU16(1);
             try self.writeU32(ttl);
             const rdlen_pos = self.pos;
@@ -725,7 +723,7 @@ pub const Message = struct {
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(qname);
-            try self.writeU16(@intFromEnum(qtype));
+            try self.writeU16(@backingInt(qtype));
             try self.writeU16(qclass);
             self.qd += 1;
         }
@@ -742,7 +740,7 @@ pub const Message = struct {
             try self.setSection(.additional);
 
             try self.writeU8(0); // OPT 的 owner name 必须为根
-            try self.writeU16(@intFromEnum(Type.OPT));
+            try self.writeU16(@backingInt(Type.OPT));
             try self.writeU16(edns.udp_payload_size); // CLASS = 请求方 UDP 载荷大小
             const flags: u32 = if (edns.dnssec_ok) 0x8000 else 0;
             const ttl = (@as(u32, edns.extended_rcode) << 24) |
@@ -759,17 +757,18 @@ pub const Message = struct {
         }
 
         /// 低级：写入 OPT 记录，options 为调用方自行编码的完整 RDATA。
-        /// 与 `addOptRecord` 共用「至多一个 OPT」的约束（RFC 6891 §6.1.1）。
+        /// 与 `addOptRecord` 共用「至多一个 OPT」及选项 TLV 平铺约束（RFC 6891 §6.1.1/§6.1.2）。
         pub fn addOptRecordRaw(self: *Builder, udp_payload_size: u16, ttl: u32, options: []const u8) !void {
             if (options.len > 0xFFFF) return Error.MessageTooLong;
             const snap = self.snapshot(); // 先快照（含 section），失败可完全回滚
             errdefer self.restore(snap);
             if (self.opt_added) return Error.MultipleOptRecords;
+            try validateOptRdata(options);
             self.opt_added = true;
             try self.setSection(.additional);
 
             try self.writeU8(0);
-            try self.writeU16(@intFromEnum(Type.OPT));
+            try self.writeU16(@backingInt(Type.OPT));
             try self.writeU16(udp_payload_size);
             try self.writeU32(ttl);
             try self.writeU16(@intCast(options.len));
@@ -790,7 +789,7 @@ pub const Message = struct {
             const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
             if (ecs.address.len < addr_len) return Error.MalformedECS;
 
-            try self.writeU16(@intFromEnum(OptionCode.ECS));
+            try self.writeU16(@backingInt(OptionCode.ECS));
             try self.writeU16(@intCast(4 + addr_len)); // OPTION-LENGTH
             try self.writeU16(ecs.family);
             try self.writeU8(ecs.source_prefix);
@@ -809,7 +808,7 @@ pub const Message = struct {
         fn writeCookieOption(self: *Builder, cookie: CookieData) !void {
             if (cookie.server.len != 0 and (cookie.server.len < 8 or cookie.server.len > 32)) return Error.MalformedCookie;
             const opt_len = 8 + cookie.server.len;
-            try self.writeU16(@intFromEnum(OptionCode.COOKIE));
+            try self.writeU16(@backingInt(OptionCode.COOKIE));
             try self.writeU16(@intCast(opt_len)); // OPTION-LENGTH
             try self.ensureCapacity(opt_len);
             @memcpy(self.buf[self.pos..][0..8], &cookie.client);
@@ -818,39 +817,97 @@ pub const Message = struct {
             self.pos += cookie.server.len;
         }
 
-        /// 写入一串点分标签（不含结束符），每个标签带 1 字节长度前缀。
-        /// canonical 必须已通过 validateName（无空标签 / 无首尾点）。
-        fn writeLabels(self: *Builder, canonical: []const u8) !void {
-            var it = mem.splitScalar(u8, canonical, '.');
-            while (it.next()) |label| {
-                try self.ensureCapacity(1 + label.len);
-                self.buf[self.pos] = @intCast(label.len);
-                @memcpy(self.buf[self.pos + 1 ..][0..label.len], label);
-                self.pos += 1 + label.len;
+        /// 校验未转义点分名（已去尾点）：单趟检查标签长度 1..63 与总长 ≤255（含根）。
+        fn validatePlainCanonical(canonical: []const u8) Error!void {
+            if (canonical.len == 0) return Error.MalformedName;
+            // 未转义点分名的线格式总长恒等于 canonical.len + 2（首长度字节 + 点转长度字节 + 根 0）。
+            var label_len: usize = 0;
+            for (canonical) |b| {
+                if (b == '.') {
+                    if (label_len == 0) return Error.MalformedName;
+                    if (label_len > 63) return Error.LabelTooLong;
+                    label_len = 0;
+                } else {
+                    label_len += 1;
+                }
+            }
+            if (label_len == 0) return Error.MalformedName;
+            if (label_len > 63) return Error.LabelTooLong;
+            if (canonical.len + 2 > MAX_NAME_LENGTH) return Error.NameTooLong;
+        }
+
+        /// 将已通过 validatePlainCanonical 的点分标签段直接原地写入 self.buf（调用方已 ensureCapacity）。
+        /// 写入字节数恰为 `1 + segment.len`。
+        fn writePlainLabelsUnchecked(self: *Builder, segment: []const u8) void {
+            var out = self.pos;
+            var len_slot = out;
+            out += 1;
+            var llen: u8 = 0;
+            for (segment) |b| {
+                if (b == '.') {
+                    self.buf[len_slot] = llen;
+                    len_slot = out;
+                    out += 1;
+                    llen = 0;
+                } else {
+                    self.buf[out] = b;
+                    out += 1;
+                    llen += 1;
+                }
+            }
+            self.buf[len_slot] = llen;
+            self.pos = out;
+        }
+
+        fn insertCompressionEntry(self: *Builder, h: u64, pos: usize) void {
+            if (self.compression_count >= MAX_COMPRESSION or pos > MAX_POINTER_OFFSET) return;
+            const bucket: u8 = @as(u8, @truncate(h)) & BUCKET_MASK;
+            const idx = self.compression_count;
+            if (idx == BUCKET_THRESHOLD) {
+                self.compression_buckets = @splat(EMPTY_BUCKET);
+                for (0..BUCKET_THRESHOLD) |j| {
+                    const b = self.compression_table[j].bucket;
+                    self.compression_table[j].prev = self.compression_buckets[b];
+                    self.compression_buckets[b] = @intCast(j);
+                }
+            }
+            const prev = if (idx >= BUCKET_THRESHOLD) self.compression_buckets[bucket] else EMPTY_BUCKET;
+            self.compression_table[idx] = .{
+                .hash = h,
+                .pos = @intCast(pos),
+                .prev = prev,
+                .bucket = bucket,
+            };
+            if (idx >= BUCKET_THRESHOLD) {
+                self.compression_buckets[bucket] = idx;
+            }
+            self.compression_count = idx + 1;
+        }
+
+        /// 把 canonical 在 `start` 处新写出的后缀（偏移 < `limit`）登记到压缩表，复用查找阶段已算好的哈希。
+        fn registerPlainSuffixes(
+            self: *Builder,
+            canonical: []const u8,
+            cached_hashes: ?*const [16]u64,
+            start: usize,
+            limit: usize,
+        ) void {
+            var s: usize = 0;
+            var k: usize = 0;
+            while (s < limit) : (k += 1) {
+                const pos = start + s;
+                if (pos > MAX_POINTER_OFFSET or self.compression_count >= MAX_COMPRESSION) return;
+                const h = if (cached_hashes != null and k < 16)
+                    cached_hashes.?[k]
+                else
+                    std.hash.Wyhash.hash(0, canonical[s..]);
+                self.insertCompressionEntry(h, pos);
+                const next_dot = mem.indexOfScalar(u8, canonical[s..], '.') orelse return;
+                s += next_dot + 1;
             }
         }
 
-        /// 把 canonical 在 `start` 处新写出的各后缀登记到压缩表，供后续名字复用。
-        /// 只登记 canonical 内偏移 < `limit` 的后缀边界：整名展开时 limit = 名字长度
-        /// （全部后缀）；压缩写出时 limit 为新写出的前缀长度——后缀部分是指针，其目标
-        /// 早已在表内。超出 14 位指针寻址范围的偏移不占槽位（永远不可能被指向）。
-        fn registerSuffixes(self: *Builder, canonical: []const u8, start: usize, limit: usize) void {
-            var label_it = mem.splitScalar(u8, canonical, '.');
-            var suffix_offset: usize = 0;
-            while (label_it.next()) |label| : (suffix_offset += label.len + 1) {
-                if (suffix_offset >= limit) return;
-                if (self.compression_count >= MAX_COMPRESSION) return;
-                const pos = start + suffix_offset;
-                if (pos > MAX_POINTER_OFFSET) return; // 后续后缀偏移只会更大
-                self.compression_table[self.compression_count] = .{
-                    .hash = std.hash.Wyhash.hash(0, canonical[suffix_offset..]),
-                    .pos = @intCast(pos),
-                };
-                self.compression_count += 1;
-            }
-        }
-
-        /// 写入域名，支持压缩指针（含共享后缀压缩）。
+        /// 写入域名，支持压缩指针（含共享后缀压缩与 RFC 1035 §5.1 转义解码）。
         fn writeName(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
                 try self.ensureCapacity(1);
@@ -859,46 +916,75 @@ pub const Message = struct {
                 return;
             }
 
-            const analyzed = try analyzeName(name);
-            const canonical = analyzed.canonical;
-            const start = self.pos;
-
-            // 从最长后缀（整名）开始逐段缩短，寻找压缩表中已写入的可复用后缀。
-            // 命中后写「前缀标签 + 指向该后缀的指针」；hash 命中须字节级确认防碰撞。
-            if (self.compression_count > 0) {
-                var s: usize = 0;
-                while (true) {
-                    const suffix = canonical[s..];
-                    const suffix_hash = if (s == 0) analyzed.hash else std.hash.Wyhash.hash(0, suffix);
-                    for (self.compression_table[0..self.compression_count]) |entry| {
-                        if (entry.hash == suffix_hash and self.nameMatchesAt(entry.pos, suffix)) {
-                            if (s > 0) try self.writeLabels(canonical[0 .. s - 1]); // 后缀前的前缀标签（去掉分隔点）
-                            try self.ensureCapacity(2);
-                            self.buf[self.pos] = 0xC0 | @as(u8, @intCast(entry.pos >> 8));
-                            self.buf[self.pos + 1] = @as(u8, @intCast(entry.pos & 0xFF));
-                            self.pos += 2;
-                            // 新写出的前缀（如 www.example.com 里的 www）本身也是合法指针
-                            // 目标——其编码是「前缀标签 + 指针」，展开后仍等于整名。
-                            // 不登记的话，后续 foo.www.example.com 只能退回指向 example.com。
-                            // 前缀标签的编码长度恰为 s（每个点变成一个长度字节，另加首字节）。
-                            self.registerSuffixes(canonical, start, s);
-                            return;
-                        }
-                    }
-                    const next_dot = mem.indexOfScalar(u8, canonical[s..], '.') orelse break;
-                    s += next_dot + 1;
-                }
+            // 慢路径：含反斜杠转义（RFC 1035 §5.1 `\.` / `\\` / `\DDD`）
+            if (mem.indexOfScalar(u8, name, '\\') != null) {
+                return self.writeNameRaw(name);
             }
 
-            // 无可复用后缀：写完整域名并把其各后缀记入压缩表。
-            try self.writeLabels(canonical);
-            try self.ensureCapacity(1);
+            // 快路径（无转义，零栈缓冲拷贝）：直接在原切片上校验、查找、单次 ensureCapacity 写出。
+            const canonical = if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+            try validatePlainCanonical(canonical);
+            const start = self.pos;
+
+            if (self.compression_count > 0) {
+                var suffix_hashes: [16]u64 = undefined;
+                var s: usize = 0;
+                var k: usize = 0;
+                while (true) : (k += 1) {
+                    const suffix = canonical[s..];
+                    const suffix_hash = std.hash.Wyhash.hash(0, suffix);
+                    if (k < 16) suffix_hashes[k] = suffix_hash;
+
+                    var matched_pos: ?u16 = null;
+                    if (self.compression_count <= BUCKET_THRESHOLD) {
+                        for (self.compression_table[0..self.compression_count]) |entry| {
+                            if (entry.hash == suffix_hash and self.nameMatchesPlainAt(entry.pos, suffix)) {
+                                matched_pos = entry.pos;
+                                break;
+                            }
+                        }
+                    } else {
+                        const bucket: u8 = @as(u8, @truncate(suffix_hash)) & BUCKET_MASK;
+                        var idx = self.compression_buckets[bucket];
+                        while (idx != EMPTY_BUCKET) : (idx = self.compression_table[idx].prev) {
+                            const entry = self.compression_table[idx];
+                            if (entry.hash == suffix_hash and self.nameMatchesPlainAt(entry.pos, suffix)) {
+                                matched_pos = entry.pos;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (matched_pos) |target_pos| {
+                        try self.ensureCapacity(s + 2);
+                        if (s > 0) self.writePlainLabelsUnchecked(canonical[0 .. s - 1]);
+                        self.buf[self.pos] = 0xC0 | @as(u8, @intCast(target_pos >> 8));
+                        self.buf[self.pos + 1] = @as(u8, @intCast(target_pos & 0xFF));
+                        self.pos += 2;
+                        self.registerPlainSuffixes(canonical, &suffix_hashes, start, s);
+                        return;
+                    }
+
+                    const next_dot = mem.indexOfScalar(u8, suffix, '.') orelse break;
+                    s += next_dot + 1;
+                }
+
+                try self.ensureCapacity(canonical.len + 2);
+                self.writePlainLabelsUnchecked(canonical);
+                self.buf[self.pos] = 0;
+                self.pos += 1;
+                self.registerPlainSuffixes(canonical, &suffix_hashes, start, canonical.len);
+                return;
+            }
+
+            try self.ensureCapacity(canonical.len + 2);
+            self.writePlainLabelsUnchecked(canonical);
             self.buf[self.pos] = 0;
             self.pos += 1;
-            self.registerSuffixes(canonical, start, canonical.len);
+            self.registerPlainSuffixes(canonical, null, start, canonical.len);
         }
 
-        /// 写入完整展开、不压缩的域名（用于 RFC 2782 规定不得压缩的 SRV target）。
+        /// 写入完整展开、不压缩的域名（用于 RFC 2782 / 4034 / 9460 规定不得压缩的域名字段，及转义域名）。
         fn writeNameRaw(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
                 try self.ensureCapacity(1);
@@ -906,12 +992,21 @@ pub const Message = struct {
                 self.pos += 1;
                 return;
             }
-
-            const canonical = try validateName(name);
-            try self.writeLabels(canonical);
-            try self.ensureCapacity(1);
-            self.buf[self.pos] = 0;
-            self.pos += 1;
+            if (mem.indexOfScalar(u8, name, '\\') == null) {
+                const canonical = if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
+                try validatePlainCanonical(canonical);
+                try self.ensureCapacity(canonical.len + 2);
+                self.writePlainLabelsUnchecked(canonical);
+                self.buf[self.pos] = 0;
+                self.pos += 1;
+                return;
+            }
+            var wire: [MAX_NAME_LENGTH]u8 = undefined;
+            var offsets: [128]u8 = undefined;
+            const decoded = try decodePresentationName(name, &wire, &offsets);
+            try self.ensureCapacity(decoded.wire_len);
+            @memcpy(self.buf[self.pos..][0..decoded.wire_len], wire[0..decoded.wire_len]);
+            self.pos += decoded.wire_len;
         }
 
         fn writeU8(self: *Builder, val: u8) !void {
@@ -1344,7 +1439,7 @@ test "Message.Builder addRecordRaw writes unknown type verbatim (RFC 3597)" {
     var parser = MessageParser.init(packet);
     var rrs = parser.resourceRecords(1);
     const rr = (try rrs.next()).?;
-    try std.testing.expectEqual(@as(u16, 257), @intFromEnum(rr.rtype));
+    try std.testing.expectEqual(@as(u16, 257), @backingInt(rr.rtype));
     try std.testing.expectEqual(@as(u16, 1), rr.class);
     try std.testing.expectEqual(@as(u32, 3600), rr.ttl);
     try std.testing.expectEqualSlices(u8, &caa_rdata, rr.rdata);
@@ -1364,7 +1459,7 @@ test "Message.Builder addRecordRaw supports non-IN class (CH)" {
     var rrs = parser.resourceRecords(1);
     const rr = (try rrs.next()).?;
     try std.testing.expectEqual(@as(u16, 3), rr.class); // CH
-    try std.testing.expectEqual(@as(u16, 16), @intFromEnum(rr.rtype));
+    try std.testing.expectEqual(@as(u16, 16), @backingInt(rr.rtype));
 }
 
 test "Message.Builder addCAARecord round-trips (RFC 8659)" {
@@ -1377,7 +1472,7 @@ test "Message.Builder addCAARecord round-trips (RFC 8659)" {
     var parser = MessageParser.init(packet);
     var rrs = parser.resourceRecords(1);
     const rr = (try rrs.next()).?;
-    try std.testing.expectEqual(@as(u16, 257), @intFromEnum(rr.rtype));
+    try std.testing.expectEqual(@as(u16, 257), @backingInt(rr.rtype));
     const rd = try parser.parseRData(rr);
     try std.testing.expectEqual(@as(u8, 0), rd.CAA.flags);
     try std.testing.expectEqualStrings("issue", rd.CAA.tag);
@@ -1415,7 +1510,7 @@ test "Message.Builder addHTTPSRecord round-trips with uncompressed target (RFC 9
     try parser.skipResourceRecords(1); // 跳过 A
     var rrs = parser.resourceRecords(1);
     const rr = (try rrs.next()).?;
-    try std.testing.expectEqual(@as(u16, 65), @intFromEnum(rr.rtype));
+    try std.testing.expectEqual(@as(u16, 65), @backingInt(rr.rtype));
     const rd = try parser.parseRData(rr);
     try std.testing.expectEqual(@as(u16, 1), rd.HTTPS.priority);
     var nbuf: [256]u8 = undefined;
@@ -1437,7 +1532,7 @@ test "Message.Builder addDNSKEYRecord round-trips and links via keyTag" {
     var parser = MessageParser.init(packet);
     var rrs = parser.resourceRecords(1);
     const rr = (try rrs.next()).?;
-    try std.testing.expectEqual(@as(u16, 48), @intFromEnum(rr.rtype));
+    try std.testing.expectEqual(@as(u16, 48), @backingInt(rr.rtype));
     const rd = try parser.parseRData(rr);
     try std.testing.expectEqual(@as(u16, 257), rd.DNSKEY.flags);
     try std.testing.expectEqualStrings("ABCD", rd.DNSKEY.public_key);
@@ -1882,7 +1977,7 @@ test "MessageParser findEdns rejects multiple OPT records (RFC 6891)" {
     inline for (.{ 1232, 4096 }) |udp_size| {
         packet[pos] = 0; // 根 owner
         pos += 1;
-        mem.writeInt(u16, packet[pos..][0..2], @intFromEnum(Type.OPT), .big);
+        mem.writeInt(u16, packet[pos..][0..2], @backingInt(Type.OPT), .big);
         mem.writeInt(u16, packet[pos + 2 ..][0..2], udp_size, .big);
         mem.writeInt(u32, packet[pos + 4 ..][0..4], 0, .big);
         mem.writeInt(u16, packet[pos + 8 ..][0..2], 0, .big); // RDLENGTH=0
@@ -1926,16 +2021,16 @@ test "Message.Builder addRecordRaw cannot smuggle in a second OPT" {
 
     const snap_pos = builder.pos;
     const snap_ar = builder.ar;
-    try std.testing.expectError(error.MultipleOptRecords, builder.addRecordRaw("", @intFromEnum(Type.OPT), 4096, 0, &[_]u8{}));
+    try std.testing.expectError(error.MultipleOptRecords, builder.addRecordRaw("", @backingInt(Type.OPT), 4096, 0, &[_]u8{}));
     try std.testing.expectEqual(snap_pos, builder.pos);
     try std.testing.expectEqual(snap_ar, builder.ar);
 
     // 反向：先用 addRecordRaw 写 OPT，再走 addOptRecord 同样要被挡住。
     var builder2 = try Message.Builder.init(&buf);
     try builder2.setSection(.additional);
-    try builder2.addRecordRaw("", @intFromEnum(Type.OPT), 1232, 0, &[_]u8{});
+    try builder2.addRecordRaw("", @backingInt(Type.OPT), 1232, 0, &[_]u8{});
     try std.testing.expectError(error.MultipleOptRecords, builder2.addOptRecord(.{ .udp_payload_size = 4096 }));
-    try std.testing.expectError(error.MultipleOptRecords, builder2.addRecordRaw("", @intFromEnum(Type.OPT), 4096, 0, &[_]u8{}));
+    try std.testing.expectError(error.MultipleOptRecords, builder2.addRecordRaw("", @backingInt(Type.OPT), 4096, 0, &[_]u8{}));
 
     // 非 OPT 类型不受影响，可以写任意多条。
     try builder2.addRecordRaw("example.com", 99, 1, 60, "\x01\x02");
@@ -2119,4 +2214,116 @@ test "Message.Builder addAAAARecord guards final RDATA copy" {
     var builder = try Message.Builder.init(&buf);
     const ip = @as([16]u8, @splat(0));
     try std.testing.expectError(error.BufferTooSmall, builder.addAAAARecord("example.com", 3600, ip));
+}
+
+test "Message.Builder round-trips escaped presentation names (RFC 1035 5.1)" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    const cases = [_]struct { wire: []const u8, pres: []const u8 }{
+        .{ .wire = "\x01.\x00", .pres = "\\." },
+        .{ .wire = "\x0bexample.com\x00", .pres = "example\\.com" },
+        .{ .wire = "\x01.\x03com\x00", .pres = "\\..com" },
+        .{ .wire = "\x05a\\b\x00\xff\x03com\x00", .pres = "a\\\\b\\000\\255.com" },
+    };
+    for (cases) |c| {
+        var msg_in: [64]u8 = @splat(0);
+        @memcpy(msg_in[12..][0..c.wire.len], c.wire);
+        const p_in = MessageParser.init(msg_in[0 .. 12 + c.wire.len]);
+        var str_buf: [256]u8 = undefined;
+        const formatted = try p_in.formatNameAt(12, &str_buf);
+        try std.testing.expectEqualStrings(c.pres, formatted);
+
+        // 重编码后线格式字节必须与原输入完全一致（无损闭环）
+        var out_pkt: [128]u8 = undefined;
+        var builder = try Message.Builder.init(&out_pkt);
+        try builder.addQuestion(formatted, .A, 1);
+        const pkt = builder.finish(.{ .id = 1 });
+        try std.testing.expectEqualSlices(u8, c.wire, pkt[12 .. 12 + c.wire.len]);
+    }
+}
+
+test "Message.parseTcpFrame distinguishes MalformedHeader (<12B) from PacketTooShort" {
+    // 声明 msg_len=0 或 msg_len=4 (<12) 的帧永远不可能合法 -> MalformedHeader
+    try std.testing.expectError(error.MalformedHeader, Message.parseTcpFrame("\x00\x00"));
+    try std.testing.expectError(error.MalformedHeader, Message.parseTcpFrame("\x00\x04abcd"));
+    // 仅收到 1 字节长度头，或 msg_len>=12 但载荷未收齐 -> PacketTooShort（继续读套接字）
+    try std.testing.expectError(error.PacketTooShort, Message.parseTcpFrame("\x00"));
+    try std.testing.expectError(error.PacketTooShort, Message.parseTcpFrame("\x00\x10abcd"));
+}
+
+test "Edns and Builder enforce strict OPT section, root owner, and TLV validity" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [512]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+
+    // 默认处于 .answer 分区：addRecordRaw 写 OPT 须报 InvalidRecordOrder
+    try std.testing.expectError(error.InvalidRecordOrder, builder.addRecordRaw("", 41, 1232, 0, ""));
+    try builder.setSection(.additional);
+    // 非根 owner 写 OPT 须报 MalformedName
+    try std.testing.expectError(error.MalformedName, builder.addRecordRaw("example.com", 41, 1232, 0, ""));
+    // 畸形 TLV 写 OPT 须报 InvalidRData 且保持原子回滚（opt_added 仍为 false）
+    try std.testing.expectError(error.InvalidRData, builder.addOptRecordRaw(1232, 0, "\xff\xff"));
+    try builder.addOptRecordRaw(1232, 0, "");
+
+    // Edns.fromOpt 拒绝非 OPT 记录与非单字节根 owner 的 OPT 记录
+    const non_opt = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .A,
+        .class = 1,
+        .ttl = 60,
+        .rdlength = 0,
+        .rdata = "",
+        .rdata_offset = 23,
+    };
+    try std.testing.expectError(error.InvalidType, Edns.fromOpt(non_opt));
+
+    const bad_owner_opt = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 15, // 非单字节根（如 "\x01a\x00"）
+        .rtype = .OPT,
+        .class = 1232,
+        .ttl = 0,
+        .rdlength = 0,
+        .rdata = "",
+        .rdata_offset = 25,
+    };
+    try std.testing.expectError(error.MalformedName, Edns.fromOpt(bad_owner_opt));
+
+    // NSEC 构造拒绝空位图；CAA 构造拒绝非字母数字 tag
+    var b2 = try Message.Builder.init(&buf);
+    try std.testing.expectError(error.InvalidRData, b2.addNSECRecord("example.com", 60, "a.example.com", &.{}));
+    try std.testing.expectError(error.InvalidRData, b2.addCAARecord("example.com", 60, 0, "issue;", "ca.example.net"));
+    _ = MessageParser;
+}
+
+test "Message.Builder restores bucket index cleanly after failed add above threshold" {
+    const MessageParser = @import("parser.zig").MessageParser;
+    var buf: [420]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+
+    // 写入 10 个不同二级域（>16 个后缀槽，触发 64 桶索引构建）
+    var nbuf: [64]u8 = undefined;
+    for (0..10) |i| {
+        const name = try std.fmt.bufPrint(&nbuf, "h{d}.z{d}.example", .{ i, i });
+        try builder.addARecord(name, 60, .{ 10, 0, 0, @intCast(i) });
+    }
+    try std.testing.expect(builder.compression_count > Message.Builder.BUCKET_THRESHOLD);
+
+    // 构造一条新名字 + 超长 TXT 令其在已写入部分前缀并入桶后触发 BufferTooSmall 回滚
+    var big_txt: [200]u8 = @splat('x');
+    const snap_pos = builder.pos;
+    const snap_count = builder.compression_count;
+    try std.testing.expectError(error.BufferTooSmall, builder.addTXTRecord("rollback.newzone.example", 60, &big_txt));
+    try std.testing.expectEqual(snap_pos, builder.pos);
+    try std.testing.expectEqual(snap_count, builder.compression_count);
+
+    // 回滚后桶索引不得残留悬垂槽位，继续压缩已有名字仍须正常命中并可解析
+    const reuse_pos = builder.pos;
+    try builder.addARecord("h9.z9.example", 60, .{ 10, 0, 1, 9 });
+    try std.testing.expectEqual(@as(usize, 2 + 14), builder.pos - reuse_pos);
+
+    const pkt = builder.finish(.{ .id = 1, .qr = 1 });
+    const parser = MessageParser.init(pkt);
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("h9.z9.example", try parser.formatNameAt(reuse_pos, &out));
 }

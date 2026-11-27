@@ -8,8 +8,10 @@
 const std = @import("std");
 const Smith = std.testing.Smith;
 const Message = @import("message.zig").Message;
+const Edns = @import("message.zig").Edns;
 const MessageParser = @import("parser.zig").MessageParser;
 const NameIterator = @import("name.zig").NameIterator;
+const formatDnsName = @import("name.zig").formatDnsName;
 const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
 
@@ -29,7 +31,16 @@ fn walk(input: []const u8) void {
     while (qi.next() catch return) |_| {}
 
     const total = @as(u32, msg.header.ancount) + msg.header.nscount + msg.header.arcount;
-    var nbuf: [256]u8 = undefined;
+    // 严格 EDNS 入口也一并走过（在跳过回答与权威区后扫描附加区）
+    {
+        var edns_parser = parser;
+        if (edns_parser.skipResourceRecords(msg.header.ancount +| msg.header.nscount)) |_| {
+            if (edns_parser.findEdns(msg.header.arcount) catch null) |edns| {
+                _ = Edns.fromOpt(edns.opt) catch {};
+            }
+        } else |_| {}
+    }
+    var nbuf: [1024]u8 = undefined;
     var i: u32 = 0;
     while (i < total) : (i += 1) {
         const rr = (parser.nextRR() catch return) orelse break;
@@ -153,6 +164,30 @@ test "fuzz parseCookie" {
         fn one(_: void, s: *Smith) anyerror!void {
             var buf: [512]u8 = undefined;
             _ = parseCookie(draw(s, &buf, 0xF6)) catch {};
+        }
+    };
+    try std.testing.fuzz({}, F.one, .{});
+}
+
+test "fuzz name presentation round-trip (formatDnsName -> Builder -> nameEqualsAt)" {
+    const F = struct {
+        fn one(_: void, s: *Smith) anyerror!void {
+            var buf: [512]u8 = undefined;
+            const input = draw(s, &buf, 0x77);
+            var pres_buf: [1024]u8 = undefined;
+            const pres = formatDnsName(input, 0, &pres_buf) catch return;
+
+            var pkt_buf: [512]u8 = undefined;
+            var builder = try Message.Builder.init(&pkt_buf);
+            try builder.addQuestion(pres, .A, 1);
+            const pkt = builder.finish(.{ .id = 1 });
+
+            var parser = MessageParser.init(pkt);
+            const q = (try parser.nextQuestion()).?;
+            try std.testing.expect(try parser.nameEqualsAt(q.name_pos, pres));
+            var round_buf: [1024]u8 = undefined;
+            const round_pres = try parser.formatNameAt(q.name_pos, &round_buf);
+            try std.testing.expectEqualStrings(pres, round_pres);
         }
     };
     try std.testing.fuzz({}, F.one, .{});
