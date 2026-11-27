@@ -251,7 +251,9 @@ pub const MessageParser = struct {
         // 快路径：expected 不含反斜杠转义
         if (mem.indexOfScalar(u8, expected, '\\') == null) {
             if (expected.len == 0 or mem.eql(u8, expected, ".")) {
-                return (try cur.next()) == null;
+                if ((try cur.next()) == null) return true;
+                while (try cur.next()) |_| {}
+                return false;
             }
             const want = if (expected.len > 1 and expected[expected.len - 1] == '.')
                 expected[0 .. expected.len - 1]
@@ -1017,6 +1019,14 @@ test "MessageParser nameEqualsAt rejects cross-label dot spoofing and supports e
     const parser2 = MessageParser.init(pkt2[0..21]);
     try std.testing.expect(!(try parser2.nameEqualsAt(12, "a.b.com")));
     try std.testing.expect(try parser2.nameEqualsAt(12, "a\\.b.com"));
+
+    // 根名分支同样须排空游标：首标签非空但其后跟悬挂压缩指针时，对 "." 和普通名一致报 PacketTooShort
+    var dangling: [18]u8 = @splat(0);
+    @memcpy(dangling[12..17], "\x03www\xc0");
+    const dp = MessageParser.init(dangling[0..17]);
+    try std.testing.expectError(error.PacketTooShort, dp.nameEqualsAt(12, "."));
+    try std.testing.expectError(error.PacketTooShort, dp.nameEqualsAt(12, ""));
+    try std.testing.expectError(error.PacketTooShort, dp.nameEqualsAt(12, "other.com"));
 }
 
 test "MessageParser rejects buffers shorter than 12-byte header" {

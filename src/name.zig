@@ -283,6 +283,48 @@ fn canonicalComparePlain(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
+const PresentationRevIter = struct {
+    mode: union(enum) {
+        plain: BackwardLabels,
+        decoded: struct {
+            wire: [MAX_NAME]u8,
+            off: [128]u8,
+            rem: usize,
+        },
+    },
+
+    fn init(raw: []const u8) PresentationRevIter {
+        if (mem.indexOfScalar(u8, raw, '\\') == null) {
+            return .{ .mode = .{ .plain = BackwardLabels.init(raw) } };
+        }
+        var res: PresentationRevIter = .{ .mode = .{ .decoded = .{
+            .wire = undefined,
+            .off = undefined,
+            .rem = 0,
+        } } };
+        if (decodePresentationName(raw, &res.mode.decoded.wire, &res.mode.decoded.off)) |d| {
+            res.mode.decoded.rem = d.n_labels;
+            return res;
+        } else |_| {
+            // 仅当前操作数自身转义非法时退回按字面点切分，不影响另一操作数的合法转义解码，
+            // 保证比较函数是单参数映射上的字典序（严格弱序：反对称且传递）。
+            return .{ .mode = .{ .plain = BackwardLabels.init(raw) } };
+        }
+    }
+
+    fn next(self: *PresentationRevIter) ?[]const u8 {
+        switch (self.mode) {
+            .plain => |*p| return p.next(),
+            .decoded => |*d| {
+                if (d.rem == 0) return null;
+                d.rem -= 1;
+                const o = d.off[d.rem];
+                return d.wire[o + 1 ..][0..d.wire[o]];
+            },
+        }
+    }
+};
+
 /// DNSSEC canonical 名序（RFC 4034 §6.1）：从最右（TLD）标签起逐个比较，
 /// 每个标签按 US-ASCII 大小写折叠后的八位组序比较；共有后缀相同时标签更少者在前。
 /// 输入为表示格式域名（支持 RFC 1035 §5.1 转义 `\.` / `\\` / `\DDD`，大小写不敏感），根用 "." 或 ""。
@@ -292,29 +334,53 @@ pub fn canonicalCompare(a: []const u8, b: []const u8) std.math.Order {
         return canonicalComparePlain(a, b);
     }
 
-    var wire_a: [MAX_NAME]u8 = undefined;
-    var off_a: [128]u8 = undefined;
-    var wire_b: [MAX_NAME]u8 = undefined;
-    var off_b: [128]u8 = undefined;
-    const da = decodePresentationName(a, &wire_a, &off_a) catch return canonicalComparePlain(a, b);
-    const db = decodePresentationName(b, &wire_b, &off_b) catch return canonicalComparePlain(b, b_blk: {
-        break :b_blk b;
-    });
-
-    var i: usize = 0;
-    while (i < da.n_labels and i < db.n_labels) : (i += 1) {
-        const oa = off_a[da.n_labels - 1 - i];
-        const ob = off_b[db.n_labels - 1 - i];
-        const la = wire_a[oa + 1 ..][0..wire_a[oa]];
-        const lb = wire_b[ob + 1 ..][0..wire_b[ob]];
-        const ord = compareLabelCI(la, lb);
-        if (ord != .eq) return ord;
+    var ia = PresentationRevIter.init(a);
+    var ib = PresentationRevIter.init(b);
+    while (true) {
+        const la = ia.next();
+        const lb = ib.next();
+        if (la != null and lb != null) {
+            const ord = compareLabelCI(la.?, lb.?);
+            if (ord != .eq) return ord;
+        } else if (la == null and lb == null) {
+            return .eq;
+        } else {
+            return if (la == null) .lt else .gt;
+        }
     }
-    return std.math.order(da.n_labels, db.n_labels);
 }
 
-/// 零拷贝比较两个线格式域名的 DNSSEC canonical 顺序（RFC 4034 §6.1）。
-/// 跟随压缩指针，无需先格式化为字符串，精确处理含 '.' 或任意二进制字节的标签。
+const PackedLabels = struct {
+    // 合法线格式域名总长 ≤255（含根与至少 1 个长度字节），故纯标签内容总长恒 ≤253、标签数 ≤127。
+    // 注意：不能用 u8 直接索引原报文缓冲区（报文中名字起始偏移常 ≥256），紧凑拷入 253B 局部缓冲后
+    // 结束偏移恒 ≤253，既把双侧总栈占用从 2KB 压到 ~762B，又支持任意大小报文偏移。
+    chars: [253]u8 = undefined,
+    ends: [128]u8 = undefined,
+    count: u8 = 0,
+
+    fn unpack(buf: []const u8, off: usize, pointer_floor: usize) Error!PackedLabels {
+        var out = PackedLabels{};
+        var cur = NameCursor{ .buffer = buf, .pos = off, .pointer_floor = pointer_floor };
+        var cpos: usize = 0;
+        var n: usize = 0;
+        while (try cur.next()) |lbl| {
+            @memcpy(out.chars[cpos..][0..lbl.len], lbl);
+            cpos += lbl.len;
+            out.ends[n] = @intCast(cpos);
+            n += 1;
+        }
+        out.count = @intCast(n);
+        return out;
+    }
+
+    fn label(self: *const PackedLabels, idx: usize) []const u8 {
+        const start: usize = if (idx == 0) 0 else self.ends[idx - 1];
+        return self.chars[start..self.ends[idx]];
+    }
+};
+
+/// 比较两个线格式域名的 DNSSEC canonical 顺序（RFC 4034 §6.1）。
+/// 跟随压缩指针，无需先格式化为转义字符串，精确处理含 '.' 或任意二进制字节的标签。
 pub fn canonicalCompareWire(
     a_buf: []const u8,
     a_off: usize,
@@ -322,29 +388,14 @@ pub fn canonicalCompareWire(
     b_off: usize,
     pointer_floor: usize,
 ) Error!std.math.Order {
-    if (a_buf.len > std.math.maxInt(u32) or b_buf.len > std.math.maxInt(u32)) return error.MessageTooLong;
-    const Span = struct { start: u32, len: u8 };
-    var la: [128]Span = undefined;
-    var lb: [128]Span = undefined;
-    var na: usize = 0;
-    var nb: usize = 0;
-
-    var cur_a = NameCursor{ .buffer = a_buf, .pos = a_off, .pointer_floor = pointer_floor };
-    while (try cur_a.next()) |lbl| {
-        la[na] = .{ .start = @intCast(cur_a.pos - lbl.len), .len = @intCast(lbl.len) };
-        na += 1;
-    }
-    var cur_b = NameCursor{ .buffer = b_buf, .pos = b_off, .pointer_floor = pointer_floor };
-    while (try cur_b.next()) |lbl| {
-        lb[nb] = .{ .start = @intCast(cur_b.pos - lbl.len), .len = @intCast(lbl.len) };
-        nb += 1;
-    }
+    const pa = try PackedLabels.unpack(a_buf, a_off, pointer_floor);
+    const pb = try PackedLabels.unpack(b_buf, b_off, pointer_floor);
+    const na: usize = pa.count;
+    const nb: usize = pb.count;
 
     var i: usize = 0;
     while (i < na and i < nb) : (i += 1) {
-        const sa = la[na - 1 - i];
-        const sb = lb[nb - 1 - i];
-        const ord = compareLabelCI(a_buf[sa.start..][0..sa.len], b_buf[sb.start..][0..sb.len]);
+        const ord = compareLabelCI(pa.label(na - 1 - i), pb.label(nb - 1 - i));
         if (ord != .eq) return ord;
     }
     return std.math.order(na, nb);
@@ -469,7 +520,7 @@ test "NameIterator empty domain" {
 /// 普通可打印 ASCII 直接写出；标签内的 '.' 与 '\\' 转义为 `\.` / `\\`，控制字符与非 ASCII 转义为 `\DDD`。
 /// buffer: 包含 DNS 数据包的缓冲区
 /// pos: 域名起始位置
-/// out_buf: 输出缓冲区（普通 ASCII 域名最多 253 字节；含全转义极端情况至多 1004 字节）
+/// out_buf: 输出缓冲区（普通 ASCII 域名最多 253 字节；含全转义极端情况至多 1003 字节）
 /// 返回: 写入 out_buf 的字符串切片
 ///
 /// buffer 是一整个 DNS 报文时请用 `formatDnsNameInMessage`，它会一并拒绝指向
@@ -806,6 +857,72 @@ test "Name.canonicalCompare and canonicalCompare preserve RFC 4034 6.1 order on 
     // 内部空标签不得与正常名字静默判等
     try std.testing.expect(canonicalCompare("a..example.com", "a.example.com") != .eq);
     try std.testing.expect(canonicalCompare(".example.com", "example.com") != .eq);
+}
+
+test "canonicalCompare maintains strict weak ordering when one operand has invalid escape" {
+    const O = std.math.Order;
+    // 评审复现向量：a 含合法转义而 b 含非法转义 \256 时，绝不得退化为 b 与自身比较返回 .eq
+    try std.testing.expectEqual(O.lt, canonicalCompare("a\\.x.example", "b\\256.example"));
+    try std.testing.expectEqual(O.gt, canonicalCompare("b\\256.example", "a\\.x.example"));
+
+    // 混合合法无转义、合法含转义、非法转义的样本集：全对验证反对称性与传递性，并跑通 std.mem.sort
+    var items = [_][]const u8{
+        "z.example",
+        "b\\256.example",
+        "a\\.z.example",
+        "b.b.example",
+        "a\\256.d.example",
+        "a.example",
+        "bad\\",
+    };
+    for (items) |x| {
+        try std.testing.expectEqual(O.eq, canonicalCompare(x, x));
+        for (items) |y| {
+            const xy = canonicalCompare(x, y);
+            const yx = canonicalCompare(y, x);
+            try std.testing.expectEqual(xy.invert(), yx);
+            for (items) |z| {
+                const yz = canonicalCompare(y, z);
+                const xz = canonicalCompare(x, z);
+                if (xy == .lt and yz == .lt) try std.testing.expectEqual(O.lt, xz);
+                if (xy == .eq and yz == .eq) try std.testing.expectEqual(O.eq, xz);
+            }
+        }
+    }
+    mem.sort([]const u8, &items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return canonicalCompare(lhs, rhs) == .lt;
+        }
+    }.lessThan);
+    for (items[0 .. items.len - 1], items[1..]) |prev, next| {
+        try std.testing.expect(canonicalCompare(prev, next) != .gt);
+    }
+}
+
+test "Name.canonicalCompare works at packet offsets >= 256 and max escaped length is 1003" {
+    var pkt: [512]u8 = @splat(0);
+    // 偏移 12 放后缀 "example\0"
+    @memcpy(pkt[12..21], "\x07example\x00");
+    // 偏移 300 (>255) 放 "b" + 指向 12 的指针；偏移 340 (>255) 放 "a" + 指向 12 的指针
+    @memcpy(pkt[300..304], "\x01b\xC0\x0C");
+    @memcpy(pkt[340..344], "\x01a\xC0\x0C");
+    const nb = Name{ .buffer = &pkt, .offset = 300 };
+    const na = Name{ .buffer = &pkt, .offset = 340 };
+    try std.testing.expectEqual(std.math.Order.gt, try nb.canonicalCompare(na));
+    try std.testing.expectEqual(std.math.Order.lt, try na.canonicalCompare(nb));
+
+    // 极限全转义线格式名字（3×63 + 1×61 个 0x00 字节 = 255 字节线格式）：输出恰为 1003 字节
+    var max_wire: [255]u8 = @splat(0);
+    max_wire[0] = 63;
+    max_wire[64] = 63;
+    max_wire[128] = 63;
+    max_wire[192] = 61;
+    max_wire[254] = 0;
+    var out_exact: [1003]u8 = undefined;
+    const formatted = try formatDnsName(&max_wire, 0, &out_exact);
+    try std.testing.expectEqual(@as(usize, 1003), formatted.len);
+    var out_short: [1002]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, formatDnsName(&max_wire, 0, &out_short));
 }
 
 test "NameCursor.initInMessage rejects pointers into the header" {

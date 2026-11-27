@@ -28,7 +28,7 @@ fn parseECSOption(option_payload: []const u8) !ECSData {
     if (source_prefix > max_prefix or scope_prefix > max_prefix) return error.MalformedECS;
     const expected_len = (@as(usize, source_prefix) + 7) / 8;
     if (address.len != expected_len) return error.MalformedECS;
-    // RFC 7871 §6 / §7.1.2: 超出 source_prefix 的地址位必须为 0，否则接收方 MUST 返回 FORMERR。
+    // RFC 7871 §6: 超出 source_prefix 的地址位必须置 0；含非零位时接收方 SHOULD 返回 FORMERR。
     if (expected_len > 0) {
         const rem: u3 = @intCast(source_prefix % 8);
         if (rem != 0) {
@@ -52,8 +52,9 @@ pub const OptOptions = struct { ecs: ?ECSData = null, cookie: ?CookieData = null
 /// 解出已识别的选项。
 ///
 /// TLV 必须**恰好平铺**整个 RDATA：即使目标选项已找到也要走完全程，残留字节一律
-/// error.InvalidRData。重复 COOKIE（RFC 7873 §5.2.2 MUST FORMERR）或重复 ECS
-/// （RFC 7871 §7.1）分别返回 error.MalformedCookie / error.MalformedECS。
+/// error.InvalidRData。
+/// - 多条 COOKIE：按 RFC 7873 §5.2 / §5.3 只取第一条，忽略后续 COOKIE；
+/// - 多条 ECS：本库严格策略直接返回 error.MalformedECS，避免多子网歧义（非 RFC 强制）。
 pub fn parseOptOptions(rdata: []const u8) !OptOptions {
     var out = OptOptions{};
     var pos: usize = 0;
@@ -70,8 +71,7 @@ pub fn parseOptOptions(rdata: []const u8) !OptOptions {
             if (out.ecs != null) return error.MalformedECS;
             out.ecs = try parseECSOption(payload);
         } else if (code == @backingInt(OptionCode.COOKIE)) {
-            if (out.cookie != null) return error.MalformedCookie;
-            out.cookie = try parseCookieOption(payload);
+            if (out.cookie == null) out.cookie = try parseCookieOption(payload);
         }
     }
     // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
@@ -1076,20 +1076,24 @@ test "RData rejects RDATA names pointing into the header" {
     try std.testing.expectError(error.InvalidOffset, RData.parse(.MX, &msg, 12, 4));
 }
 
-test "parseOptOptions rejects duplicate COOKIE and duplicate ECS (RFC 7873 / RFC 7871)" {
+test "parseOptOptions keeps first COOKIE per RFC 7873 5.2 and rejects duplicate ECS" {
     const cookie1 = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
-    const cookie2_ok = "\x00\x0a\x00\x08\x08\x07\x06\x05\x04\x03\x02\x01";
-    const cookie2_bad = "\x00\x0a\x00\x03\xff\xff\xff";
-    try std.testing.expectError(error.MalformedCookie, parseOptOptions(cookie1 ++ cookie2_ok));
-    try std.testing.expectError(error.MalformedCookie, parseOptOptions(cookie1 ++ cookie2_bad));
+    const cookie2 = "\x00\x0a\x00\x08\x08\x07\x06\x05\x04\x03\x02\x01";
+    const cookie_ignored = "\x00\x0a\x00\x03\xff\xff\xff";
+    // RFC 7873 §5.2 / §5.3: 多条 COOKIE 只取最靠近头部的一条，后续忽略
+    const opts1 = try parseOptOptions(cookie1 ++ cookie2);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &opts1.cookie.?.client);
+    const opts2 = try parseOptOptions(cookie1 ++ cookie_ignored);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }, &opts2.cookie.?.client);
 
+    // 重复 ECS 按本库严格策略返回 MalformedECS
     const ecs1 = "\x00\x08\x00\x07\x00\x01\x18\x00\xc0\x00\x02";
     const ecs2_bad = "\x00\x08\x00\x04\x00\x09\x00\x00";
     try std.testing.expectError(error.MalformedECS, parseOptOptions(ecs1 ++ ecs1));
     try std.testing.expectError(error.MalformedECS, parseOptOptions(ecs1 ++ ecs2_bad));
 }
 
-test "parseECS rejects non-zero host bits beyond source_prefix (RFC 7871 7.1.2)" {
+test "parseECS rejects non-zero host bits beyond source_prefix (RFC 7871 §6)" {
     // IPv4 /20 末字节低 4 位须为 0：0xF1 非法，0xF0 合法
     const bad = "\x00\x08\x00\x07\x00\x01\x14\x00\xc0\xa8\xf1";
     try std.testing.expectError(error.MalformedECS, parseECS(bad));
@@ -1126,4 +1130,68 @@ test "RData.advanceName bounds wire scan to rdlength without reading into next R
     msg[21] = 'c';
     msg[22] = 64; // 下一条记录中的字节，不应被本条 RDATA 读取
     try std.testing.expectError(error.InvalidRData, RData.parse(.CNAME, &msg, 20, 2));
+}
+
+test "RData.advanceName agrees with NameCursor on pointer/limit validation" {
+    const NameCursor = @import("name.zig").NameCursor;
+    // 当 rdlength 完整覆盖 RDATA 名字线格式时，RData.parse(.CNAME) 内部的 advanceName
+    // 必须与 NameCursor.initInMessage 对合法/越界/指向header/成环/超长标签/255上限给出相同判定。
+    var msg_ok_ptr: [32]u8 = @splat(0);
+    @memcpy(msg_ok_ptr[12..17], "\x03com\x00");
+    @memcpy(msg_ok_ptr[20..26], "\x03www\xC0\x0C");
+
+    var msg_hdr_ptr: [32]u8 = @splat(0);
+    @memcpy(msg_hdr_ptr[20..22], "\xC0\x0B"); // 指向偏移 11（header 内）
+
+    var msg_oob_ptr: [32]u8 = @splat(0);
+    @memcpy(msg_oob_ptr[20..22], "\xC0\x30"); // 指向偏移 48（越界）
+
+    var msg_loop: [32]u8 = @splat(0);
+    @memcpy(msg_loop[12..14], "\xC0\x14");
+    @memcpy(msg_loop[20..22], "\xC0\x0C"); // 互指成环
+
+    var msg_bad_lbl: [32]u8 = @splat(0);
+    msg_bad_lbl[12] = 64; // 指针目标处标签 >63
+    @memcpy(msg_bad_lbl[20..22], "\xC0\x0C");
+
+    // 255（合法）与 256（超长）通过压缩指针展开
+    var msg_255: [300]u8 = @splat('a');
+    @memset(msg_255[0..12], 0);
+    msg_255[12] = 63;
+    msg_255[76] = 63;
+    msg_255[140] = 63;
+    msg_255[204] = 0; // 偏移 12 处为 3×63 + 根 = 193 字节
+    // 偏移 210 处放 61 字节标签 + 指向 12 的指针 -> 展开总长 62 + 193 = 255（合法）
+    msg_255[210] = 61;
+    msg_255[272] = 0xC0;
+    msg_255[273] = 12;
+
+    var msg_256 = msg_255;
+    // 偏移 210 处改为 62 字节标签 + 指向 12 的指针 -> 展开总长 63 + 193 = 256（NameTooLong）
+    msg_256[210] = 62;
+    msg_256[273] = 0xC0;
+    msg_256[274] = 12;
+
+    const Case = struct { buf: []const u8, off: usize, rdlen: u16 };
+    const cases = [_]Case{
+        .{ .buf = &msg_ok_ptr, .off = 12, .rdlen = 5 },
+        .{ .buf = &msg_ok_ptr, .off = 20, .rdlen = 6 },
+        .{ .buf = &msg_hdr_ptr, .off = 20, .rdlen = 2 },
+        .{ .buf = &msg_oob_ptr, .off = 20, .rdlen = 2 },
+        .{ .buf = &msg_loop, .off = 20, .rdlen = 2 },
+        .{ .buf = &msg_bad_lbl, .off = 20, .rdlen = 2 },
+        .{ .buf = &msg_255, .off = 210, .rdlen = 64 },
+        .{ .buf = &msg_256, .off = 210, .rdlen = 65 },
+    };
+
+    for (cases) |c| {
+        const rdata_err: ?anyerror = if (RData.parse(.CNAME, c.buf, c.off, c.rdlen)) |_| null else |e| e;
+        var cur = NameCursor.initInMessage(c.buf, c.off);
+        const cur_err: ?anyerror = while (true) {
+            if (cur.next()) |lbl| {
+                if (lbl == null) break null;
+            } else |e| break e;
+        };
+        try std.testing.expectEqual(cur_err, rdata_err);
+    }
 }
