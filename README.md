@@ -284,8 +284,9 @@ try builder.setEdns(.{
               .address = &[_]u8{ 192, 0, 2 } }, // 192.0.2.0/24
 });
 // Answer / Authority records can still be added normally; finish() appends OPT at the end.
-// (addOptRecord / addOptRecordRaw remain available for immediate Additional-section emission.)
 ```
+
+`addOptRecord` and `addOptRecordRaw` remain available for writing an `OPT` record into the Additional section immediately. Note that if you have **not** called `try builder.setSection(.additional)` beforehand, `addOptRecord` / `addOptRecordRaw` lock the builder against accidental subsequent `add*Record` calls (returning `error.InvalidRecordOrder` so Answer records are never silently emitted into Additional as `ANCOUNT=0` NODATA); call `try builder.setSection(.additional)` explicitly to unlock when intentionally appending trailing Additional records such as TSIG after `OPT`.
 
 For DNS-over-TCP, use the 2-byte length-prefix framing helpers:
 
@@ -386,12 +387,20 @@ pub const Error = error{
     InvalidOffset,
     MessageTooLong,
     MultipleOptRecords, // RFC 6891 §6.1.1: more than one OPT record → FORMERR
-    InvalidRecordOrder, // Builder misuse: section regression, or question after an RR
+    InvalidRecordOrder, // Section order violation: Builder regression/question after RR/implicit OPT lock, or SectionParser out-of-order/unconsumed section
     UseEdns,            // parseRData called on OPT(41): use findEdns / Edns.fromOpt instead
     MisplacedOptRecord, // RFC 6891 §6.1.1: OPT record in Answer or Authority section → FORMERR
     TrailingBytes,      // Unaccounted trailing bytes past the declared section counts → FORMERR
 };
 ```
+
+### Breaking Behavior Notes
+
+- **Forward compression pointers rejected (RFC 1035 §4.1.4)**: Name compression pointers must target a strictly earlier offset (`target < origin`); forward jumps return `error.MalformedName`.
+- **`Builder` initial section is `.question`**: Calling `setSection(.answer)` (or `.authority` / `.additional`) before `addQuestion()` now returns `error.InvalidRecordOrder` (writing a non-OPT RR directly on a fresh builder still auto-advances `.question` → `.answer`).
+- **Implicit section lock after `addOptRecord` / `addOptRecordRaw`**: When called without a prior `setSection(.additional)`, appending further records afterward (e.g., TSIG via `addRecordRaw`) requires calling `try builder.setSection(.additional)` first to confirm Additional-section intent (or prefer `setEdns()`, which reserves `OPT` at the end without changing the active section).
+- **`RData` decoupled from `Type`**: `RData` is now `union(enum)` rather than `union(Type)` so `Type` can define pure QTYPEs and Meta-TYPEs (`ANY`, `AXFR`, `IXFR`, `TSIG`, `TKEY`); match `RData` tags directly rather than coercing `RData` to `Type`.
+- **`OPT` internal TLV overrun error**: When an EDNS option's `OPTION-LENGTH` exceeds `OPT.RDLENGTH`, `parseOptOptions` / `parseECS` / `parseCookie` / `Edns.fromOpt` / `findEdns` now return `error.InvalidRData` instead of `error.PacketTooShort` (reserving `PacketTooShort` for truncated packet or TCP-frame buffers).
 
 ## Examples
 

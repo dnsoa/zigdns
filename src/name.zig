@@ -7,8 +7,6 @@ const MAX_LABEL = 63;
 const MAX_NAME = 255;
 // 单个域名跟随压缩指针的总次数上限（含带标签后缀链，最多 127 层标签）。
 const MAX_POINTER_JUMPS = 128;
-// 连续无标签纯指针链（0xC0 -> 0xC0）上限：合法编码器不会发出长纯指针链，限制放大开销。
-pub const MAX_CHAINED_POINTERS = 16;
 
 /// 完整 DNS 报文中压缩指针目标的最小合法偏移：域名不可能起始于 12 字节 header 内，
 /// 指向 header 的指针是畸形输入。裸缓冲区（不是整个报文）用 0 表示不约束。
@@ -27,7 +25,6 @@ pub const NameCursor = struct {
     pos: usize,
     total: usize = 0,
     jumps: usize = 0,
-    chained_jumps: u8 = 0,
     /// 当前正在展开的名字/后缀起始偏移；压缩指针必须满足 `target < origin`（RFC 1035 §4.1.4）。
     origin: ?usize = null,
     /// 压缩指针目标的最小合法偏移，见 `MESSAGE_POINTER_FLOOR`。
@@ -61,11 +58,10 @@ pub const NameCursor = struct {
                 if (self.pos + 1 >= self.buffer.len) return error.PacketTooShort;
                 const offset = (@as(usize, len & 0x3F) << 8) | self.buffer[self.pos + 1];
                 if (offset < self.pointer_floor or offset >= self.buffer.len) return error.InvalidOffset;
-                if (offset >= self.origin.? or self.jumps >= MAX_POINTER_JUMPS or self.chained_jumps >= MAX_CHAINED_POINTERS) {
+                if (offset >= self.origin.? or self.jumps >= MAX_POINTER_JUMPS) {
                     return error.MalformedName;
                 }
                 self.jumps += 1;
-                self.chained_jumps += 1;
                 self.origin = offset;
                 self.pos = offset;
                 continue;
@@ -81,55 +77,11 @@ pub const NameCursor = struct {
             // 而 Builder.validateName 以同一规则拒绝，形成解析/构造不一致）。
             if (self.total + 1 > MAX_NAME) return error.NameTooLong;
 
-            self.chained_jumps = 0;
             self.pos = start + len;
             return self.buffer[start .. start + len];
         }
     }
 };
-
-pub const SkipResult = struct {
-    end_pos: usize,
-    jumps: usize,
-};
-
-/// 同 `skipName`，额外返回本次域名展开消耗的压缩指针跳转次数，供整包解压缩预算记账。
-pub fn skipNameCounted(buffer: []const u8, start: usize, pointer_floor: usize) !SkipResult {
-    var pos = start;
-    var origin = start;
-    var total: usize = 1; // 根结束符计入 255（RFC 1035 §2.3.4）
-    var jumps: usize = 0;
-    var chained_jumps: u8 = 0;
-    var wire_end: ?usize = null; // 线格式止于首个指针；在此之前即整名末尾
-    while (true) {
-        if (pos >= buffer.len) return error.PacketTooShort;
-        const len = buffer[pos];
-        if (len == 0) return .{ .end_pos = wire_end orelse pos + 1, .jumps = jumps };
-
-        if (len & 0xC0 == 0xC0) { // 压缩指针：跟随以校验展开结果
-            if (pos + 2 > buffer.len) return error.PacketTooShort;
-            const target = (@as(usize, len & 0x3F) << 8) | buffer[pos + 1];
-            if (target < pointer_floor or target >= buffer.len) return error.InvalidOffset;
-            // RFC 1035 §4.1.4: 指针只能指向更早偏移（target < origin），天然消除成环与前向越区引用。
-            if (target >= origin or jumps >= MAX_POINTER_JUMPS or chained_jumps >= MAX_CHAINED_POINTERS) {
-                return error.MalformedName;
-            }
-            jumps += 1;
-            chained_jumps += 1;
-            if (wire_end == null) wire_end = pos + 2;
-            origin = target;
-            pos = target;
-            continue;
-        }
-
-        if (len > MAX_LABEL) return error.LabelTooLong;
-        if (pos + 1 + len > buffer.len) return error.PacketTooShort;
-        total += 1 + len;
-        if (total > MAX_NAME) return error.NameTooLong;
-        chained_jumps = 0;
-        pos += 1 + len;
-    }
-}
 
 /// 跳过 `buffer` 中起始于 `start` 的域名，返回其**线格式**结束偏移：
 /// 未压缩名为根结束符之后；压缩名为首个压缩指针的 2 字节之后（**不是**指针目标之后）——
@@ -142,7 +94,37 @@ pub fn skipNameCounted(buffer: []const u8, start: usize, pointer_floor: usize) !
 /// `pointer_floor`：压缩指针目标的最小合法偏移，完整报文传 `MESSAGE_POINTER_FLOOR`，
 /// 裸缓冲区传 0；与 `NameCursor.pointer_floor` 同义。
 pub fn skipName(buffer: []const u8, start: usize, pointer_floor: usize) !usize {
-    return (try skipNameCounted(buffer, start, pointer_floor)).end_pos;
+    var pos = start;
+    var origin = start;
+    var total: usize = 1; // 根结束符计入 255（RFC 1035 §2.3.4）
+    var jumps: usize = 0;
+    var wire_end: ?usize = null; // 线格式止于首个指针；在此之前即整名末尾
+    while (true) {
+        if (pos >= buffer.len) return error.PacketTooShort;
+        const len = buffer[pos];
+        if (len == 0) return wire_end orelse pos + 1;
+
+        if (len & 0xC0 == 0xC0) { // 压缩指针：跟随以校验展开结果
+            if (pos + 2 > buffer.len) return error.PacketTooShort;
+            const target = (@as(usize, len & 0x3F) << 8) | buffer[pos + 1];
+            if (target < pointer_floor or target >= buffer.len) return error.InvalidOffset;
+            // RFC 1035 §4.1.4: 指针只能指向更早偏移（target < origin），天然消除成环与前向越区引用。
+            if (target >= origin or jumps >= MAX_POINTER_JUMPS) {
+                return error.MalformedName;
+            }
+            jumps += 1;
+            if (wire_end == null) wire_end = pos + 2;
+            origin = target;
+            pos = target;
+            continue;
+        }
+
+        if (len > MAX_LABEL) return error.LabelTooLong;
+        if (pos + 1 + len > buffer.len) return error.PacketTooShort;
+        total += 1 + len;
+        if (total > MAX_NAME) return error.NameTooLong;
+        pos += 1 + len;
+    }
 }
 
 pub const DecodedPresentationName = struct {
@@ -996,7 +978,7 @@ test "NameCursor terminates on pointer loop" {
     try std.testing.expectError(error.MalformedName, formatDnsName(&buf, 0, &out));
 }
 
-test "NameCursor and skipName reject forward compression pointers and long pointer chains (RFC 1035 4.1.4)" {
+test "NameCursor and skipName reject forward compression pointers and >128 pointer chains (RFC 1035 4.1.4)" {
     // 前向指针：偏移 12 处的名字跳向偏移 20（即使偏移 20 处是合法 "com\0" 也须拒绝）
     var fwd: [32]u8 = @splat(0);
     @memcpy(fwd[12..18], "\x03www\xC0\x14");
@@ -1005,12 +987,12 @@ test "NameCursor and skipName reject forward compression pointers and long point
     try std.testing.expectError(error.MalformedName, formatDnsNameInMessage(&fwd, 12, &out));
     try std.testing.expectError(error.MalformedName, skipName(&fwd, 12, MESSAGE_POINTER_FLOOR));
 
-    // 纯指针链超过 MAX_CHAINED_POINTERS(16) 跳时须拒绝（防单包纯指针放大）
-    var chain: [128]u8 = @splat(0);
+    // 向后指针链超过 MAX_POINTER_JUMPS(128) 跳时须拒绝
+    var chain: [300]u8 = @splat(0);
     @memcpy(chain[12..17], "\x03com\x00");
     var prev: usize = 12;
     var off: usize = 18;
-    for (0..MAX_CHAINED_POINTERS + 1) |_| {
+    for (0..MAX_POINTER_JUMPS + 1) |_| {
         chain[off] = 0xC0 | @as(u8, @intCast(prev >> 8));
         chain[off + 1] = @intCast(prev & 0xFF);
         prev = off;

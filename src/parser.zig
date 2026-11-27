@@ -9,14 +9,11 @@ const parseCookie = @import("rdata.zig").parseCookie;
 const parseOptOptions = @import("rdata.zig").parseOptOptions;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
-const skipNameCounted = @import("name.zig").skipNameCounted;
+const skipNameAt = @import("name.zig").skipName;
 const formatDnsNameInMessage = @import("name.zig").formatDnsNameInMessage;
 const decodePresentationName = @import("name.zig").decodePresentationName;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 const Error = @import("errors.zig").Error;
-
-/// 单个 DNS 报文允许累计跟随的压缩指针总跳数上限，防御大规模压缩放大 DoS。
-pub const MAX_MESSAGE_POINTER_JUMPS: u32 = 8192;
 
 pub const Question = struct {
     name_pos: usize, // Where the owner name starts in the buffer (for zero-copy echo / name resolution)
@@ -79,7 +76,6 @@ pub fn CountedIterator(comptime T: type) type {
 pub const MessageParser = struct {
     buffer: []const u8,
     pos: usize,
-    jump_budget: u32 = MAX_MESSAGE_POINTER_JUMPS,
 
     pub const QuestionIterator = CountedIterator(Question);
     pub const RRIterator = CountedIterator(ResourceRecord);
@@ -91,14 +87,11 @@ pub const MessageParser = struct {
     /// Skips a DNS name (including compression pointers) without copying it.
     /// Crucial for jumping to the Type/Class fields.
     ///
-    /// 委托给 `name.skipNameCounted`：压缩指针会被**跟随并完整校验**（RFC 1035 §2.3.4 的
-    /// 标签 ≤63 / 整名 ≤255 含根、目标越界、指向 header、前向跳转、指针成环），并扣减整包
-    /// 解压缩跳转预算，而 `pos` 仍落在线格式结束处（指针后 2 字节）。
+    /// 委托给 `name.skipName`：压缩指针会被**跟随并完整校验**（RFC 1035 §2.3.4 / §4.1.4 的
+    /// 标签 ≤63 / 整名 ≤255 含根、目标越界、指向 header、禁止前向跳转、指针成环），而 `pos`
+    /// 仍落在线格式结束处（指针后 2 字节）。每个名字上限（≤255 字节、≤128 跳）天然保证整包线性复杂度。
     fn skipName(self: *MessageParser) !void {
-        const res = try skipNameCounted(self.buffer, self.pos, POINTER_FLOOR);
-        if (res.jumps > self.jump_budget) return error.MalformedName;
-        self.jump_budget -= @intCast(res.jumps);
-        self.pos = res.end_pos;
+        self.pos = try skipNameAt(self.buffer, self.pos, POINTER_FLOOR);
     }
 
     /// Parses the next Question in the packet
@@ -363,18 +356,11 @@ pub const MessageParser = struct {
     /// compression pointers without any pointer arithmetic or aliasing assumptions.
     ///
     /// - OPT（类型 41）不是普通 RR：返回 `error.UseEdns`，分流到 `findEdns` / `Edns.fromOpt`。
-    /// - 伪类 `ANY(255)` / `NONE(254)`（如 RFC 2136 动态更新空记录）不承载常规 RDATA：返回 `error.InvalidClass`。
-    /// - 仅在 `CLASS = IN(1)` 下定义的地址/服务绑定类型（A/AAAA/SRV/SVCB/HTTPS）遇其他类返回 `error.UnknownClass`。
+    /// - QCLASS / 伪类 `ANY(255)` 与 `NONE(254)`（RFC 6895 §3.2 / RFC 2136）不承载常规数据 RDATA：返回 `error.InvalidClass`。
     pub fn parseRData(self: *const MessageParser, rr: ResourceRecord) !RData {
         if (rr.rtype == .OPT) return error.UseEdns;
         if (rr.class == @backingInt(Class.ANY) or rr.class == @backingInt(Class.NONE)) {
             return error.InvalidClass;
-        }
-        switch (rr.rtype) {
-            .A, .AAAA, .SRV, .SVCB, .HTTPS => {
-                if (rr.class != @backingInt(Class.IN)) return error.UnknownClass;
-            },
-            else => {},
         }
         return RData.parse(rr.rtype, self.buffer, rr.rdata_offset, rr.rdlength);
     }
@@ -1095,7 +1081,8 @@ test "MessageParser enforces class checks, non-additional OPT rejection, and exp
     var p1 = MessageParser.init(packet[0..23]);
     try std.testing.expectError(error.MisplacedOptRecord, p1.skipNonAdditionalRecords(1));
 
-    // CH A 记录（非 IN 类的互联网专有类型）-> parseRData 报 UnknownClass；ANY 伪类 -> InvalidClass
+    // 已分配非 IN 数据类（如 CH/HS）交由 RData.parse 按类型解析；ANY/NONE 伪类（RFC 6895 §3.2）报 InvalidClass
+    @memcpy(packet[23..27], &[_]u8{ 1, 2, 3, 4 });
     const ch_a = ResourceRecord{
         .name_pos = 12,
         .name_end_pos = 13,
@@ -1103,11 +1090,12 @@ test "MessageParser enforces class checks, non-additional OPT rejection, and exp
         .class = @backingInt(Class.CH),
         .ttl = 60,
         .rdlength = 4,
-        .rdata = &[_]u8{ 1, 2, 3, 4 },
+        .rdata = packet[23..27],
         .rdata_offset = 23,
     };
     const p2 = MessageParser.init(packet[0..27]);
-    try std.testing.expectError(error.UnknownClass, p2.parseRData(ch_a));
+    const ch_rd = try p2.parseRData(ch_a);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, &ch_rd.A);
 
     const update_empty = ResourceRecord{
         .name_pos = 12,
@@ -1121,9 +1109,96 @@ test "MessageParser enforces class checks, non-additional OPT rejection, and exp
     };
     try std.testing.expectError(error.InvalidClass, p2.parseRData(update_empty));
 
+    const none_rr = ResourceRecord{
+        .name_pos = 12,
+        .name_end_pos = 13,
+        .rtype = .A,
+        .class = @backingInt(Class.NONE),
+        .ttl = 0,
+        .rdlength = 0,
+        .rdata = "",
+        .rdata_offset = 23,
+    };
+    try std.testing.expectError(error.InvalidClass, p2.parseRData(none_rr));
+
     // 声明 0 条记录但末尾多了残尾字节 -> expectEnd 报 TrailingBytes
     const p_trail = MessageParser.init(packet[0..14]);
     try std.testing.expectError(error.TrailingBytes, p_trail.expectEnd());
     const p_exact = MessageParser.init(packet[0..12]);
     try p_exact.expectEnd();
+}
+
+test "MessageParser parses large 48KB multi-hop chained-compression packet (>12000 pointer jumps)" {
+    // 复现评审探针（48083 字节、3003 条 RR）：
+    // - Question: example.com (off 12..29)
+    // - 3 条 A 记录：owner 依次为 d+ptr(12) [off 29..47]、c+ptr(29) [off 47..65]、b+ptr(47) [off 65..83]
+    // - 3000 条 16 字节 PTR 记录：owner 为 a+ptr(65)（展开 4 跳 -> a.b.c.d.example.com），rdata 为 ptr(12)
+    const pkt = try std.testing.allocator.alloc(u8, 48083);
+    defer std.testing.allocator.free(pkt);
+    @memset(pkt, 0);
+
+    mem.writeInt(u16, pkt[4..6], 1, .big); // QDCOUNT = 1
+    mem.writeInt(u16, pkt[6..8], 3003, .big); // ANCOUNT = 3003
+
+    var pos: usize = 12;
+    const qname = "\x07example\x03com\x00";
+    @memcpy(pkt[pos..][0..qname.len], qname);
+    pos += qname.len;
+    mem.writeInt(u16, pkt[pos..][0..2], @backingInt(Type.A), .big);
+    mem.writeInt(u16, pkt[pos + 2 ..][0..2], 1, .big);
+    pos += 4; // pos = 29
+
+    const chain_labels = [_]struct { ch: u8, target: u16 }{
+        .{ .ch = 'd', .target = 12 }, // off 29..47
+        .{ .ch = 'c', .target = 29 }, // off 47..65
+        .{ .ch = 'b', .target = 47 }, // off 65..83
+    };
+    for (chain_labels) |item| {
+        pkt[pos] = 1;
+        pkt[pos + 1] = item.ch;
+        pkt[pos + 2] = 0xC0 | @as(u8, @intCast(item.target >> 8));
+        pkt[pos + 3] = @intCast(item.target & 0xFF);
+        pos += 4;
+        mem.writeInt(u16, pkt[pos..][0..2], @backingInt(Type.A), .big);
+        mem.writeInt(u16, pkt[pos + 2 ..][0..2], 1, .big);
+        mem.writeInt(u32, pkt[pos + 4 ..][0..4], 60, .big);
+        mem.writeInt(u16, pkt[pos + 8 ..][0..2], 4, .big);
+        pos += 10;
+        @memcpy(pkt[pos..][0..4], &[_]u8{ 192, 0, 2, 1 });
+        pos += 4;
+    }
+    try std.testing.expectEqual(@as(usize, 83), pos);
+
+    for (0..3000) |_| {
+        pkt[pos] = 1;
+        pkt[pos + 1] = 'a';
+        pkt[pos + 2] = 0xC0;
+        pkt[pos + 3] = 65;
+        pos += 4;
+        mem.writeInt(u16, pkt[pos..][0..2], @backingInt(Type.PTR), .big);
+        mem.writeInt(u16, pkt[pos + 2 ..][0..2], 1, .big);
+        mem.writeInt(u32, pkt[pos + 4 ..][0..4], 60, .big);
+        mem.writeInt(u16, pkt[pos + 8 ..][0..2], 2, .big);
+        pos += 10;
+        pkt[pos] = 0xC0;
+        pkt[pos + 1] = 12;
+        pos += 2;
+    }
+    try std.testing.expectEqual(@as(usize, 48083), pos);
+
+    var parser = MessageParser.init(pkt);
+    try parser.skipQuestions(1);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("a.b.c.d.example.com", try parser.formatNameAt(83, &nbuf));
+
+    var rrs = parser.resourceRecords(3003);
+    var count: usize = 0;
+    while (try rrs.next()) |rr| : (count += 1) {
+        if (count == 3002) {
+            const rd = try parser.parseRData(rr);
+            try std.testing.expectEqualStrings("example.com", try rd.PTR.str(&nbuf));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3003), count);
+    try parser.expectEnd();
 }

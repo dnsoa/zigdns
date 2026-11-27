@@ -7,7 +7,6 @@ const CookieData = @import("types.zig").CookieData;
 const Error = @import("errors.zig").Error;
 const Name = @import("name.zig").Name;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
-const MAX_CHAINED_POINTERS = @import("name.zig").MAX_CHAINED_POINTERS;
 
 fn parseECSOption(option_payload: []const u8) !ECSData {
     if (option_payload.len < 4) return error.MalformedECS;
@@ -185,12 +184,13 @@ pub const SvcbData = struct {
     }
 };
 
-/// 校验 SvcParams 原始字节（RFC 9460 §2.2 / §7）：各 TLV 恰好平铺、SvcParamKey
+/// 校验 SvcParams 原始字节（RFC 9460 §2.2 / §2.4.3 / §7）：各 TLV 恰好平铺、SvcParamKey
 /// 按数值严格递增去重，且知名键（mandatory/alpn/no-default-alpn/port/ipv4hint/ipv6hint）
-/// 符合规范值格式。空 params（AliasMode）合法。
+/// 符合规范值格式与自洽性要求（no-default-alpn 必须伴随 alpn）。空 params（AliasMode）合法。
 pub fn validateSvcParams(params: []const u8) !void {
     var pos: usize = 0;
     var prev_key: i32 = -1;
+    var has_alpn = false;
     var mandatory_val: ?[]const u8 = null;
     while (pos < params.len) {
         if (pos + 4 > params.len) return error.InvalidRData;
@@ -215,7 +215,7 @@ pub fn validateSvcParams(params: []const u8) !void {
                 }
                 mandatory_val = val;
             },
-            1 => { // alpn (RFC 9460 §7.1): 1 个或多个非空 1 字节长度前缀的 ALPN ID
+            1 => { // alpn (RFC 9460 §7.1.1): 1 个或多个非空 1 字节长度前缀的 ALPN ID
                 if (val.len < 2) return error.InvalidRData;
                 var apos: usize = 0;
                 while (apos < val.len) {
@@ -224,9 +224,10 @@ pub fn validateSvcParams(params: []const u8) !void {
                     if (alen == 0 or apos + alen > val.len) return error.InvalidRData;
                     apos += alen;
                 }
+                has_alpn = true;
             },
-            2 => { // no-default-alpn (RFC 9460 §7.1): 必须为空值
-                if (val.len != 0) return error.InvalidRData;
+            2 => { // no-default-alpn (RFC 9460 §7.1.1 / §2.4.3): 必须为空值，且同条记录须包含 alpn(1)
+                if (val.len != 0 or !has_alpn) return error.InvalidRData;
             },
             3 => { // port (RFC 9460 §7.2): 固定 2 字节端口
                 if (val.len != 2) return error.InvalidRData;
@@ -443,7 +444,6 @@ pub const RData = union(enum) {
         var origin = cur;
         var total: usize = 1; // RFC 1035 §2.3.4 的 255 含根结束符
         var jumps: usize = 0;
-        var chained_jumps: u8 = 0;
         var wire_end: ?usize = null;
 
         while (true) {
@@ -463,11 +463,10 @@ pub const RData = union(enum) {
                 if (cur + 2 > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
                 const target = (@as(usize, len & 0x3F) << 8) | msg[cur + 1];
                 if (target < POINTER_FLOOR or target >= msg.len) return error.InvalidOffset;
-                if (target >= origin or jumps >= 128 or chained_jumps >= MAX_CHAINED_POINTERS) {
+                if (target >= origin or jumps >= 128) {
                     return error.MalformedName;
                 }
                 jumps += 1;
-                chained_jumps += 1;
                 if (wire_end == null) wire_end = cur + 2;
                 origin = target;
                 cur = target;
@@ -478,7 +477,6 @@ pub const RData = union(enum) {
             if (cur + 1 + len > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
             total += 1 + len;
             if (total > 255) return error.NameTooLong;
-            chained_jumps = 0;
             cur += 1 + len;
         }
     }
@@ -691,7 +689,7 @@ pub const RData = union(enum) {
                 const hash_start = 6 + salt_len;
                 if (hash_len == 0 or hash_start + hash_len > data.len) return error.InvalidRData;
                 // RFC 5155 §3.1.1/§3.1.7: 仅定义 SHA-1（算法 1），其哈希固定 20 字节。
-                // 已知算法的非法哈希长度视为畸形；未定义算法仍须非空（§3.2 无空哈希表示）。
+                // 已知算法的非法哈希长度视为畸形；未定义算法仍须非空（RFC 5155 §3.1.6: Hash Length 取值 1..255）。
                 if (data[0] == 1 and hash_len != 20) return error.InvalidRData;
                 // RFC 5155 §3.2.1: NSEC3 允许空位图（空非终端），但非空时须符合窗口规范。
                 try validateTypeBitmap(data[hash_start + hash_len ..], true);
@@ -1313,9 +1311,10 @@ test "validateSvcParams enforces RFC 9460 §7 well-known SvcParamValue formats" 
     // alpn(1) 含零长协议名或截断 -> InvalidRData；合法 "h2" 通过
     try validateSvcParams("\x00\x01\x00\x03\x02h2");
     try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x01\x00\x01\x00"));
-    // no-default-alpn(2) 必须为空值
-    try validateSvcParams("\x00\x02\x00\x00");
-    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x02\x00\x01\x00"));
+    // no-default-alpn(2) 必须为空值，且必须伴随 alpn(1)（RFC 9460 §7.1.1 / §2.4.3）
+    try validateSvcParams("\x00\x01\x00\x03\x02h2" ++ "\x00\x02\x00\x00");
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x02\x00\x00")); // 缺少 alpn
+    try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x01\x00\x03\x02h2" ++ "\x00\x02\x00\x01\x00")); // 非空值
     // ipv4hint(4) 须 4N 非空；ipv6hint(6) 须 16N 非空
     try validateSvcParams("\x00\x04\x00\x04\xc0\x00\x02\x01");
     try std.testing.expectError(error.InvalidRData, validateSvcParams("\x00\x04\x00\x03\xc0\x00\x02"));

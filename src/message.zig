@@ -176,6 +176,8 @@ pub const SectionParser = struct {
         return self.parser.nameEqualsAt(offset, expected);
     }
 
+    /// 校验四个分区声明的记录均已按序消费完毕（未读完前置记录时返回 `error.InvalidRecordOrder`），
+    /// 且报文末尾不存在未声明的残留字节（若有则返回 `error.TrailingBytes`）。
     pub fn expectEnd(self: *const SectionParser) Error!void {
         if (self.qd_rem != 0 or self.an_rem != 0 or self.ns_rem != 0 or self.ar_rem != 0) {
             return error.InvalidRecordOrder;
@@ -1232,7 +1234,10 @@ pub const Message = struct {
             self.registerPlainSuffixes(canonical, null, start, canonical.len);
         }
 
-        /// 写入完整展开、不压缩的域名（用于 RFC 2782 / 4034 / 9460 规定不得压缩的域名字段，及转义域名）。
+        /// 写入完整展开、不压缩的域名（用于 SRV target、SVCB/HTTPS TargetName、RRSIG signer、
+        /// NSEC next_domain 等 RFC 2782 / 4034 / 9460 规定不得压缩的域名字段，以及转义域名）。
+        /// 无转义路径在展开写出后同样把后缀登记到压缩表，供后续附加区胶水记录（A/AAAA）或后续 owner 压缩复用；
+        /// 含 `\` 转义的慢路径与 `writeName` 对齐，不入压缩表。
         fn writeNameRaw(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
                 try self.ensureCapacity(1);
@@ -2629,6 +2634,77 @@ test "Message.Builder setEdns preserves OPT across TC=1 truncation and prevents 
     var b3 = try Message.Builder.init(&buf2);
     try b3.setSection(.authority);
     try std.testing.expectError(error.InvalidRecordOrder, b3.addQuestion("example.com", .A, 1));
+
+    // addOptRecordRaw 同样触发隐式附加区保护锁，显式 setSection(.additional) 后解锁
+    var b4 = try Message.Builder.init(&buf2);
+    try b4.addQuestion("example.com", .A, 1);
+    try b4.addOptRecordRaw(1232, 0, "");
+    try std.testing.expectError(error.InvalidRecordOrder, b4.addARecord("example.com", 60, .{ 1, 2, 3, 4 }));
+    try b4.setSection(.additional);
+    try b4.addRecordRaw("example.com", @backingInt(Type.TSIG), @backingInt(@import("types.zig").Class.ANY), 0, "\x01\x02");
+
+    // setEdns 配合 initTcp / finishTcp 在 TCP 帧末尾自动落盘 OPT 且可由 parseTcp + findEdns 往返解析
+    var tcp_buf: [128]u8 = undefined;
+    var tb = try Message.Builder.initTcp(&tcp_buf);
+    try tb.addQuestion("example.com", .A, 1);
+    try tb.setEdns(.{ .udp_payload_size = 4096, .dnssec_ok = true });
+    try tb.addARecord("example.com", 300, .{ 93, 184, 216, 34 });
+    const tcp_frame = try tb.finishTcp(.{ .id = 0x99, .qr = 1, .aa = 1 });
+    const tcp_msg = try Message.parseTcp(tcp_frame);
+    try std.testing.expectEqual(@as(u16, 1), tcp_msg.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 1), tcp_msg.header.ancount);
+    try std.testing.expectEqual(@as(u16, 1), tcp_msg.header.arcount);
+    const tcp_edns = (try tcp_msg.findEdns()).?;
+    try std.testing.expectEqual(@as(u16, 4096), tcp_edns.udp_payload_size);
+    try std.testing.expect(tcp_edns.dnssec_ok);
+}
+
+test "Message.Builder writeNameRaw registers suffixes for subsequent glue compression and rolls back cleanly" {
+    // 1. SRV target 自身不压缩（RFC 2782），但紧随其后的附加区胶水 A 记录 owner 压缩为 2 字节指针
+    var buf: [256]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    try builder.addSRVRecord("_sip._tcp.example.com", 300, 10, 20, 5060, "sip1.svc.example.net");
+    try builder.setSection(.additional);
+    const glue_a_start = builder.pos;
+    try builder.addARecord("sip1.svc.example.net", 300, .{ 192, 0, 2, 10 });
+    // 胶水 A 记录总长应为 2(压缩指针) + 10(固定头) + 4(IPv4) = 16 字节
+    try std.testing.expectEqual(@as(usize, 16), builder.pos - glue_a_start);
+
+    // 2. HTTPS TargetName 自身不压缩（RFC 9460 §2.2），后续胶水 AAAA 记录 owner 同样压缩为 2 字节指针
+    try builder.setSection(.additional);
+    var b_https = try Message.Builder.init(&buf);
+    try b_https.addHTTPSRecord("example.com", 300, 1, "h3.cdn.example.org", "\x00\x03\x00\x02\x01\xbb");
+    try b_https.setSection(.additional);
+    const glue_aaaa_start = b_https.pos;
+    try b_https.addAAAARecord("h3.cdn.example.org", 300, @splat(1));
+    // 2(压缩指针) + 10(固定头) + 16(IPv6) = 28 字节
+    try std.testing.expectEqual(@as(usize, 28), b_https.pos - glue_aaaa_start);
+
+    const pkt = b_https.finish(.{ .id = 1, .qr = 1, .aa = 1 });
+    const msg = try Message.parse(pkt);
+    var secs = msg.sections();
+    const ans = (try secs.nextAnswer()).?;
+    const https_rd = try secs.parseRData(ans);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("h3.cdn.example.org", try https_rd.HTTPS.target.str(&nbuf));
+    const glue = (try secs.nextAdditional()).?;
+    try std.testing.expect(try secs.nameEqualsAt(glue.name_pos, "h3.cdn.example.org"));
+    try secs.expectEnd();
+
+    // 3. SVCB 写完未压缩 target 后若因 params 超出缓冲区失败，压缩表登记必须一并原子回滚
+    var tight: [52]u8 = undefined;
+    var b_rollback = try Message.Builder.init(&tight);
+    const big_params = "\x00\x04\x00\x10" ++ "\xc0\x00\x02\x01\xc0\x00\x02\x02\xc0\x00\x02\x03\xc0\x00\x02\x04";
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        b_rollback.addSVCBRecord("a.example", 60, 1, "ghost.target.invalid", big_params),
+    );
+    try std.testing.expectEqual(@as(u8, 0), b_rollback.compression_count);
+    // 后续写入同名记录不得指向刚才已回滚废弃的字节，须完整展开写出
+    try b_rollback.addARecord("ghost.target.invalid", 60, .{ 1, 1, 1, 1 });
+    const rb_pkt = b_rollback.finish(.{ .id = 2, .qr = 1 });
+    const rb_parser = Parser.init(rb_pkt);
+    try std.testing.expectEqualStrings("ghost.target.invalid", try rb_parser.formatNameAt(12, &nbuf));
 }
 
 test "Message.findEdns and SectionParser handle QDCOUNT=0 Cookie probes, misplaced OPT, and trailing bytes" {
