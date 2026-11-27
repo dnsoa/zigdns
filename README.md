@@ -73,6 +73,7 @@ pub fn main() !void {
 
     // Finalize the packet
     const packet = builder.finish(header);
+    _ = packet;
 
     // Now send packet to a DNS server...
 }
@@ -205,7 +206,7 @@ if (try message.findEdns()) |edns| {
 }
 ```
 
-Or scan the additional section directly with `MessageParser.findEdns`:
+Or scan the additional section directly with `MessageParser.findEdns` (which scans on a copy without advancing `parser.pos`, so consume the additional section before calling `parser.expectEnd()`):
 
 ```zig
 var parser = dns.MessageParser.init(buffer);
@@ -216,6 +217,8 @@ if (try parser.findEdns(message.header.arcount)) |edns| {
     const params = try dns.Edns.fromOpt(edns.opt);
     std.debug.print("DO={}\n", .{params.dnssec_ok});
 }
+var add = parser.resourceRecords(message.header.arcount);
+while (try add.next()) |_| {}
 try parser.expectEnd();
 ```
 

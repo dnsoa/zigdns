@@ -2671,7 +2671,6 @@ test "Message.Builder writeNameRaw registers suffixes for subsequent glue compre
     try std.testing.expectEqual(@as(usize, 16), builder.pos - glue_a_start);
 
     // 2. HTTPS TargetName 自身不压缩（RFC 9460 §2.2），后续胶水 AAAA 记录 owner 同样压缩为 2 字节指针
-    try builder.setSection(.additional);
     var b_https = try Message.Builder.init(&buf);
     try b_https.addHTTPSRecord("example.com", 300, 1, "h3.cdn.example.org", "\x00\x03\x00\x02\x01\xbb");
     try b_https.setSection(.additional);
@@ -2691,8 +2690,10 @@ test "Message.Builder writeNameRaw registers suffixes for subsequent glue compre
     try std.testing.expect(try secs.nameEqualsAt(glue.name_pos, "h3.cdn.example.org"));
     try secs.expectEnd();
 
-    // 3. SVCB 写完未压缩 target 后若因 params 超出缓冲区失败，压缩表登记必须一并原子回滚
-    var tight: [52]u8 = undefined;
+    // 3. SVCB 写完未压缩 target 并入压缩表后若因 params 超出缓冲区失败，压缩表登记必须随快照一并回滚：
+    // Header(12) + owner "a.example"(11) + 固定头(10) + priority(2) + target "ghost.target.invalid"(22) = 57B <= 60B，
+    // 确保 writeNameRaw 已完成写入与登记，随后因 20B params (57+20=77 > 60) 触发回滚。
+    var tight: [60]u8 = undefined;
     var b_rollback = try Message.Builder.init(&tight);
     const big_params = "\x00\x04\x00\x10" ++ "\xc0\x00\x02\x01\xc0\x00\x02\x02\xc0\x00\x02\x03\xc0\x00\x02\x04";
     try std.testing.expectError(
@@ -2700,11 +2701,13 @@ test "Message.Builder writeNameRaw registers suffixes for subsequent glue compre
         b_rollback.addSVCBRecord("a.example", 60, 1, "ghost.target.invalid", big_params),
     );
     try std.testing.expectEqual(@as(u8, 0), b_rollback.compression_count);
-    // 后续写入同名记录不得指向刚才已回滚废弃的字节，须完整展开写出
+    // 后续写入同名记录不得指向刚才已回滚废弃的字节，owner 必须完整展开为 22 字节而非 2 字节指针
     try b_rollback.addARecord("ghost.target.invalid", 60, .{ 1, 1, 1, 1 });
     const rb_pkt = b_rollback.finish(.{ .id = 2, .qr = 1 });
-    const rb_parser = Parser.init(rb_pkt);
-    try std.testing.expectEqualStrings("ghost.target.invalid", try rb_parser.formatNameAt(12, &nbuf));
+    var rb_parser = Parser.init(rb_pkt);
+    const rb_rr = (try rb_parser.nextRR()).?;
+    try std.testing.expectEqual(@as(usize, 22), rb_rr.name_end_pos - rb_rr.name_pos);
+    try std.testing.expectEqualStrings("ghost.target.invalid", try rb_parser.formatNameAt(rb_rr.name_pos, &nbuf));
 }
 
 test "Message.findEdns and SectionParser handle QDCOUNT=0 Cookie probes, misplaced OPT, and trailing bytes" {

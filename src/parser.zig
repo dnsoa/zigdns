@@ -191,6 +191,9 @@ pub const MessageParser = struct {
     }
 
     /// 校验解析游标已精确抵达报文末尾，不存在未声明的尾随字节（防止走私记录或尾部垃圾）。
+    /// 注意：`findOptRecord` / `findECS` / `findCookie` / `findEdns` 均在副本上扫描（`*const MessageParser`），
+    /// 不会推进 `self.pos`；调用本方法前须先通过 `resourceRecords` / `skipResourceRecords` 消费完附加区，
+    /// 或直接使用会自动校验包尾的 `Message.findEdns()` / `SectionParser.expectEnd()`。
     pub fn expectEnd(self: *const MessageParser) Error!void {
         if (self.pos != self.buffer.len) return error.TrailingBytes;
     }
