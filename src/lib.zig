@@ -14,12 +14,16 @@ pub const Type = @import("types.zig").Type;
 pub const Class = @import("types.zig").Class;
 pub const Opcode = @import("types.zig").Opcode;
 pub const Rcode = @import("types.zig").Rcode;
+pub const ExtendedRcode = @import("types.zig").ExtendedRcode;
 pub const OptionCode = @import("types.zig").OptionCode;
+pub const SvcParamKey = @import("types.zig").SvcParamKey;
 pub const ECSData = @import("types.zig").ECSData;
 pub const CookieData = @import("types.zig").CookieData;
+pub const serialCompare = @import("types.zig").serialCompare;
 
 pub const Message = @import("message.zig").Message;
 pub const Section = @import("message.zig").Section;
+pub const SectionParser = @import("message.zig").SectionParser;
 pub const Edns = @import("message.zig").Edns;
 pub const MessageParser = @import("parser.zig").MessageParser;
 pub const ResourceData = @import("rdata.zig").RData;
@@ -48,9 +52,11 @@ pub const Question = @import("parser.zig").Question;
 pub const ResourceRecord = @import("parser.zig").ResourceRecord;
 
 // 导出 EDNS 选项解析：parseOptOptions 单趟取出全部已识别选项，
-// parseECS / parseCookie 是只要其中一项时的薄封装。
+// OptOptionIterator 零拷贝遍历全部原始 TLV，parseECS / parseCookie 是单项薄封装。
 pub const parseOptOptions = @import("rdata.zig").parseOptOptions;
 pub const OptOptions = @import("rdata.zig").OptOptions;
+pub const OptOption = @import("rdata.zig").OptOption;
+pub const OptOptionIterator = @import("rdata.zig").OptOptionIterator;
 pub const parseECS = @import("rdata.zig").parseECS;
 pub const parseCookie = @import("rdata.zig").parseCookie;
 

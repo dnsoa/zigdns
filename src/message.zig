@@ -3,12 +3,15 @@ const mem = std.mem;
 const Header = @import("header.zig").Header;
 const Type = @import("types.zig").Type;
 const OptionCode = @import("types.zig").OptionCode;
+const ExtendedRcode = @import("types.zig").ExtendedRcode;
 const ECSData = @import("types.zig").ECSData;
 const CookieData = @import("types.zig").CookieData;
 const Error = @import("errors.zig").Error;
+const Question = @import("parser.zig").Question;
 const ResourceRecord = @import("parser.zig").ResourceRecord;
-const parseECS = @import("rdata.zig").parseECS;
-const parseCookie = @import("rdata.zig").parseCookie;
+const Parser = @import("parser.zig").MessageParser;
+const RData = @import("rdata.zig").RData;
+const OptOptionIterator = @import("rdata.zig").OptOptionIterator;
 const validateSvcParams = @import("rdata.zig").validateSvcParams;
 const parseOptOptions = @import("rdata.zig").parseOptOptions;
 const decodePresentationName = @import("name.zig").decodePresentationName;
@@ -24,18 +27,70 @@ const MAX_NAME_LENGTH = 255;
 /// DNS 报文分区（RFC 1035 4.1）。构造时记录必须按此顺序添加。
 pub const Section = enum { question, answer, authority, additional };
 
-/// EDNS(0) OPT 记录参数（RFC 6891 / 7871）。
+/// EDNS(0) OPT 记录参数（RFC 6891 / 7871 / 7873 / 9824）。
 pub const Edns = struct {
     udp_payload_size: u16 = 1232, // 存于 OPT 记录的 CLASS 字段
     extended_rcode: u8 = 0, // 扩展 RCODE 高 8 位（存于 TTL[31:24]）
     version: u8 = 0, // EDNS 版本（存于 TTL[23:16]）
-    dnssec_ok: bool = false, // DO 标志（存于 TTL flags 最高位）
+    dnssec_ok: bool = false, // DO 标志（存于 TTL flags 最高位 0x8000）
+    z_flags: u15 = 0, // 其余 15 位 EDNS 标志（RFC 6891 §6.1.4 Z 位 / RFC 9824 CO=0x4000），默认置 0
     ecs: ?ECSData = null, // 若设置则写入 ECS 选项
     cookie: ?CookieData = null, // 若设置则写入 COOKIE 选项（RFC 7873）
+    extra_options: []const u8 = "", // 构造时追加在 ECS/COOKIE 之后的预编码 TLV（如 EDE/NSID/Padding）
+    options_raw: []const u8 = "", // 解析时保留完整原始 OPT RDATA 切片，供 optionsIterator 零拷贝遍历
+
+    /// RFC 6891 §6.2.3: 请求方声明的 UDP 载荷小于 512 字节时，必须按 512 字节对待。
+    pub fn effectiveUdpPayloadSize(self: Edns) u16 {
+        return @max(self.udp_payload_size, 512);
+    }
+
+    /// 合并 Header 低 4 位 RCODE 与 OPT 高 8 位 extended_rcode 为完整 12 位响应码（RFC 6891 §6.1.3）。
+    pub fn fullRcode(self: Edns, header: Header) ExtendedRcode {
+        return ExtendedRcode.fromParts(header.rcode, self.extended_rcode);
+    }
+
+    /// 将 12 位扩展响应码（如 BADVERS=16、BADCOOKIE=23）拆分写入 Header.rcode 与 Edns.extended_rcode。
+    pub fn setFullRcode(self: *Edns, header: *Header, rc: ExtendedRcode) void {
+        const parts = rc.split();
+        header.rcode = parts.header_rcode;
+        self.extended_rcode = parts.extended_rcode;
+    }
+
+    /// 遍历解析所得 OPT 记录中的全部原始 EDNS 选项 TLV（含 EDE/NSID/Padding 及未知选项）。
+    pub fn optionsIterator(self: Edns) OptOptionIterator {
+        return .{ .raw = self.options_raw };
+    }
+
+    /// 校验本 Edns 配置并返回编码整条 OPT 记录所需的线格式字节数（11 字节固定头 + RDATA）。
+    pub fn wireLen(self: Edns) Error!usize {
+        var rdlen: usize = 0;
+        if (self.ecs) |ecs| {
+            const max_prefix: u8 = switch (ecs.family) {
+                1 => 32,
+                2 => 128,
+                else => return Error.MalformedECS,
+            };
+            if (ecs.source_prefix > max_prefix or ecs.scope_prefix > max_prefix) return Error.MalformedECS;
+            const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
+            if (ecs.address.len < addr_len) return Error.MalformedECS;
+            rdlen += 8 + addr_len;
+        }
+        if (self.cookie) |cookie| {
+            if (cookie.server.len != 0 and (cookie.server.len < 8 or cookie.server.len > 32)) return Error.MalformedCookie;
+            rdlen += 12 + cookie.server.len;
+        }
+        if (self.extra_options.len > 0) {
+            const extra = try parseOptOptions(self.extra_options);
+            if (self.ecs != null and extra.ecs != null) return Error.MalformedECS;
+            rdlen += self.extra_options.len;
+        }
+        if (rdlen > 0xFFFF) return Error.MessageTooLong;
+        return 11 + rdlen;
+    }
 
     /// 从已解析的 OPT 记录解码 EDNS 参数（RFC 6891 §6.1.3）。
     /// CLASS 字段承载 UDP 载荷大小；TTL 承载 扩展 RCODE 高 8 位 / 版本 / flags。
-    /// RDATA 中若含 ECS / COOKIE 选项则一并解出（RFC 7871 / 7873）。
+    /// RDATA 中若含 ECS / COOKIE 选项则一并解出（RFC 7871 / 7873），并保留完整 options_raw。
     pub fn fromOpt(rr: ResourceRecord) !Edns {
         if (rr.rtype != .OPT) return Error.InvalidType;
         // RFC 6891 §6.1.2: OPT 的 owner name 必须为未压缩单字节根（0x00，线格式长度恰为 1）。
@@ -46,10 +101,88 @@ pub const Edns = struct {
             .extended_rcode = @truncate(rr.ttl >> 24),
             .version = @truncate(rr.ttl >> 16),
             .dnssec_ok = (rr.ttl & 0x8000) != 0,
+            .z_flags = @truncate(rr.ttl & 0x7FFF),
             // 选项只遍历一趟：ECS 与 Cookie 同时取出。
             .ecs = options.ecs,
             .cookie = options.cookie,
+            .options_raw = rr.rdata,
         };
+    }
+};
+
+/// 绑定 Header 四分区计数的严格顺序报文解析器（RFC 1035 §4.1 / RFC 6891 §6.1.1）：
+/// - 按 QDCOUNT/ANCOUNT/NSCOUNT/ARCOUNT 精确控制边界（QDCOUNT=0 时 nextQuestion 直接返回 null，防误把 OPT 当 Question）；
+/// - 拒绝混入 Answer / Authority 区的 OPT 记录（error.MisplacedOptRecord）；
+/// - 校验附加区至多一条单字节根 OPT 记录；
+/// - `expectEnd()` 校验四分区全部消费完毕且报文末尾无残留字节（error.TrailingBytes）。
+pub const SectionParser = struct {
+    parser: Parser,
+    qd_rem: u16,
+    an_rem: u16,
+    ns_rem: u16,
+    ar_rem: u16,
+    seen_opt: bool = false,
+
+    pub fn nextQuestion(self: *SectionParser) Error!?Question {
+        if (self.qd_rem == 0) return null;
+        const q = (try self.parser.nextQuestion()) orelse return error.PacketTooShort;
+        self.qd_rem -= 1;
+        return q;
+    }
+
+    pub fn nextAnswer(self: *SectionParser) Error!?ResourceRecord {
+        if (self.qd_rem != 0) return error.InvalidRecordOrder;
+        if (self.an_rem == 0) return null;
+        const rr = (try self.parser.nextRR()) orelse return error.PacketTooShort;
+        if (rr.rtype == .OPT) return error.MisplacedOptRecord;
+        self.an_rem -= 1;
+        return rr;
+    }
+
+    pub fn nextAuthority(self: *SectionParser) Error!?ResourceRecord {
+        if (self.qd_rem != 0 or self.an_rem != 0) return error.InvalidRecordOrder;
+        if (self.ns_rem == 0) return null;
+        const rr = (try self.parser.nextRR()) orelse return error.PacketTooShort;
+        if (rr.rtype == .OPT) return error.MisplacedOptRecord;
+        self.ns_rem -= 1;
+        return rr;
+    }
+
+    pub fn nextAdditional(self: *SectionParser) Error!?ResourceRecord {
+        if (self.qd_rem != 0 or self.an_rem != 0 or self.ns_rem != 0) return error.InvalidRecordOrder;
+        if (self.ar_rem == 0) return null;
+        const rr = (try self.parser.nextRR()) orelse return error.PacketTooShort;
+        if (rr.rtype == .OPT) {
+            if (self.seen_opt) return error.MultipleOptRecords;
+            if (rr.name_pos >= self.parser.buffer.len or self.parser.buffer[rr.name_pos] != 0) {
+                return error.MalformedName;
+            }
+            _ = try parseOptOptions(rr.rdata);
+            self.seen_opt = true;
+        }
+        self.ar_rem -= 1;
+        return rr;
+    }
+
+    pub fn parseRData(self: *const SectionParser, rr: ResourceRecord) Error!RData {
+        return self.parser.parseRData(rr);
+    }
+
+    pub fn formatNameAt(self: *const SectionParser, offset: usize, out_buf: []u8) Error![]const u8 {
+        return self.parser.formatNameAt(offset, out_buf);
+    }
+
+    pub fn nameEqualsAt(self: *const SectionParser, offset: usize, expected: []const u8) Error!bool {
+        return self.parser.nameEqualsAt(offset, expected);
+    }
+
+    /// 校验四个分区声明的记录均已按序消费完毕（未读完前置记录时返回 `error.InvalidRecordOrder`），
+    /// 且报文末尾不存在未声明的残留字节（若有则返回 `error.TrailingBytes`）。
+    pub fn expectEnd(self: *const SectionParser) Error!void {
+        if (self.qd_rem != 0 or self.an_rem != 0 or self.ns_rem != 0 or self.ar_rem != 0) {
+            return error.InvalidRecordOrder;
+        }
+        return self.parser.expectEnd();
     }
 };
 
@@ -88,6 +221,38 @@ pub const Message = struct {
         return .{ .message = try Message.parse(raw[2..frame_len]), .frame_len = frame_len };
     }
 
+    /// 返回绑定本报文 Header 计数的严格四分区解析器。
+    pub fn sections(self: Message) SectionParser {
+        return .{
+            .parser = Parser.init(self.buffer),
+            .qd_rem = self.header.qdcount,
+            .an_rem = self.header.ancount,
+            .ns_rem = self.header.nscount,
+            .ar_rem = self.header.arcount,
+        };
+    }
+
+    /// 整包严格 EDNS(0) 解析与结构校验（RFC 1035 §4.1 / RFC 6891 §6.1.1）：
+    /// 单趟校验 Question、Answer/Authority（拒绝非附加区 OPT -> error.MisplacedOptRecord）、
+    /// Additional（至多一条根 OPT 且 TLV 平铺）以及精确包尾（拒绝残尾字节 -> error.TrailingBytes）。
+    pub fn findEdns(self: Message) Error!?Edns {
+        var parser = Parser.init(self.buffer);
+        try parser.skipQuestions(self.header.qdcount);
+        try parser.skipNonAdditionalRecords(@as(usize, self.header.ancount) + self.header.nscount);
+        var found: ?Edns = null;
+        var rem: usize = self.header.arcount;
+        while (rem > 0) : (rem -= 1) {
+            const rr = (try parser.nextRR()) orelse return error.PacketTooShort;
+            if (rr.rtype == .OPT) {
+                if (found != null) return error.MultipleOptRecords;
+                if (rr.name_pos >= self.buffer.len or self.buffer[rr.name_pos] != 0) return error.MalformedName;
+                found = try Edns.fromOpt(rr);
+            }
+        }
+        try parser.expectEnd();
+        return found;
+    }
+
     /// 高性能响应构造器
     pub const Builder = struct {
         const BUCKET_COUNT = 64;
@@ -111,6 +276,9 @@ pub const Message = struct {
         compression_count: u8,
         section: Section, // 当前分区，用于自动计数
         opt_added: bool, // RFC 6891 §6.1.1: 一个报文至多一个 OPT 记录
+        implicit_opt_section: bool, // addOptRecord 隐式跳到 .additional 后的保护锁，防后续误写回答变 NODATA
+        reserved_edns: ?Edns, // setEdns 预留待 finish 自动落盘到附加区末尾的 OPT 配置（支持 TC=1 截断保留 OPT）
+        reserved_bytes: usize, // 为 reserved_edns 预留的尾部字节数
         qd: u16,
         an: u16,
         ns: u16,
@@ -139,8 +307,11 @@ pub const Message = struct {
                 .compression_table = undefined,
                 .compression_buckets = undefined,
                 .compression_count = 0,
-                .section = .answer, // RR 默认写入回答区
+                .section = .question, // 初始位于 question；首次写数据 RR 自动推进到 .answer
                 .opt_added = false,
+                .implicit_opt_section = false,
+                .reserved_edns = null,
+                .reserved_bytes = 0,
                 .qd = 0,
                 .an = 0,
                 .ns = 0,
@@ -148,7 +319,15 @@ pub const Message = struct {
             };
         }
 
-        const Snapshot = struct { pos: usize, compression_count: u8, section: Section, opt_added: bool };
+        const Snapshot = struct {
+            pos: usize,
+            compression_count: u8,
+            section: Section,
+            opt_added: bool,
+            implicit_opt_section: bool,
+            reserved_edns: ?Edns,
+            reserved_bytes: usize,
+        };
 
         fn snapshot(self: *const Builder) Snapshot {
             return .{
@@ -156,6 +335,9 @@ pub const Message = struct {
                 .compression_count = self.compression_count,
                 .section = self.section,
                 .opt_added = self.opt_added,
+                .implicit_opt_section = self.implicit_opt_section,
+                .reserved_edns = self.reserved_edns,
+                .reserved_bytes = self.reserved_bytes,
             };
         }
 
@@ -173,13 +355,22 @@ pub const Message = struct {
             self.pos = s.pos;
             self.section = s.section;
             self.opt_added = s.opt_added;
+            self.implicit_opt_section = s.implicit_opt_section;
+            self.reserved_edns = s.reserved_edns;
+            self.reserved_bytes = s.reserved_bytes;
         }
 
-        /// 切换当前分区（后续 RR 计入 authority/additional）。分区只能向后推进；
+        /// 切换当前分区（后续 RR 计入 answer/authority/additional）。分区只能向后推进；
         /// 回退返回 error.InvalidRecordOrder（调用方误用，不做 UB）。
         pub fn setSection(self: *Builder, s: Section) !void {
             if (@backingInt(s) < @backingInt(self.section)) return Error.InvalidRecordOrder;
             self.section = s;
+            if (s == .additional) self.implicit_opt_section = false;
+        }
+
+        fn beginDataRecord(self: *Builder) Error!void {
+            if (self.implicit_opt_section) return Error.InvalidRecordOrder;
+            if (self.section == .question) self.section = .answer;
         }
 
         /// 校验 buf[pos..] 处已写入的线格式域名是否等于未转义点分名 canonical。
@@ -225,17 +416,19 @@ pub const Message = struct {
         }
 
         fn ensureCapacity(self: *Builder, need: usize) !void {
-            if (need > self.buf.len -| self.pos) return Error.BufferTooSmall;
+            const limit = self.buf.len -| self.reserved_bytes;
+            if (need > limit -| self.pos) return Error.BufferTooSmall;
         }
 
         fn validateOptRdata(rdata: []const u8) Error!void {
-            _ = parseOptOptions(rdata) catch |err| return if (err == error.PacketTooShort) Error.InvalidRData else err;
+            _ = try parseOptOptions(rdata);
         }
 
         /// 写入 A 记录
         pub fn addARecord(self: *Builder, name: []const u8, ttl: u32, ip: [4]u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.A));
             try self.writeU16(1); // Class IN
@@ -251,6 +444,7 @@ pub const Message = struct {
         pub fn addAAAARecord(self: *Builder, name: []const u8, ttl: u32, ip: [16]u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.AAAA));
             try self.writeU16(1); // Class IN
@@ -266,6 +460,7 @@ pub const Message = struct {
         pub fn addCNAMERecord(self: *Builder, name: []const u8, ttl: u32, cname: []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.CNAME));
             try self.writeU16(1); // Class IN
@@ -282,6 +477,7 @@ pub const Message = struct {
         pub fn addMXRecord(self: *Builder, name: []const u8, ttl: u32, preference: u16, exchange: []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.MX));
             try self.writeU16(1); // Class IN
@@ -299,6 +495,7 @@ pub const Message = struct {
         pub fn addNSRecord(self: *Builder, name: []const u8, ttl: u32, nsdname: []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.NS));
             try self.writeU16(1); // Class IN
@@ -315,6 +512,7 @@ pub const Message = struct {
         pub fn addPTRRecord(self: *Builder, name: []const u8, ttl: u32, ptrdname: []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.PTR));
             try self.writeU16(1); // Class IN
@@ -342,6 +540,7 @@ pub const Message = struct {
         pub fn addTXTRecord(self: *Builder, name: []const u8, ttl: u32, txt: []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.TXT));
             try self.writeU16(1); // Class IN
@@ -368,6 +567,7 @@ pub const Message = struct {
         pub fn addTXTRecordStrings(self: *Builder, name: []const u8, ttl: u32, strings: []const []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.TXT));
             try self.writeU16(1); // Class IN
@@ -400,6 +600,7 @@ pub const Message = struct {
         ) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.SOA));
             try self.writeU16(1); // Class IN
@@ -430,6 +631,7 @@ pub const Message = struct {
         ) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.SRV));
             try self.writeU16(1); // Class IN
@@ -457,10 +659,12 @@ pub const Message = struct {
             errdefer self.restore(snap);
             if (rtype == @backingInt(Type.OPT)) {
                 if (self.opt_added) return Error.MultipleOptRecords;
-                if (self.section != .additional) return Error.InvalidRecordOrder;
+                if (self.section != .additional or self.implicit_opt_section) return Error.InvalidRecordOrder;
                 if (name.len != 0 and !mem.eql(u8, name, ".")) return Error.MalformedName;
                 try validateOptRdata(rdata);
                 self.opt_added = true;
+            } else {
+                try self.beginDataRecord();
             }
             try self.writeName(name);
             try self.writeU16(rtype);
@@ -482,6 +686,7 @@ pub const Message = struct {
             }
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.CAA));
             try self.writeU16(1); // Class IN
@@ -510,9 +715,10 @@ pub const Message = struct {
         }
 
         fn addSvcbLike(self: *Builder, rtype: Type, name: []const u8, ttl: u32, priority: u16, target: []const u8, params: []const u8) !void {
-            try validateSvcParams(params); // RFC 9460 §2.2: key 须严格递增去重、TLV 平铺
+            try validateSvcParams(params); // RFC 9460 §2.2 / §7: key 严格递增去重、TLV 平铺且知名值格式合法
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(rtype));
             try self.writeU16(1); // Class IN
@@ -566,6 +772,7 @@ pub const Message = struct {
         pub fn addDNSKEYRecord(self: *Builder, name: []const u8, ttl: u32, flags: u16, protocol: u8, algorithm: u8, public_key: []const u8) !void {
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.DNSKEY));
             try self.writeU16(1);
@@ -582,10 +789,12 @@ pub const Message = struct {
             self.countRecord();
         }
 
-        /// 写入 DS 记录（RFC 4034）。
+        /// 写入 DS 记录（RFC 4034）。digest 不可为空。
         pub fn addDSRecord(self: *Builder, name: []const u8, ttl: u32, key_tag: u16, algorithm: u8, digest_type: u8, digest: []const u8) !void {
+            if (digest.len == 0) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.DS));
             try self.writeU16(1);
@@ -614,10 +823,12 @@ pub const Message = struct {
             signature: []const u8,
         };
 
-        /// 写入 RRSIG 记录（RFC 4034）。signer name 不压缩；signature 原样写入。
+        /// 写入 RRSIG 记录（RFC 4034）。signer name 不压缩；labels ≤ 127 且 signature 非空。
         pub fn addRRSIGRecord(self: *Builder, name: []const u8, ttl: u32, sig: Rrsig) !void {
+            if (sig.labels > 127 or sig.signature.len == 0) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.RRSIG));
             try self.writeU16(1);
@@ -645,6 +856,7 @@ pub const Message = struct {
             if (types.len == 0) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.NSEC));
             try self.writeU16(1);
@@ -663,6 +875,7 @@ pub const Message = struct {
             if (salt.len > 255) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.NSEC3PARAM));
             try self.writeU16(1);
@@ -687,13 +900,14 @@ pub const Message = struct {
             types: []const u16, // 升序去重
         };
 
-        /// 写入 NSEC3 记录（RFC 5155）。salt 与 next_hashed_owner 均须 ≤255 字节；types 须升序。
+        /// 写入 NSEC3 记录（RFC 5155）。salt ≤255 字节，next_hashed_owner 须 1..255 字节；types 须升序。
         pub fn addNSEC3Record(self: *Builder, name: []const u8, ttl: u32, n3: Nsec3) !void {
-            if (n3.salt.len > 255 or n3.next_hashed_owner.len > 255) return Error.InvalidRData;
+            if (n3.salt.len > 255 or n3.next_hashed_owner.len == 0 or n3.next_hashed_owner.len > 255) return Error.InvalidRData;
             // RFC 5155: SHA-1（算法 1）哈希固定 20 字节——与解析端一致，避免构造出解析器会拒的记录。
             if (n3.hash_algorithm == 1 and n3.next_hashed_owner.len != 20) return Error.InvalidRData;
             const snap = self.snapshot();
             errdefer self.restore(snap);
+            try self.beginDataRecord();
             try self.writeName(name);
             try self.writeU16(@backingInt(Type.NSEC3));
             try self.writeU16(1);
@@ -717,9 +931,11 @@ pub const Message = struct {
             self.countRecord();
         }
 
-        /// 写入 Question（必须先于所有 RR 添加）
+        /// 写入 Question（必须先于所有 RR 及非 question 分区设置）
         pub fn addQuestion(self: *Builder, qname: []const u8, qtype: Type, qclass: u16) !void {
-            if (self.an != 0 or self.ns != 0 or self.ar != 0) return Error.InvalidRecordOrder;
+            if (self.section != .question or self.an != 0 or self.ns != 0 or self.ar != 0) {
+                return Error.InvalidRecordOrder;
+            }
             const snap = self.snapshot();
             errdefer self.restore(snap);
             try self.writeName(qname);
@@ -728,31 +944,102 @@ pub const Message = struct {
             self.qd += 1;
         }
 
-        /// 写入 EDNS(0) OPT 记录（RFC 6891）。自动置于附加区（additional）。
-        /// 若 edns.ecs 非空，附带 ECS 选项（RFC 7871）。
-        /// RFC 6891 §6.1.1: 一个报文至多一个 OPT；第二次调用返回
-        /// error.MultipleOptRecords 且完全回滚（pos / 计数 / 分区均不变）。
+        /// 预留 EDNS(0) OPT 尾部空间并在 finish/finishTcp 时自动写入附加区末尾（RFC 6891 §6.1.1 / §7）。
+        /// - 不改变当前分区：可在写 Question/Answer/Authority 前后任意时刻调用，不会导致后续回答误入附加区；
+        /// - 截断安全：当回答区写满返回 `error.BufferTooSmall` 并置 `TC=1` 时，已预留的 OPT 空间不受侵占，
+        ///   收尾时仍能按 RFC 6891 §7 在截断响应中完整发出 OPT 记录。
+        pub fn setEdns(self: *Builder, edns: Edns) !void {
+            if (self.opt_added) return Error.MultipleOptRecords;
+            const opt_len = try edns.wireLen();
+            try self.ensureCapacity(opt_len);
+            self.opt_added = true;
+            self.reserved_edns = edns;
+            self.reserved_bytes = opt_len;
+        }
+
+        /// 更新由 `setEdns` 预留但尚未 finish 落盘的 EDNS 参数（如查询后回填 ECS scope_prefix 或 BADCOOKIE）。
+        pub fn updateEdns(self: *Builder, edns: Edns) !void {
+            if (self.reserved_edns == null) return Error.InvalidRecordOrder;
+            const opt_len = try edns.wireLen();
+            if (opt_len > self.buf.len -| self.pos) return Error.BufferTooSmall;
+            self.reserved_edns = edns;
+            self.reserved_bytes = opt_len;
+        }
+
+        fn writeOptRecordUnchecked(self: *Builder, edns: Edns) void {
+            self.buf[self.pos] = 0; // OPT 的 owner name 必须为单字节根
+            self.pos += 1;
+            mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(Type.OPT), .big);
+            self.pos += 2;
+            mem.writeInt(u16, self.buf[self.pos..][0..2], edns.udp_payload_size, .big);
+            self.pos += 2;
+            const flags: u32 = (if (edns.dnssec_ok) @as(u32, 0x8000) else 0) | @as(u32, edns.z_flags);
+            const ttl = (@as(u32, edns.extended_rcode) << 24) |
+                (@as(u32, edns.version) << 16) | flags;
+            mem.writeInt(u32, self.buf[self.pos..][0..4], ttl, .big);
+            self.pos += 4;
+
+            const rdlen_pos = self.pos;
+            self.pos += 2; // 占位 RDLength
+            if (edns.ecs) |ecs| {
+                const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
+                mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(OptionCode.ECS), .big);
+                mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], @intCast(4 + addr_len), .big);
+                mem.writeInt(u16, self.buf[self.pos + 4 ..][0..2], ecs.family, .big);
+                self.buf[self.pos + 6] = ecs.source_prefix;
+                self.buf[self.pos + 7] = ecs.scope_prefix;
+                self.pos += 8;
+                @memcpy(self.buf[self.pos..][0..addr_len], ecs.address[0..addr_len]);
+                if (addr_len > 0) {
+                    const rem: u3 = @intCast(ecs.source_prefix % 8);
+                    if (rem != 0) self.buf[self.pos + addr_len - 1] &= @as(u8, 0xFF) << @intCast(8 - @as(u4, rem));
+                }
+                self.pos += addr_len;
+            }
+            if (edns.cookie) |cookie| {
+                const opt_len = 8 + cookie.server.len;
+                mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(OptionCode.COOKIE), .big);
+                mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], @intCast(opt_len), .big);
+                self.pos += 4;
+                @memcpy(self.buf[self.pos..][0..8], &cookie.client);
+                self.pos += 8;
+                @memcpy(self.buf[self.pos..][0..cookie.server.len], cookie.server);
+                self.pos += cookie.server.len;
+            }
+            if (edns.extra_options.len > 0) {
+                @memcpy(self.buf[self.pos..][0..edns.extra_options.len], edns.extra_options);
+                self.pos += edns.extra_options.len;
+            }
+            const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
+            mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+        }
+
+        fn flushReservedEdns(self: *Builder) void {
+            if (self.reserved_edns) |edns| {
+                self.reserved_edns = null;
+                self.reserved_bytes = 0;
+                self.section = .additional;
+                self.implicit_opt_section = false;
+                self.writeOptRecordUnchecked(edns);
+                self.ar += 1;
+            }
+        }
+
+        /// 立即在附加区（additional）写入 EDNS(0) OPT 记录（RFC 6891）。
+        /// 若调用前未显式 `setSection(.additional)`，后续若未显式声明附加区而继续调用 `add*Record`
+        /// 将返回 `error.InvalidRecordOrder`，防止误把回答记录写进附加区造成静默 NODATA；
+        /// 服务端推荐优先使用不改变分区的 `setEdns`。
         pub fn addOptRecord(self: *Builder, edns: Edns) !void {
             const snap = self.snapshot(); // 先快照（含 section），失败可完全回滚
             errdefer self.restore(snap);
             if (self.opt_added) return Error.MultipleOptRecords;
+            const opt_len = try edns.wireLen();
+            try self.ensureCapacity(opt_len);
+            const explicit_additional = (self.section == .additional) and !self.implicit_opt_section;
             self.opt_added = true;
             try self.setSection(.additional);
-
-            try self.writeU8(0); // OPT 的 owner name 必须为根
-            try self.writeU16(@backingInt(Type.OPT));
-            try self.writeU16(edns.udp_payload_size); // CLASS = 请求方 UDP 载荷大小
-            const flags: u32 = if (edns.dnssec_ok) 0x8000 else 0;
-            const ttl = (@as(u32, edns.extended_rcode) << 24) |
-                (@as(u32, edns.version) << 16) | flags;
-            try self.writeU32(ttl);
-
-            const rdlen_pos = self.pos;
-            try self.writeU16(0); // 占位 RDLength
-            if (edns.ecs) |ecs| try self.writeEcsOption(ecs);
-            if (edns.cookie) |cookie| try self.writeCookieOption(cookie);
-            const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
-            mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            self.implicit_opt_section = !explicit_additional;
+            self.writeOptRecordUnchecked(edns);
             self.countRecord();
         }
 
@@ -764,8 +1051,10 @@ pub const Message = struct {
             errdefer self.restore(snap);
             if (self.opt_added) return Error.MultipleOptRecords;
             try validateOptRdata(options);
+            const explicit_additional = (self.section == .additional) and !self.implicit_opt_section;
             self.opt_added = true;
             try self.setSection(.additional);
+            self.implicit_opt_section = !explicit_additional;
 
             try self.writeU8(0);
             try self.writeU16(@backingInt(Type.OPT));
@@ -776,45 +1065,6 @@ pub const Message = struct {
             @memcpy(self.buf[self.pos..][0..options.len], options);
             self.pos += options.len;
             self.countRecord();
-        }
-
-        /// 写入 ECS 选项 TLV（RFC 7871）。按 family/prefix 校验地址长度。
-        fn writeEcsOption(self: *Builder, ecs: ECSData) !void {
-            const max_prefix: u8 = switch (ecs.family) {
-                1 => 32, // IPv4
-                2 => 128, // IPv6
-                else => return Error.MalformedECS,
-            };
-            if (ecs.source_prefix > max_prefix or ecs.scope_prefix > max_prefix) return Error.MalformedECS;
-            const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
-            if (ecs.address.len < addr_len) return Error.MalformedECS;
-
-            try self.writeU16(@backingInt(OptionCode.ECS));
-            try self.writeU16(@intCast(4 + addr_len)); // OPTION-LENGTH
-            try self.writeU16(ecs.family);
-            try self.writeU8(ecs.source_prefix);
-            try self.writeU8(ecs.scope_prefix);
-            try self.ensureCapacity(addr_len);
-            @memcpy(self.buf[self.pos..][0..addr_len], ecs.address[0..addr_len]);
-            // RFC 7871 §7.1.3: 超出 source_prefix 的地址位必须为 0（MUST）。
-            if (addr_len > 0) {
-                const rem: u3 = @intCast(ecs.source_prefix % 8);
-                if (rem != 0) self.buf[self.pos + addr_len - 1] &= @as(u8, 0xFF) << @intCast(8 - @as(u4, rem));
-            }
-            self.pos += addr_len;
-        }
-
-        /// 写入 COOKIE 选项 TLV（RFC 7873）。server cookie 须为空或 8..32 字节。
-        fn writeCookieOption(self: *Builder, cookie: CookieData) !void {
-            if (cookie.server.len != 0 and (cookie.server.len < 8 or cookie.server.len > 32)) return Error.MalformedCookie;
-            const opt_len = 8 + cookie.server.len;
-            try self.writeU16(@backingInt(OptionCode.COOKIE));
-            try self.writeU16(@intCast(opt_len)); // OPTION-LENGTH
-            try self.ensureCapacity(opt_len);
-            @memcpy(self.buf[self.pos..][0..8], &cookie.client);
-            self.pos += 8;
-            @memcpy(self.buf[self.pos..][0..cookie.server.len], cookie.server);
-            self.pos += cookie.server.len;
         }
 
         /// 校验未转义点分名（已去尾点）：单趟检查标签长度 1..63 与总长 ≤255（含根）。
@@ -984,7 +1234,10 @@ pub const Message = struct {
             self.registerPlainSuffixes(canonical, null, start, canonical.len);
         }
 
-        /// 写入完整展开、不压缩的域名（用于 RFC 2782 / 4034 / 9460 规定不得压缩的域名字段，及转义域名）。
+        /// 写入完整展开、不压缩的域名（用于 SRV target、SVCB/HTTPS TargetName、RRSIG signer、
+        /// NSEC next_domain 等 RFC 2782 / 4034 / 9460 规定不得压缩的域名字段，以及转义域名）。
+        /// 无转义路径在展开写出后同样把后缀登记到压缩表，供后续附加区胶水记录（A/AAAA）或后续 owner 压缩复用；
+        /// 含 `\` 转义的慢路径与 `writeName` 对齐，不入压缩表。
         fn writeNameRaw(self: *Builder, name: []const u8) !void {
             if (name.len == 0 or mem.eql(u8, name, ".")) {
                 try self.ensureCapacity(1);
@@ -995,10 +1248,13 @@ pub const Message = struct {
             if (mem.indexOfScalar(u8, name, '\\') == null) {
                 const canonical = if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
                 try validatePlainCanonical(canonical);
+                const start = self.pos;
                 try self.ensureCapacity(canonical.len + 2);
                 self.writePlainLabelsUnchecked(canonical);
                 self.buf[self.pos] = 0;
                 self.pos += 1;
+                // 该字段自身按 RFC 完整展开，但其已写出的后缀可供后续附加区胶水记录（A/AAAA）压缩指向。
+                self.registerPlainSuffixes(canonical, null, start, canonical.len);
                 return;
             }
             var wire: [MAX_NAME_LENGTH]u8 = undefined;
@@ -1027,8 +1283,9 @@ pub const Message = struct {
             self.pos += 4;
         }
 
-        /// 收尾：自动回填 header 的四个分区计数（防止 desync），返回 DNS 报文。
+        /// 收尾：若存在 `setEdns` 预留的 OPT 记录则自动落盘到附加区末尾，并自动回填四个分区计数。
         pub fn finish(self: *Builder, header: Header) []u8 {
+            self.flushReservedEdns();
             var h = header;
             h.qdcount = self.qd;
             h.ancount = self.an;
@@ -1037,8 +1294,9 @@ pub const Message = struct {
             return self.finishRaw(h);
         }
 
-        /// 收尾但原样使用调用方 header 的计数（不自动回填）。
+        /// 收尾但原样使用调用方 header 的计数（若有 `setEdns` 预留 OPT 仍落盘字节）。
         pub fn finishRaw(self: *Builder, header: Header) []u8 {
+            self.flushReservedEdns();
             const h_bytes = header.encode();
             @memcpy(self.buf[0..12], &h_bytes);
             return self.buf[0..self.pos];
@@ -2326,4 +2584,170 @@ test "Message.Builder restores bucket index cleanly after failed add above thres
     const parser = MessageParser.init(pkt);
     var out: [256]u8 = undefined;
     try std.testing.expectEqualStrings("h9.z9.example", try parser.formatNameAt(reuse_pos, &out));
+}
+
+test "Message.Builder setEdns preserves OPT across TC=1 truncation and prevents silent NODATA (RFC 6891 §7)" {
+    // 缓冲区 56 字节：Header(12) + Question(17) + 预留裸 OPT(11) = 40，仅够再放 1 条压缩 A 记录(+16 -> 56)
+    var buf: [56]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    try builder.setSection(.question); // 新建 Builder 允许显式 setSection(.question)
+    try builder.addQuestion("example.com", .A, 1);
+
+    // 提前预留 EDNS（含 CO 标志 0x4000 与小载荷 256），不改变当前分区
+    var edns_cfg = Edns{ .udp_payload_size = 256, .z_flags = 0x4000 };
+    try std.testing.expectEqual(@as(u16, 512), edns_cfg.effectiveUdpPayloadSize());
+    try builder.setEdns(edns_cfg);
+
+    // 第一条 A 自动进入 Answer 区，第二条因预留了 11B OPT 空间而触发 BufferTooSmall
+    try builder.addARecord("example.com", 60, .{ 192, 0, 2, 1 });
+    try std.testing.expectError(error.BufferTooSmall, builder.addARecord("example.com", 60, .{ 192, 0, 2, 2 }));
+
+    var hdr = Header{ .id = 0x42, .qr = 1, .aa = 1, .tc = 1 };
+    edns_cfg.setFullRcode(&hdr, .BADCOOKIE);
+    try builder.updateEdns(edns_cfg);
+
+    const pkt = builder.finish(hdr);
+    try std.testing.expectEqual(@as(usize, 56), pkt.len);
+
+    const parsed = try Message.parse(pkt);
+    try std.testing.expectEqual(@as(u1, 1), parsed.header.tc);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.ancount);
+    try std.testing.expectEqual(@as(u16, 1), parsed.header.arcount);
+
+    const decoded_edns = (try parsed.findEdns()).?;
+    try std.testing.expectEqual(ExtendedRcode.BADCOOKIE, decoded_edns.fullRcode(parsed.header));
+    try std.testing.expectEqual(@as(u15, 0x4000), decoded_edns.z_flags);
+    try std.testing.expectEqual(@as(u16, 512), decoded_edns.effectiveUdpPayloadSize());
+
+    // 直接走 addOptRecord 隐式跳到 additional 后若未 setSection(.additional) 继续写 A 记录须报错防静默 NODATA
+    var buf2: [128]u8 = undefined;
+    var b2 = try Message.Builder.init(&buf2);
+    try b2.addQuestion("example.com", .A, 1);
+    try b2.addOptRecord(.{});
+    try std.testing.expectError(error.InvalidRecordOrder, b2.addARecord("example.com", 60, .{ 1, 2, 3, 4 }));
+    // 显式确认处于 .additional 后允许继续添加附加区记录（如 TSIG）
+    try b2.setSection(.additional);
+    try b2.addARecord("ns1.example.com", 60, .{ 1, 2, 3, 4 });
+
+    // 先切到 .authority 再调 addQuestion 须被拒绝
+    var b3 = try Message.Builder.init(&buf2);
+    try b3.setSection(.authority);
+    try std.testing.expectError(error.InvalidRecordOrder, b3.addQuestion("example.com", .A, 1));
+
+    // addOptRecordRaw 同样触发隐式附加区保护锁，显式 setSection(.additional) 后解锁
+    var b4 = try Message.Builder.init(&buf2);
+    try b4.addQuestion("example.com", .A, 1);
+    try b4.addOptRecordRaw(1232, 0, "");
+    try std.testing.expectError(error.InvalidRecordOrder, b4.addARecord("example.com", 60, .{ 1, 2, 3, 4 }));
+    try b4.setSection(.additional);
+    try b4.addRecordRaw("example.com", @backingInt(Type.TSIG), @backingInt(@import("types.zig").Class.ANY), 0, "\x01\x02");
+
+    // setEdns 配合 initTcp / finishTcp 在 TCP 帧末尾自动落盘 OPT 且可由 parseTcp + findEdns 往返解析
+    var tcp_buf: [128]u8 = undefined;
+    var tb = try Message.Builder.initTcp(&tcp_buf);
+    try tb.addQuestion("example.com", .A, 1);
+    try tb.setEdns(.{ .udp_payload_size = 4096, .dnssec_ok = true });
+    try tb.addARecord("example.com", 300, .{ 93, 184, 216, 34 });
+    const tcp_frame = try tb.finishTcp(.{ .id = 0x99, .qr = 1, .aa = 1 });
+    const tcp_msg = try Message.parseTcp(tcp_frame);
+    try std.testing.expectEqual(@as(u16, 1), tcp_msg.header.qdcount);
+    try std.testing.expectEqual(@as(u16, 1), tcp_msg.header.ancount);
+    try std.testing.expectEqual(@as(u16, 1), tcp_msg.header.arcount);
+    const tcp_edns = (try tcp_msg.findEdns()).?;
+    try std.testing.expectEqual(@as(u16, 4096), tcp_edns.udp_payload_size);
+    try std.testing.expect(tcp_edns.dnssec_ok);
+}
+
+test "Message.Builder writeNameRaw registers suffixes for subsequent glue compression and rolls back cleanly" {
+    // 1. SRV target 自身不压缩（RFC 2782），但紧随其后的附加区胶水 A 记录 owner 压缩为 2 字节指针
+    var buf: [256]u8 = undefined;
+    var builder = try Message.Builder.init(&buf);
+    try builder.addSRVRecord("_sip._tcp.example.com", 300, 10, 20, 5060, "sip1.svc.example.net");
+    try builder.setSection(.additional);
+    const glue_a_start = builder.pos;
+    try builder.addARecord("sip1.svc.example.net", 300, .{ 192, 0, 2, 10 });
+    // 胶水 A 记录总长应为 2(压缩指针) + 10(固定头) + 4(IPv4) = 16 字节
+    try std.testing.expectEqual(@as(usize, 16), builder.pos - glue_a_start);
+
+    // 2. HTTPS TargetName 自身不压缩（RFC 9460 §2.2），后续胶水 AAAA 记录 owner 同样压缩为 2 字节指针
+    var b_https = try Message.Builder.init(&buf);
+    try b_https.addHTTPSRecord("example.com", 300, 1, "h3.cdn.example.org", "\x00\x03\x00\x02\x01\xbb");
+    try b_https.setSection(.additional);
+    const glue_aaaa_start = b_https.pos;
+    try b_https.addAAAARecord("h3.cdn.example.org", 300, @splat(1));
+    // 2(压缩指针) + 10(固定头) + 16(IPv6) = 28 字节
+    try std.testing.expectEqual(@as(usize, 28), b_https.pos - glue_aaaa_start);
+
+    const pkt = b_https.finish(.{ .id = 1, .qr = 1, .aa = 1 });
+    const msg = try Message.parse(pkt);
+    var secs = msg.sections();
+    const ans = (try secs.nextAnswer()).?;
+    const https_rd = try secs.parseRData(ans);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("h3.cdn.example.org", try https_rd.HTTPS.target.str(&nbuf));
+    const glue = (try secs.nextAdditional()).?;
+    try std.testing.expect(try secs.nameEqualsAt(glue.name_pos, "h3.cdn.example.org"));
+    try secs.expectEnd();
+
+    // 3. SVCB 写完未压缩 target 并入压缩表后若因 params 超出缓冲区失败，压缩表登记必须随快照一并回滚：
+    // Header(12) + owner "a.example"(11) + 固定头(10) + priority(2) + target "ghost.target.invalid"(22) = 57B <= 60B，
+    // 确保 writeNameRaw 已完成写入与登记，随后因 20B params (57+20=77 > 60) 触发回滚。
+    var tight: [60]u8 = undefined;
+    var b_rollback = try Message.Builder.init(&tight);
+    const big_params = "\x00\x04\x00\x10" ++ "\xc0\x00\x02\x01\xc0\x00\x02\x02\xc0\x00\x02\x03\xc0\x00\x02\x04";
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        b_rollback.addSVCBRecord("a.example", 60, 1, "ghost.target.invalid", big_params),
+    );
+    try std.testing.expectEqual(@as(u8, 0), b_rollback.compression_count);
+    // 后续写入同名记录不得指向刚才已回滚废弃的字节，owner 必须完整展开为 22 字节而非 2 字节指针
+    try b_rollback.addARecord("ghost.target.invalid", 60, .{ 1, 1, 1, 1 });
+    const rb_pkt = b_rollback.finish(.{ .id = 2, .qr = 1 });
+    var rb_parser = Parser.init(rb_pkt);
+    const rb_rr = (try rb_parser.nextRR()).?;
+    try std.testing.expectEqual(@as(usize, 22), rb_rr.name_end_pos - rb_rr.name_pos);
+    try std.testing.expectEqualStrings("ghost.target.invalid", try rb_parser.formatNameAt(rb_rr.name_pos, &nbuf));
+}
+
+test "Message.findEdns and SectionParser handle QDCOUNT=0 Cookie probes, misplaced OPT, and trailing bytes" {
+    // 1. RFC 7873 §5.4: QDCOUNT=0, ARCOUNT=1 的纯 Cookie 探测包
+    var probe_buf: [64]u8 = undefined;
+    var pb = try Message.Builder.init(&probe_buf);
+    try pb.addOptRecord(.{
+        .cookie = .{ .client = .{ 1, 2, 3, 4, 5, 6, 7, 8 }, .server = "" },
+        .extra_options = "\x00\x0f\x00\x02\x00\x12", // 附带 EDE(15)
+    });
+    const probe_pkt = pb.finish(.{ .id = 7 });
+    const probe_msg = try Message.parse(probe_pkt);
+    try std.testing.expectEqual(@as(u16, 0), probe_msg.header.qdcount);
+
+    var secs = probe_msg.sections();
+    try std.testing.expect((try secs.nextQuestion()) == null); // 绝不误把 OPT 当 Question
+    const opt_rr = (try secs.nextAdditional()).?;
+    try std.testing.expectEqual(Type.OPT, opt_rr.rtype);
+    try secs.expectEnd();
+
+    const probe_edns = (try probe_msg.findEdns()).?;
+    var opt_it = probe_edns.optionsIterator();
+    try std.testing.expectEqual(OptionCode.COOKIE, (try opt_it.next()).?.code);
+    try std.testing.expectEqual(OptionCode.EDE, (try opt_it.next()).?.code);
+    try std.testing.expect((try opt_it.next()) == null);
+
+    // 2. 报文末尾夹带多余字节 -> Message.findEdns 报 TrailingBytes
+    var with_trail: [64]u8 = @splat(0);
+    @memcpy(with_trail[0..probe_pkt.len], probe_pkt);
+    const trail_msg = try Message.parse(with_trail[0 .. probe_pkt.len + 2]);
+    try std.testing.expectError(error.TrailingBytes, trail_msg.findEdns());
+
+    // 3. OPT 混入 Answer 区 -> Message.findEdns 与 SectionParser 均报 MisplacedOptRecord
+    var bad_ans: [32]u8 = @splat(0);
+    bad_ans[7] = 1; // ANCOUNT = 1
+    bad_ans[12] = 0; // root
+    mem.writeInt(u16, bad_ans[13..15], @backingInt(Type.OPT), .big);
+    mem.writeInt(u16, bad_ans[15..17], 1232, .big);
+    const bad_msg = try Message.parse(bad_ans[0..23]);
+    try std.testing.expectError(error.MisplacedOptRecord, bad_msg.findEdns());
+    var bad_secs = bad_msg.sections();
+    try std.testing.expectError(error.MisplacedOptRecord, bad_secs.nextAnswer());
 }

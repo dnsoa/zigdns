@@ -52,12 +52,13 @@ pub fn main() !void {
     std.debug.print("  QDCOUNT: {d}\n", .{parsed.header.qdcount});
     std.debug.print("  ANCOUNT: {d}\n", .{parsed.header.ancount});
 
-    // 使用解析器读取问题
-    var parser = dns.MessageParser.init(packet);
-    if (try parser.nextQuestion()) |q| {
+    // 按 Header 计数读取问题（避免 QDCOUNT=0 时误读后续记录）
+    var secs = parsed.sections();
+    while (try secs.nextQuestion()) |q| {
         std.debug.print("\n  Question:\n", .{});
         std.debug.print("    Name end position: {d}\n", .{q.qname_end_pos});
         std.debug.print("    Type: {d}\n", .{@backingInt(q.qtype)});
         std.debug.print("    Class: {d}\n", .{q.qclass});
     }
+    try secs.expectEnd();
 }
