@@ -305,32 +305,40 @@ fn benchmarkNameParsing() !void {
     reportBenchmark("iterate simple qname", iterations, iterator_parse.elapsed_ns);
     reportVsBaseline("iterate simple qname", baseline.elapsed_ns, iterations, iterator_parse.elapsed_ns, iterations);
 
-    var response_packet: [RESPONSE_PACKET.len]u8 = undefined;
-    @memcpy(response_packet[0..], RESPONSE_PACKET);
+    const NameBenchContext = struct {
+        packet: [RESPONSE_PACKET.len]u8,
+        name_pos: usize,
+    };
+    var name_ctx = NameBenchContext{
+        .packet = undefined,
+        .name_pos = 0,
+    };
+    @memcpy(name_ctx.packet[0..], RESPONSE_PACKET);
+    {
+        var init_parser = dns.MessageParser.init(name_ctx.packet[0..]);
+        try init_parser.skipQuestions(1);
+        var answers = init_parser.resourceRecords(1);
+        const rr = (try answers.next()).?;
+        name_ctx.name_pos = rr.name_pos;
+    }
 
-    const compressed_format = try runBenchmark([RESPONSE_PACKET.len]u8, usize, &response_packet, iterations, struct {
-        fn run(packet: *[RESPONSE_PACKET.len]u8, iteration: usize) !usize {
-            packet[19] = if ((iteration & 1) == 0) 'e' else 'f';
-            var parser = dns.MessageParser.init(packet[0..]);
-            try parser.skipQuestions(1);
-            var answers = parser.resourceRecords(1);
-            const rr = (try answers.next()).?;
+    const compressed_format = try runBenchmark(NameBenchContext, usize, &name_ctx, iterations, struct {
+        fn run(ctx: *NameBenchContext, iteration: usize) !usize {
+            ctx.packet[19] = if ((iteration & 1) == 0) 'e' else 'f';
+            const parser = dns.MessageParser.init(ctx.packet[0..]);
             var name_buf: [256]u8 = undefined;
-            const name = try parser.formatNameAt(rr.name_end_pos - 2, &name_buf);
+            const name = try parser.formatNameAt(ctx.name_pos, &name_buf);
             return name.len + name[0];
         }
     }.run);
     reportBenchmark("format compressed owner name", iterations, compressed_format.elapsed_ns);
     reportVsBaseline("format compressed owner name", baseline.elapsed_ns, iterations, compressed_format.elapsed_ns, iterations);
 
-    const compressed_equals = try runBenchmark([RESPONSE_PACKET.len]u8, usize, &response_packet, iterations, struct {
-        fn run(packet: *[RESPONSE_PACKET.len]u8, iteration: usize) !usize {
-            packet[19] = if ((iteration & 1) == 0) 'e' else 'f';
-            var parser = dns.MessageParser.init(packet[0..]);
-            try parser.skipQuestions(1);
-            var answers = parser.resourceRecords(1);
-            const rr = (try answers.next()).?;
-            const equals = try parser.nameEqualsAt(rr.name_end_pos - 2, if ((iteration & 1) == 0) "example.com" else "fxample.com");
+    const compressed_equals = try runBenchmark(NameBenchContext, usize, &name_ctx, iterations, struct {
+        fn run(ctx: *NameBenchContext, iteration: usize) !usize {
+            ctx.packet[19] = if ((iteration & 1) == 0) 'e' else 'f';
+            const parser = dns.MessageParser.init(ctx.packet[0..]);
+            const equals = try parser.nameEqualsAt(ctx.name_pos, if ((iteration & 1) == 0) "example.com" else "fxample.com");
             return @intFromBool(equals);
         }
     }.run);

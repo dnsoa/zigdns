@@ -1,6 +1,7 @@
 /// DNS 解析和编码错误
 pub const Error = error{
     PacketTooShort,
+    MalformedHeader, // TCP 帧声明长度 <12 字节，无法构成合法 DNS Header
     MalformedName,
     MalformedECS,
     LabelTooLong,

@@ -77,7 +77,7 @@ pub fn main() !void {
     // 读取问题
     if (try parser.nextQuestion()) |q| {
         std.debug.print("  Question: Type={d}, Class={d}\n", .{
-            @intFromEnum(q.qtype),
+            @backingInt(q.qtype),
             q.qclass,
         });
     }
@@ -89,7 +89,7 @@ pub fn main() !void {
 
         // 使用 parseRData 解析 RDATA
         const rdata = parser.parseRData(rr) catch |err| {
-            std.debug.print("(parse error: {}) Type={d}\n", .{ err, @intFromEnum(rr.rtype) });
+            std.debug.print("(parse error: {}) Type={d}\n", .{ err, @backingInt(rr.rtype) });
             i += 1;
             continue;
         };
@@ -115,7 +115,7 @@ pub fn main() !void {
                 std.debug.print("\n", .{});
             },
             else => {
-                std.debug.print("Type={d}\n", .{@intFromEnum(rr.rtype)});
+                std.debug.print("Type={d}\n", .{@backingInt(rr.rtype)});
             },
         }
         i += 1;

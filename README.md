@@ -24,7 +24,7 @@ This library prioritizes **performance** and **safety** for server-side DNS impl
 Add zigdns to your project:
 
 ```bash
-zig fetch --save="dns" https://github.com/dnsoa/zigdns/archive/refs/tags/main.tar.gz
+zig fetch --save="dns" https://github.com/dnsoa/zigdns/archive/refs/heads/main.tar.gz
 ```
 
 Then in your `build.zig`:
@@ -49,7 +49,7 @@ const dns = @import("dns");
 pub fn main() !void {
     // Buffer for the DNS packet
     var buffer: [512]u8 = undefined;
-    var builder = dns.Message.Builder.init(&buffer);
+    var builder = try dns.Message.Builder.init(&buffer);
 
     // Add a question for example.com A record
     try builder.addQuestion("example.com", .A, 1); // type=A, class=IN
@@ -84,9 +84,8 @@ pub fn main() !void {
 const std = @import("std");
 const dns = @import("dns");
 
-pub fn createResponse() ![]const u8 {
-    var buffer: [512]u8 = undefined;
-    var builder = dns.Message.Builder.init(&buffer);
+pub fn createResponse(buffer: []u8) ![]const u8 {
+    var builder = try dns.Message.Builder.init(buffer);
 
     // Add the question (mirrored from query)
     try builder.addQuestion("example.com", .A, 1);
@@ -141,7 +140,7 @@ pub fn parseDnsPacket(buffer: []const u8) !void {
     var questions = parser.questions(message.header.qdcount);
     while (try questions.next()) |q| {
         std.debug.print("Question: Type={d}, Class={d}\n", .{
-            @intFromEnum(q.qtype),
+            @backingInt(q.qtype),
             q.qclass,
         });
     }
@@ -163,7 +162,8 @@ pub fn parseDnsPacket(buffer: []const u8) !void {
                 std.debug.print("AAAA: {x:0>2}:{x:0>2}:...\n", .{ip[0], ip[1]});
             },
             .MX => |mx| {
-                var name_buf: [255]u8 = undefined;
+                // Plain ASCII names fit in 253 bytes; worst-case \DDD-escaped wire names need up to 1003 bytes.
+                var name_buf: [1004]u8 = undefined;
                 std.debug.print("MX: pref={d}, exchange={s}\n", .{
                     mx.preference, try mx.exchange.str(&name_buf),
                 });
@@ -208,7 +208,7 @@ if (try parser.findEdns(message.header.arcount)) |edns| {
 }
 ```
 
-`findEdns` returns an error when the message violates RFC 6891:
+`findEdns` returns an error when the message violates RFC 6891 or option validation:
 
 | Condition | Error |
 |-----------|-------|
@@ -216,6 +216,8 @@ if (try parser.findEdns(message.header.arcount)) |edns| {
 | A name points into the header | `error.InvalidOffset` |
 | OPT owner name is not the root | `error.MalformedName` |
 | OPT RDATA options do not exactly tile the RDATA | `error.InvalidRData` |
+| Malformed ECS payload, non-zero tail bits beyond `source_prefix` (RFC 7871 §6), or duplicate ECS option (strict library policy) | `error.MalformedECS` |
+| Invalid COOKIE length (RFC 7873 §5.2.2; multiple COOKIE options keep the first and ignore the rest per §5.2/§5.3) | `error.MalformedCookie` |
 
 `findOptRecord`, `findECS` and `findCookie` are **fast paths**: they stop at the first OPT
 and skip those checks. Use them only on input you have already validated; for untrusted
@@ -234,10 +236,10 @@ EDNS helpers instead of a vague `InvalidRData`.
 they can never desync:
 
 ```zig
-var builder = dns.Message.Builder.init(&buffer);
+var builder = try dns.Message.Builder.init(&buffer);
 try builder.addQuestion("example.com", .A, 1);      // -> qdcount
 try builder.addARecord("example.com", 60, .{1,2,3,4}); // -> ancount
-builder.setSection(.authority);
+try builder.setSection(.authority);
 try builder.addNSRecord("example.com", 60, "ns1.example.com"); // -> nscount
 
 // header counts are overwritten with the real values (pass 0s)
@@ -281,7 +283,8 @@ var builder = try dns.Message.Builder.initTcp(&buffer);
 try builder.addQuestion("example.com", .A, 1);
 const frame = try builder.finishTcp(header); // 2-byte length prefix + message
 
-// parsing side strips the prefix:
+// parsing side strips the prefix (returns error.MalformedHeader if the 2-byte length is < 12,
+// reserving error.PacketTooShort strictly for incomplete TCP stream bytes):
 const message = try dns.Message.parseTcp(frame);
 ```
 
@@ -309,7 +312,11 @@ matches where `MessageParser` leaves off, but reaching for it means doing by han
 
 All name reading enforces RFC 1035 §2.3.4 identically across the library — labels ≤ 63
 bytes, and ≤ 255 bytes for the whole name *including* the root octet. A name the parser
-accepts can always be re-encoded by the builder.
+accepts can always be re-encoded by the builder:
+
+- **Presentation escaping (RFC 1035 §5.1 / RFC 4343 §2.1)**: `formatDnsName`, `formatDnsNameInMessage`, `Name.str`, and `MessageParser.formatNameAt` escape `.` and `\` inside labels as `\.` / `\\` and control or non-ASCII bytes (`<= 0x20` or `>= 0x7F`) as `\DDD`. Ordinary printable ASCII names remain ≤ 253 bytes, while a worst-case all-escaped 255-octet wire name expands to **1003 bytes** (pass a `[1004]u8` / `[1024]u8` buffer if untrusted binary labels must be formatted without `error.BufferTooSmall`).
+- **Backslash escape parsing**: `Message.Builder`, `MessageParser.nameEqualsAt`, and `canonicalCompare` interpret `\` escapes per RFC 1035 §5.1 (`\.`, `\\`, `\DDD` for `000`–`255`). A literal backslash inside a presentation string must therefore be escaped as `\\` (e.g. `"a\\\\b.example.com"`). Names containing `\` escapes are written uncompressed by `Builder` and are not inserted into the compression table; for DNSSEC ordering on parsed records, prefer zero-escape `Name.canonicalCompare`.
+- **RDATA name boundaries**: Embedded domain names inside RDATA whose wire encoding overruns `rdlength` fail with `error.InvalidRData` without reading into subsequent records.
 
 Every message-level entry point also rejects compression pointers aimed at the 12-byte
 header, since no name can start there. That applies uniformly to `MessageParser`
@@ -353,6 +360,7 @@ The library provides detailed error types:
 ```zig
 pub const Error = error{
     PacketTooShort,
+    MalformedHeader,    // TCP frame declares < 12 bytes (cannot form a valid DNS header)
     MalformedName,
     MalformedECS,
     MalformedCookie,
@@ -368,6 +376,7 @@ pub const Error = error{
     MessageTooLong,
     MultipleOptRecords, // RFC 6891 §6.1.1: more than one OPT record → FORMERR
     InvalidRecordOrder, // Builder misuse: section regression, or question after an RR
+    UseEdns,            // parseRData called on OPT(41): use findEdns / Edns.fromOpt instead
 };
 ```
 
@@ -402,7 +411,7 @@ zig test src/rdata.zig
 
 ### Core Types
 
-- `Header` - DNS message header (12 bytes, packed struct)
+- `Header` - DNS message header (`packed struct(u96)`, host-endian `u16` fields; serialize via `Header.decode` / `Header.encode`)
 - `Message` - Message parsing wrapper
 - `Message.Builder` - Zero-allocation packet builder
 - `MessageParser` - Incremental packet parser
@@ -429,15 +438,15 @@ on your own hardware, these are not authoritative):
 
 | Operation | ~ns/op |
 |-----------|-------:|
-| Decode header | 0.9 |
-| Parse one question (uncompressed name) | 2 |
-| Skip question + parse one answer (compressed owner) | 10 |
-| Iterate a qname (labels) | 4 |
-| Compare a compressed name | 18 |
-| Format a compressed name (dotted) | 16 |
-| Find OPT / `findEdns` (OPT+ECS+Cookie, one scan) | 17–19 |
-| Encode a query | 33 |
-| Encode a response with compression | 72 |
+| Decode header | 0.6 |
+| Parse one question (uncompressed name) | 2.5 |
+| Skip question + parse one answer (compressed owner) | 11 |
+| Iterate a qname (labels) | 6 |
+| Compare a compressed name (`nameEqualsAt`) | 14 |
+| Format a compressed name (dotted) | 18 |
+| Find OPT / `findEdns` (OPT+ECS+Cookie, one scan) | 17–26 |
+| Encode a query | 18 |
+| Encode a response with compression | 62 |
 
 Skipping a name now **follows and validates** its compression pointers instead of
 accepting "+2 bytes and done", so a fast-path server that only skips rejects the same

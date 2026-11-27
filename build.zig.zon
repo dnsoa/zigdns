@@ -2,7 +2,7 @@
     .name = .dns,
     .version = "0.0.1",
     .fingerprint = 0x82eddc4110626e35,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

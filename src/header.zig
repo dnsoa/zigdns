@@ -1,27 +1,28 @@
 const std = @import("std");
 const mem = std.mem;
 
-// RFC 1035 4.1.1. DNS 报文头 (12 字节)
-// 使用 packed struct 确保内存布局与协议一致
+// RFC 1035 4.1.1. DNS 报文头（线格式固定 12 字节）。
+// 保持 packed struct(u96) 供下游位级操作使用；注意 u16 字段在内存中为主机字节序（且 u96 对齐占 16 字节），
+// 线格式大端字节序转换必须走 Header.decode / Header.encode，不可对原始报文做 @bitCast。
 pub const Header = packed struct(u96) {
     id: u16,
-    // 标志位 (大端序处理)
-    rd: u1, // 期望递归
-    tc: u1, // 截断
-    aa: u1, // 权威应答
-    opcode: u4, // 操作码
-    qr: u1, // 0:查询, 1:响应
-    rcode: u4, // 响应码
+    // 标志位
+    rd: u1 = 0, // 期望递归
+    tc: u1 = 0, // 截断
+    aa: u1 = 0, // 权威应答
+    opcode: u4 = 0, // 操作码
+    qr: u1 = 0, // 0:查询, 1:响应
+    rcode: u4 = 0, // 响应码
     // RFC 2535 起 byte3 的保留区细分为 Z/AD/CD 三个独立标志位（默认 0，向后兼容旧构造点）
     cd: u1 = 0, // 禁用校验 (Checking Disabled)
     ad: u1 = 0, // 已验证数据 (Authentic Data)
     z: u1 = 0, // 保留 (必须为 0)
-    ra: u1, // 递归可用
+    ra: u1 = 0, // 递归可用
 
-    qdcount: u16, // 问题数
-    ancount: u16, // 回答数
-    nscount: u16, // 权威记录数
-    arcount: u16, // 附加记录数
+    qdcount: u16 = 0, // 问题数
+    ancount: u16 = 0, // 回答数
+    nscount: u16 = 0, // 权威记录数
+    arcount: u16 = 0, // 附加记录数
 
     // 显式按线格式字节解码，不依赖 packed struct 的隐式位序。
     // RFC 1035 4.1.1:

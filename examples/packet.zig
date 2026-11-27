@@ -57,7 +57,7 @@ pub fn main() !void {
     if (try parser.nextQuestion()) |q| {
         std.debug.print("\n  Question:\n", .{});
         std.debug.print("    Name end position: {d}\n", .{q.qname_end_pos});
-        std.debug.print("    Type: {d}\n", .{@intFromEnum(q.qtype)});
+        std.debug.print("    Type: {d}\n", .{@backingInt(q.qtype)});
         std.debug.print("    Class: {d}\n", .{q.qclass});
     }
 }

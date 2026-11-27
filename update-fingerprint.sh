@@ -5,18 +5,19 @@ set -e
 
 echo "Updating build.zig.zon fingerprint..."
 
-# 获取 Zig 构建时输出的正确 fingerprint
-OUTPUT=$(zig build 2>&1)
+# 获取 Zig 构建时输出的正确 fingerprint（允许非零退出码以便捕获 mismatch 输出）
+OUTPUT=$(zig build 2>&1 || true)
 
-if echo "$OUTPUT" | grep -q "fingerprint mismatch"; then
-    # 提取实际的 fingerprint
-    ACTUAL=$(echo "$OUTPUT" | grep "actual:" | sed 's/.*actual:.*0x\([0-9a-fA-F]*\).*/\1/' | tr '[:lower:]' '[:upper:]')
+if echo "$OUTPUT" | grep -q "fingerprint"; then
+    # 提取建议或实际的 fingerprint（保持小写十六进制，兼容 Zig 规范）
+    ACTUAL=$(echo "$OUTPUT" | grep -Eo '0x[0-9a-fA-F]+' | tail -n 1)
 
     if [ -n "$ACTUAL" ]; then
-        echo "Found fingerprint: 0x$ACTUAL"
+        echo "Found fingerprint: $ACTUAL"
 
-        # 更新 build.zig.zon
-        sed -i "s/\.fingerprint = 0x[0-9a-fA-F]*/.fingerprint = 0x$ACTUAL/" build.zig.zon
+        # 使用临时文件替换，兼容 macOS BSD sed 与 GNU sed
+        sed "s/\.fingerprint = 0x[0-9a-fA-F]*/.fingerprint = $ACTUAL/" build.zig.zon > build.zig.zon.tmp
+        mv build.zig.zon.tmp build.zig.zon
 
         echo "✓ Updated build.zig.zon"
         echo ""

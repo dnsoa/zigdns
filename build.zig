@@ -42,13 +42,20 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz_tests.step);
 
     // === 性能基准测试 ===
+    // 必须为基准单独创建 ReleaseFast 的 dns 模块：公开导出的 dns_module 跟随用户 -Doptimize（默认 Debug），
+    // 直接复用会导致 `zig build bench` 把被测库编译为 -Odebug。
+    const bench_dns_module = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .link_libc = true, // clock_gettime for timing
     });
-    bench_module.addImport("dns", dns_module);
+    bench_module.addImport("dns", bench_dns_module);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
@@ -82,12 +89,11 @@ pub fn build(b: *std.Build) void {
         // 将 dns 模块添加到示例的导入中
         example.root_module.addImport("dns", dns_module);
 
-        b.installArtifact(example);
-
         const run_example = b.addRunArtifact(example);
         const run_step = b.step("example-" ++ name, "Run the " ++ name ++ " example");
         run_step.dependOn(&run_example.step);
 
-        examples_step.dependOn(&b.addInstallArtifact(example, .{}).step);
+        const install_example = b.addInstallArtifact(example, .{});
+        examples_step.dependOn(&install_example.step);
     }
 }
