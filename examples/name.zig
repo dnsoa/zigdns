@@ -34,8 +34,8 @@ pub fn main() !void {
             .arcount = 0,
         });
 
-        // 跳过头部 (12 字节) 获取域名部分
-        const name_data = packet[12..];
+        // 跳过头部 (12 字节) 并去除末尾 QTYPE+QCLASS (4 字节)，获取纯域名线格式字节
+        const name_data = packet[12 .. packet.len - 4];
 
         // 显示线缆格式
         std.debug.print("  Wire format ({d} bytes): ", .{name_data.len});
@@ -76,8 +76,9 @@ pub fn main() !void {
     try builder.addARecord("example.com", 3600, [_]u8{ 192, 0, 2, 2 });
     const pos2 = builder.pos;
 
-    const saved_bytes = pos2 - pos1;
-    std.debug.print("First record size: {d} bytes\n", .{pos1 - 12});
-    std.debug.print("Second record size: {d} bytes\n", .{saved_bytes});
-    std.debug.print("Saved by compression: {d} bytes\n", .{13 - 2 + 10});
+    const first_size = pos1 - 12;
+    const second_size = pos2 - pos1;
+    std.debug.print("First record size: {d} bytes\n", .{first_size});
+    std.debug.print("Second record size: {d} bytes\n", .{second_size});
+    std.debug.print("Saved by compression: {d} bytes\n", .{first_size - second_size});
 }

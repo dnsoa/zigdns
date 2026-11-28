@@ -6,6 +6,7 @@ const ECSData = @import("types.zig").ECSData;
 const CookieData = @import("types.zig").CookieData;
 const Error = @import("errors.zig").Error;
 const Name = @import("name.zig").Name;
+const NameCursor = @import("name.zig").NameCursor;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 
 fn parseECSOption(option_payload: []const u8) !ECSData {
@@ -110,6 +111,40 @@ pub fn parseOptOptions(rdata: []const u8) !OptOptions {
         }
     }
     // 残尾字节不足以构成 TLV 头 -> 畸形 OPT，不得当成"无该选项"。
+    if (pos != rdata.len) return error.InvalidRData;
+    return out;
+}
+
+pub const OptEncodeValidation = struct {
+    has_ecs: bool = false,
+    has_cookie: bool = false,
+};
+
+/// 构造侧严格校验 OPT 选项 TLV（RFC 6891 §6.1.2 / RFC 7871 / RFC 7873 §4 / §5.1）：
+/// 与接收端容错的 `parseOptOptions` 不同，发送端严禁在单条 OPT 中重复携带 COOKIE 或 ECS，
+/// 且每一条 COOKIE / ECS 都必须通过语法与长度校验（防止夹带畸形次条 COOKIE 写上报文）。
+pub fn validateOptOptionsForEncode(rdata: []const u8) Error!OptEncodeValidation {
+    var out = OptEncodeValidation{};
+    var pos: usize = 0;
+    while (pos + 4 <= rdata.len) {
+        const code = (@as(u16, rdata[pos]) << 8) | rdata[pos + 1];
+        const len = (@as(u16, rdata[pos + 2]) << 8) | rdata[pos + 3];
+        pos += 4;
+
+        if (len > rdata.len -| pos) return error.InvalidRData;
+        const payload = rdata[pos .. pos + len];
+        pos += len;
+
+        if (code == @backingInt(OptionCode.ECS)) {
+            if (out.has_ecs) return error.MalformedECS;
+            _ = try parseECSOption(payload);
+            out.has_ecs = true;
+        } else if (code == @backingInt(OptionCode.COOKIE)) {
+            if (out.has_cookie) return error.MalformedCookie;
+            _ = try parseCookieOption(payload);
+            out.has_cookie = true;
+        }
+    }
     if (pos != rdata.len) return error.InvalidRData;
     return out;
 }
@@ -345,6 +380,9 @@ pub const TypeBitmap = struct {
     }
 };
 
+pub const HinfoData = struct { cpu: []const u8, os: []const u8 };
+pub const SshfpData = struct { algorithm: u8, fp_type: u8, fingerprint: []const u8 };
+pub const TlsaData = struct { usage: u8, selector: u8, matching_type: u8, cert_data: []const u8 };
 pub const DnskeyData = struct { flags: u16, protocol: u8, algorithm: u8, public_key: []const u8 };
 pub const DsData = struct { key_tag: u16, algorithm: u8, digest_type: u8, digest: []const u8 };
 pub const RrsigData = struct {
@@ -415,90 +453,54 @@ pub const RData = union(enum) {
         minimum: u32,
     },
     PTR: Name,
+    HINFO: HinfoData, // 主机信息（RFC 1035 §3.3.2 / RFC 8482）
     MX: struct { preference: u16, exchange: Name },
     TXT: TxtData, // 一个或多个 character-string（RFC 1035 §3.3.14）
     AAAA: [16]u8,
     SRV: struct { priority: u16, weight: u16, port: u16, target: Name },
+    DNAME: Name, // 子树别名（RFC 6672 §2.1，不得压缩）
     OPT: []const u8, // 保留兼容分支；对 OPT 调用 RData.parse 返回 error.UseEdns
     SVCB: SvcbData, // 服务绑定（RFC 9460）
     HTTPS: SvcbData, // HTTPS 服务绑定（RFC 9460，与 SVCB 同格式）
     CAA: CaaData, // 证书颁发机构授权（RFC 8659）
     DS: DsData, // 委派签名者（RFC 4034）
+    SSHFP: SshfpData, // SSH 公钥指纹（RFC 4255）
     RRSIG: RrsigData, // 资源记录签名（RFC 4034）
     NSEC: NsecData, // 下一安全记录（RFC 4034）
     DNSKEY: DnskeyData, // DNS 公钥（RFC 4034）
     NSEC3: Nsec3Data, // 哈希化 NSEC（RFC 5155）
     NSEC3PARAM: Nsec3ParamData, // NSEC3 参数（RFC 5155）
+    TLSA: TlsaData, // DANE TLS 认证（RFC 6698）
+    CDS: DsData, // 子区域 DS（RFC 7344 §3.1，与 DS 同格式）
+    CDNSKEY: DnskeyData, // 子区域 DNSKEY（RFC 7344 §3.2，与 DNSKEY 同格式）
 
-    /// 在 RDATA 内推进越过一个域名（含压缩指针），仅校验与定位，不复制。
-    /// 用于跳到域名之后的定长字段。
-    ///
-    /// 压缩指针会被**跟随并完整校验**（目标越界、指向 header、前向跳转、成环、展开后 >255），
-    /// 推进量仍是线格式的 2 字节；名字的线格式必须整体落在本条 RDATA 内。
-    /// `base` 为 RDATA 在完整报文 `msg` 中的绝对偏移，`pos` 相对 RDATA 起点。
-    /// 与 owner name 的 skip 路径共用 `MESSAGE_POINTER_FLOOR`：RDATA 里的域名同样
-    /// 不得指向 header，且须指向更早出现的位置（RFC 1035 §4.1.4）。
+    /// 在 RDATA 内推进越过一个域名（含压缩指针），直接委托给统一的 `NameCursor`。
+    /// 首个压缩指针之前的线格式字节通过 `wire_limit` 严格限制在本条 RDLENGTH 内。
     fn advanceName(msg: []const u8, base: usize, data: []const u8, pos: *usize) Error!void {
-        const wire_limit = base + data.len;
-        var cur = base + pos.*;
-        var origin = cur;
-        var total: usize = 1; // RFC 1035 §2.3.4 的 255 含根结束符
-        var jumps: usize = 0;
-        var wire_end: ?usize = null;
-
-        while (true) {
-            // 首个压缩指针之前的线格式字节必须严格落在本条记录 RDLENGTH 之内，
-            // 不得越界读入后续 RR；超出 RDLENGTH 一律归类为 InvalidRData。
-            const limit = if (wire_end == null) wire_limit else msg.len;
-            if (cur >= limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
-
-            const len = msg[cur];
-            if (len == 0) {
-                const end = wire_end orelse (cur + 1);
-                pos.* = end - base;
-                return;
-            }
-
-            if (len & 0xC0 == 0xC0) {
-                if (cur + 2 > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
-                const target = (@as(usize, len & 0x3F) << 8) | msg[cur + 1];
-                if (target < POINTER_FLOOR or target >= msg.len) return error.InvalidOffset;
-                if (target >= origin or jumps >= 128) {
-                    return error.MalformedName;
-                }
-                jumps += 1;
-                if (wire_end == null) wire_end = cur + 2;
-                origin = target;
-                cur = target;
-                continue;
-            }
-
-            if (len > 63) return error.LabelTooLong;
-            if (cur + 1 + len > limit) return if (wire_end == null) error.InvalidRData else error.PacketTooShort;
-            total += 1 + len;
-            if (total > 255) return error.NameTooLong;
-            cur += 1 + len;
-        }
+        var cur = NameCursor{
+            .buffer = msg,
+            .pos = base + pos.*,
+            .pointer_floor = POINTER_FLOOR,
+            .wire_limit = base + data.len,
+            .has_wire_limit = true,
+            .allow_header_start = true,
+        };
+        try cur.step(true, true, true);
+        pos.* = cur.wire_end - base;
     }
 
-    /// 同 advanceName，但禁止压缩指针（RFC 4034 §3.1.7/§4.1.1、RFC 9460 §2.2
-    /// 规定 RRSIG signer / NSEC next_domain / SVCB target 不得压缩）。
+    /// 同 advanceName，但禁止压缩指针（RFC 4034 §3.1.7/§4.1.1、RFC 6672 §2.1、RFC 9460 §2.2
+    /// 规定 RRSIG signer / NSEC next_domain / DNAME target / SVCB target 不得压缩）。
     fn advanceNameNoPointer(data: []const u8, pos: *usize) Error!void {
-        var total: usize = 1; // RFC 1035 §2.3.4 的 255 含根结束符
-        while (pos.* < data.len) {
-            const len = data[pos.*];
-            if (len == 0) {
-                pos.* += 1;
-                return;
-            }
-            if (len & 0xC0 == 0xC0) return error.MalformedName; // 禁止压缩
-            if (len > 63) return error.LabelTooLong;
-            if (data.len - pos.* < 1 + len) return error.InvalidRData;
-            total += 1 + len;
-            if (total > 255) return error.NameTooLong;
-            pos.* += 1 + len;
-        }
-        return error.InvalidRData;
+        var cur = NameCursor{
+            .buffer = data,
+            .pos = pos.*,
+            .wire_limit = data.len,
+            .has_wire_limit = true,
+            .allow_pointers = false,
+        };
+        try cur.step(true, false, true);
+        pos.* = cur.wire_end;
     }
 
     /// 从完整报文中解析某条记录的 RDATA。
@@ -533,6 +535,26 @@ pub const RData = union(enum) {
                     .PTR => RData{ .PTR = name },
                     else => unreachable,
                 };
+            },
+            .DNAME => {
+                // RFC 6672 §2.1 / RFC 3597 §4: DNAME target 不得压缩，且须精确覆盖 RDATA。
+                var pos: usize = 0;
+                try advanceNameNoPointer(data, &pos);
+                if (pos != data.len) return error.InvalidRData;
+                return RData{ .DNAME = .{ .buffer = msg, .offset = rdata_offset } };
+            },
+            .HINFO => {
+                // RFC 1035 §3.3.2 / RFC 8482: CPU <character-string> + OS <character-string>。
+                if (data.len < 2) return error.InvalidRData;
+                const cpu_len: usize = data[0];
+                const os_pos = 1 + cpu_len;
+                if (os_pos >= data.len) return error.InvalidRData;
+                const os_len: usize = data[os_pos];
+                if (os_pos + 1 + os_len != data.len) return error.InvalidRData;
+                return RData{ .HINFO = .{
+                    .cpu = data[1..os_pos],
+                    .os = data[os_pos + 1 ..],
+                } };
             },
             .MX => {
                 if (data.len < 2) return error.InvalidRData;
@@ -630,23 +652,53 @@ pub const RData = union(enum) {
                     else => unreachable,
                 };
             },
-            .DNSKEY => {
+            .DNSKEY, .CDNSKEY => {
+                // RFC 4034 §2.1 / RFC 7344 §3.2: CDNSKEY 与 DNSKEY 线格式完全一致。
                 if (data.len < 4) return error.InvalidRData;
-                return RData{ .DNSKEY = .{
+                const key = DnskeyData{
                     .flags = mem.readInt(u16, data[0..2], .big),
                     .protocol = data[2],
                     .algorithm = data[3],
                     .public_key = data[4..],
-                } };
+                };
+                return switch (rtype) {
+                    .DNSKEY => RData{ .DNSKEY = key },
+                    .CDNSKEY => RData{ .CDNSKEY = key },
+                    else => unreachable,
+                };
             },
-            .DS => {
-                // RFC 4034 §5.1 / §5.3: 固定 4 字节头 + 非空 Digest。
+            .DS, .CDS => {
+                // RFC 4034 §5.1 / RFC 7344 §3.1: 固定 4 字节头 + 非空 Digest（兼容 RFC 8078 删除记录 1B 0x00）。
                 if (data.len < 5) return error.InvalidRData;
-                return RData{ .DS = .{
+                const ds = DsData{
                     .key_tag = mem.readInt(u16, data[0..2], .big),
                     .algorithm = data[2],
                     .digest_type = data[3],
                     .digest = data[4..],
+                };
+                return switch (rtype) {
+                    .DS => RData{ .DS = ds },
+                    .CDS => RData{ .CDS = ds },
+                    else => unreachable,
+                };
+            },
+            .SSHFP => {
+                // RFC 4255 §3.1: algorithm(1) + fp_type(1) + 非空 fingerprint。
+                if (data.len < 3) return error.InvalidRData;
+                return RData{ .SSHFP = .{
+                    .algorithm = data[0],
+                    .fp_type = data[1],
+                    .fingerprint = data[2..],
+                } };
+            },
+            .TLSA => {
+                // RFC 6698 §2.1: usage(1) + selector(1) + matching_type(1) + 非空 cert_data。
+                if (data.len < 4) return error.InvalidRData;
+                return RData{ .TLSA = .{
+                    .usage = data[0],
+                    .selector = data[1],
+                    .matching_type = data[2],
+                    .cert_data = data[3..],
                 } };
             },
             .RRSIG => {
@@ -714,7 +766,9 @@ pub const RData = union(enum) {
                 } };
             },
             .OPT => return error.UseEdns, // OPT 不是普通 RR：RDATA 是 EDNS 选项 TLV，用 findEdns / Edns.fromOpt
-            else => return error.UnknownType,
+            // RFC 3597 §3 / RFC 6895 §3.1: 未知类型透明处理仅适用于合法数据 RR 类型；
+            // 保留值 0 / 65535 与 QTYPE / Meta-TYPE (128..255) 不属于数据 RR，返回 error.InvalidType。
+            else => return if (rtype.isDataType()) error.UnknownType else error.InvalidType,
         };
     }
 };
@@ -775,6 +829,7 @@ test "RData parse NSEC3PARAM record (RFC 5155)" {
 }
 
 test "RData parse RRSIG record (RFC 4034)" {
+    const hdr: [12]u8 = @splat(0);
     const rdata = "\x00\x01" ++ // type_covered=A
         "\x08" ++ // algorithm
         "\x02" ++ // labels
@@ -784,7 +839,8 @@ test "RData parse RRSIG record (RFC 4034)" {
         "\x30\x39" ++ // key_tag=0x3039
         "\x07example\x03com\x00" ++ // signer (uncompressed)
         "SIG!"; // signature
-    const rd = try RData.parse(.RRSIG, rdata, 0, rdata.len);
+    const msg = hdr ++ rdata;
+    const rd = try RData.parse(.RRSIG, msg, 12, rdata.len);
     try std.testing.expectEqual(@as(u16, 1), rd.RRSIG.type_covered);
     try std.testing.expectEqual(@as(u8, 8), rd.RRSIG.algorithm);
     try std.testing.expectEqual(@as(u8, 2), rd.RRSIG.labels);
@@ -798,9 +854,11 @@ test "RData parse RRSIG record (RFC 4034)" {
 }
 
 test "RData parse NSEC record with type bitmap (RFC 4034)" {
+    const hdr: [12]u8 = @splat(0);
     const rdata = "\x01a\x07example\x03com\x00" ++ // next_domain
         "\x00\x06\x40\x01\x00\x00\x00\x03"; // window 0: A(1), MX(15), RRSIG(46), NSEC(47)
-    const rd = try RData.parse(.NSEC, rdata, 0, rdata.len);
+    const msg = hdr ++ rdata;
+    const rd = try RData.parse(.NSEC, msg, 12, rdata.len);
     var nbuf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("a.example.com", try rd.NSEC.next_domain.str(&nbuf));
     var it = rd.NSEC.types.iterator();
@@ -893,10 +951,12 @@ test "RData parse CAA allows empty value" {
 
 test "RData parse HTTPS record with SvcParams (RFC 9460)" {
     // priority=1, target="svc.example.net", 一个 SvcParam key=3(port) value={0x01,0xBB}=443
+    const hdr: [12]u8 = @splat(0);
     const rdata = "\x00\x01" ++ // priority
         "\x03svc\x07example\x03net\x00" ++ // target (uncompressed)
         "\x00\x03\x00\x02\x01\xBB"; // key=3, len=2, value=443
-    const rd = try RData.parse(.HTTPS, rdata, 0, rdata.len);
+    const msg = hdr ++ rdata;
+    const rd = try RData.parse(.HTTPS, msg, 12, rdata.len);
     try std.testing.expectEqual(@as(u16, 1), rd.HTTPS.priority);
     var nbuf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("svc.example.net", try rd.HTTPS.target.str(&nbuf));
@@ -940,8 +1000,8 @@ test "RData rejects trailing data past name-terminated RDATA" {
 }
 
 test "RData parse MX record resolves exchange name" {
-    var data: [20]u8 = undefined;
-    @memset(&data, 0);
+    var msg: [32]u8 = @splat(0);
+    var data = msg[12..32];
     mem.writeInt(u16, data[0..2], 10, .big); // preference
     // mail.example.com (未压缩，以 0 结尾)
     data[2] = 4;
@@ -952,7 +1012,7 @@ test "RData parse MX record resolves exchange name" {
     @memcpy(data[16..19], "com");
     data[19] = 0;
 
-    const rdata = try RData.parse(.MX, &data, 0, 20);
+    const rdata = try RData.parse(.MX, &msg, 12, 20);
     try std.testing.expectEqual(@as(u16, 10), rdata.MX.preference);
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("mail.example.com", try rdata.MX.exchange.str(&buf));
@@ -1238,7 +1298,6 @@ test "RData.advanceName bounds wire scan to rdlength without reading into next R
 }
 
 test "RData.advanceName agrees with NameCursor on pointer/limit validation" {
-    const NameCursor = @import("name.zig").NameCursor;
     // 当 rdlength 完整覆盖 RDATA 名字线格式时，RData.parse(.CNAME) 内部的 advanceName
     // 必须与 NameCursor.initInMessage 对合法/越界/指向header/成环/超长标签/255上限给出相同判定。
     var msg_ok_ptr: [32]u8 = @splat(0);
@@ -1351,4 +1410,59 @@ test "DS, RRSIG and NSEC3 reject empty cryptographic payloads and invalid RRSIG 
     try std.testing.expectError(error.InvalidRData, RData.parse(.RRSIG, rrsig_bad_labels, 0, rrsig_bad_labels.len));
     // NSEC3 未知哈希算法但 hash_len=0 -> InvalidRData
     try std.testing.expectError(error.InvalidRData, RData.parse(.NSEC3, "\x02\x00\x00\x01\x00\x00", 0, 6));
+}
+
+test "validateOptOptionsForEncode rejects duplicate or malformed trailing COOKIE" {
+    const c1 = "\x00\x0a\x00\x08\x01\x02\x03\x04\x05\x06\x07\x08";
+    const c2 = "\x00\x0a\x00\x08\x08\x07\x06\x05\x04\x03\x02\x01";
+    const c_bad = "\x00\x0a\x00\x03\xff\xff\xff";
+    const v = try validateOptOptionsForEncode(c1);
+    try std.testing.expect(v.has_cookie and !v.has_ecs);
+    try std.testing.expectError(error.MalformedCookie, validateOptOptionsForEncode(c1 ++ c2));
+    try std.testing.expectError(error.MalformedCookie, validateOptOptionsForEncode(c1 ++ c_bad));
+}
+
+test "RData.parse distinguishes InvalidType (QTYPE/Meta-TYPE/Reserved) from UnknownType (RFC 3597 §3)" {
+    for ([_]u16{ 0, 128, 249, 250, 251, 252, 253, 254, 255, 65535 }) |bad| {
+        try std.testing.expectError(error.InvalidType, RData.parse(@fromBackingInt(bad), "", 0, 0));
+    }
+    // 合法未知数据 RR 类型（如 99、65000）仍返回 UnknownType 供 RFC 3597 透明处理
+    try std.testing.expectError(error.UnknownType, RData.parse(@fromBackingInt(99), "", 0, 0));
+    try std.testing.expectError(error.UnknownType, RData.parse(@fromBackingInt(65000), "", 0, 0));
+}
+
+test "RData.parse supports CDS, CDNSKEY, DNAME, HINFO, SSHFP, and TLSA" {
+    const hdr: [12]u8 = @splat(0);
+
+    // CDS & CDNSKEY
+    const cds = try RData.parse(.CDS, "\x30\x39\x08\x02\xde\xad\xbe\xef", 0, 8);
+    try std.testing.expectEqual(@as(u16, 0x3039), cds.CDS.key_tag);
+    const cdnskey = try RData.parse(.CDNSKEY, "\x01\x01\x03\x08KEY!", 0, 8);
+    try std.testing.expectEqual(@as(u16, 257), cdnskey.CDNSKEY.flags);
+
+    // DNAME（禁止压缩指针与残尾字节）
+    const dname_msg = hdr ++ "\x06target\x07example\x00";
+    const dname = try RData.parse(.DNAME, dname_msg, 12, 16);
+    var nbuf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("target.example", try dname.DNAME.str(&nbuf));
+    try std.testing.expectError(error.MalformedName, RData.parse(.DNAME, "\xc0\x0c", 0, 2));
+    try std.testing.expectError(error.InvalidRData, RData.parse(.DNAME, "\x00\xff", 0, 2));
+
+    // HINFO（RFC 8482: CPU="RFC8482", OS=""）
+    const hinfo = try RData.parse(.HINFO, "\x07RFC8482\x00", 0, 9);
+    try std.testing.expectEqualStrings("RFC8482", hinfo.HINFO.cpu);
+    try std.testing.expectEqualStrings("", hinfo.HINFO.os);
+    try std.testing.expectError(error.InvalidRData, RData.parse(.HINFO, "\x03cpu", 0, 4));
+    try std.testing.expectError(error.InvalidRData, RData.parse(.HINFO, "\x01a\x01b\xff", 0, 5));
+
+    // SSHFP & TLSA
+    const sshfp = try RData.parse(.SSHFP, "\x04\x02\xaa\xbb\xcc", 0, 5);
+    try std.testing.expectEqual(@as(u8, 4), sshfp.SSHFP.algorithm);
+    try std.testing.expectEqualSlices(u8, "\xaa\xbb\xcc", sshfp.SSHFP.fingerprint);
+    try std.testing.expectError(error.InvalidRData, RData.parse(.SSHFP, "\x04\x02", 0, 2));
+
+    const tlsa = try RData.parse(.TLSA, "\x03\x01\x01\x11\x22\x33", 0, 6);
+    try std.testing.expectEqual(@as(u8, 3), tlsa.TLSA.usage);
+    try std.testing.expectEqualSlices(u8, "\x11\x22\x33", tlsa.TLSA.cert_data);
+    try std.testing.expectError(error.InvalidRData, RData.parse(.TLSA, "\x03\x01\x01", 0, 3));
 }

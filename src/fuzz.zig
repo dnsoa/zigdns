@@ -37,6 +37,7 @@ fn walk(input: []const u8) void {
         while (secs.nextAnswer() catch null) |_| {}
         while (secs.nextAuthority() catch null) |_| {}
         while (secs.nextAdditional() catch null) |_| {}
+        _ = secs.edns();
         _ = secs.expectEnd() catch {};
     }
 
@@ -45,13 +46,17 @@ fn walk(input: []const u8) void {
     while (qi.next() catch return) |_| {}
 
     const total = @as(u32, msg.header.ancount) + msg.header.nscount + msg.header.arcount;
-    // 严格 EDNS 入口也一并走过（在跳过回答与权威区后扫描附加区）
+    // 严格 EDNS 入口也一并走过（在跳过回答与权威区后消费附加区并校验包尾）
     {
         var edns_parser = parser;
         if (edns_parser.skipNonAdditionalRecords(@as(usize, msg.header.ancount) + msg.header.nscount)) |_| {
-            if (edns_parser.findEdns(msg.header.arcount) catch null) |edns| {
+            if (edns_parser.consumeEdns(msg.header.arcount) catch null) |edns| {
                 _ = Edns.fromOpt(edns.opt) catch {};
+                _ = edns.params.preservingOptions().wireLen() catch {};
+                var extra_buf: [512]u8 = undefined;
+                _ = edns.params.withPreservedOptions(&extra_buf) catch {};
             }
+            _ = edns_parser.expectEnd() catch {};
         } else |_| {}
     }
     var nbuf: [1024]u8 = undefined;
@@ -60,7 +65,7 @@ fn walk(input: []const u8) void {
         const rr = (parser.nextRR() catch return) orelse break;
         const rd = parser.parseRData(rr) catch continue;
         switch (rd) {
-            .CNAME, .NS, .PTR => |n| {
+            .CNAME, .NS, .PTR, .DNAME => |n| {
                 _ = n.str(&nbuf) catch {};
             },
             .MX => |mx| {

@@ -6,9 +6,9 @@ A high-performance DNS protocol library for Zig, featuring zero-copy packet pars
 
 - **Zero-copy parsing**: All parsed data references the original buffer - no allocations
 - **Compression support**: Automatic compression pointer following on parse; shared-suffix compression on encode
-- **Comprehensive record types**: A, AAAA, CNAME, NS, MX, TXT, PTR, SOA, SRV, CAA, SVCB, HTTPS
-- **EDNS0 support**: OPT records with ECS (Client Subnet, RFC 7871) and DNS Cookies (RFC 7873)
-- **DNSSEC**: DNSKEY, DS, RRSIG, NSEC, NSEC3, NSEC3PARAM parsing and construction, key tag computation, type bitmaps, canonical ordering (RFC 4034 / 5155)
+- **Comprehensive record types**: A, AAAA, CNAME, DNAME, NS, MX, TXT, PTR, HINFO, SOA, SRV, SSHFP, TLSA, CAA, SVCB, HTTPS
+- **EDNS0 support**: OPT records with ECS (Client Subnet, RFC 7871), DNS Cookies (RFC 7873), 12-bit Extended RCODEs, and generic TLV iteration
+- **DNSSEC**: DNSKEY, CDNSKEY, DS, CDS, RRSIG, NSEC, NSEC3, NSEC3PARAM parsing and construction, key tag computation, type bitmaps, canonical ordering (RFC 4034 / 5155 / 7344)
 - **Type-safe**: Zig's type system ensures correctness at compile time
 - **RFC compliant**: Follows RFC 1035, RFC 1034, and related standards
 
@@ -206,21 +206,20 @@ if (try message.findEdns()) |edns| {
 }
 ```
 
-Or scan the additional section directly with `MessageParser.findEdns` (which scans on a copy without advancing `parser.pos`, so consume the additional section before calling `parser.expectEnd()`):
+Or scan and consume the additional section in a single pass with `MessageParser.consumeEdns` (which decodes `edns.params` without a second `Edns.fromOpt` pass and advances `parser.pos` to the end of the additional section; use read-only `parser.findEdns` if you do not want to advance `parser.pos`):
 
 ```zig
 var parser = dns.MessageParser.init(buffer);
 try parser.skipQuestions(message.header.qdcount);
 try parser.skipNonAdditionalRecords(@as(usize, message.header.ancount) + message.header.nscount);
 
-if (try parser.findEdns(message.header.arcount)) |edns| {
-    const params = try dns.Edns.fromOpt(edns.opt);
-    std.debug.print("DO={}\n", .{params.dnssec_ok});
+if (try parser.consumeEdns(message.header.arcount)) |edns| {
+    std.debug.print("DO={}\n", .{edns.params.dnssec_ok});
 }
-var add = parser.resourceRecords(message.header.arcount);
-while (try add.next()) |_| {}
 try parser.expectEnd();
 ```
+
+When walking all four sections with `message.sections()`, `SectionParser` caches the decoded `Edns` during Additional-section traversal (`secs.edns()`) and provides `skipQuestions()` / `skipAnswers()` / `skipAuthorities()` / `skipAdditionals()` so you never need a second pass over the packet.
 
 `findEdns` returns an error when the message violates RFC 6891 or option validation:
 
@@ -289,7 +288,7 @@ try builder.setEdns(.{
 // Answer / Authority records can still be added normally; finish() appends OPT at the end.
 ```
 
-`addOptRecord` and `addOptRecordRaw` remain available for writing an `OPT` record into the Additional section immediately. Note that if you have **not** called `try builder.setSection(.additional)` beforehand, `addOptRecord` / `addOptRecordRaw` lock the builder against accidental subsequent `add*Record` calls (returning `error.InvalidRecordOrder` so Answer records are never silently emitted into Additional as `ANCOUNT=0` NODATA); call `try builder.setSection(.additional)` explicitly to unlock when intentionally appending trailing Additional records such as TSIG after `OPT`.
+`addOptRecord` and `addOptRecordRaw` remain available for writing an `OPT` record into the Additional section immediately. Note that if you have **not** called `try builder.setSection(.additional)` beforehand, `addOptRecord` / `addOptRecordRaw` lock the builder against accidental subsequent `add*Record` calls (returning `error.InvalidRecordOrder` so Answer records are never silently emitted into Additional as `ANCOUNT=0` NODATA); call `try builder.setSection(.additional)` explicitly to unlock when intentionally appending trailing Additional records such as TSIG after `OPT`. When using `setEdns`, call `builder.flushEdns()` before computing a TSIG digest (or write `Type.TSIG` via `addRecordRaw` in `.additional`, which flushes the reserved `OPT` before `TSIG` automatically per RFC 8945 §5.1). You can also echo a parsed query `Question` directly with `try builder.addQuestionFrom(query_msg.buffer, q)`, forward non-ECS/COOKIE EDNS options zero-copy with `edns.preservingOptions()` (or materialize them into a separate buffer via `try edns.withPreservedOptions(&opt_buf)`), and reuse a builder across packets with `try builder.reset(&buffer)`.
 
 For DNS-over-TCP, use the 2-byte length-prefix framing helpers:
 
@@ -330,17 +329,10 @@ bytes, and ≤ 255 bytes for the whole name *including* the root octet. A name t
 accepts can always be re-encoded by the builder:
 
 - **Presentation escaping (RFC 1035 §5.1 / RFC 4343 §2.1)**: `formatDnsName`, `formatDnsNameInMessage`, `Name.str`, and `MessageParser.formatNameAt` escape `.` and `\` inside labels as `\.` / `\\` and control or non-ASCII bytes (`<= 0x20` or `>= 0x7F`) as `\DDD`. Ordinary printable ASCII names remain ≤ 253 bytes, while a worst-case all-escaped 255-octet wire name expands to **1003 bytes** (pass a `[1004]u8` / `[1024]u8` buffer if untrusted binary labels must be formatted without `error.BufferTooSmall`).
-- **Backslash escape parsing**: `Message.Builder`, `MessageParser.nameEqualsAt`, and `canonicalCompare` interpret `\` escapes per RFC 1035 §5.1 (`\.`, `\\`, `\DDD` for `000`–`255`). A literal backslash inside a presentation string must therefore be escaped as `\\` (e.g. `"a\\\\b.example.com"`). Names containing `\` escapes are written uncompressed by `Builder` and are not inserted into the compression table; for DNSSEC ordering on parsed records, prefer zero-escape `Name.canonicalCompare`.
+- **Backslash escape parsing & compression**: `Message.Builder`, `MessageParser.nameEqualsAt`, and `canonicalCompare` interpret `\` escapes per RFC 1035 §5.1 (`\.`, `\\`, `\DDD` for `000`–`255`). A literal backslash inside a presentation string must therefore be escaped as `\\` (e.g. `"a\\\\b.example.com"`). Because `Builder`'s compression table keys on decoded wire-format label suffixes, names containing `\` escapes (such as RFC 6763 DNS-SD instance names with `\032` or `\.`) participate in both full-name and shared-suffix compression identically to unescaped names; for DNSSEC ordering on parsed records, prefer zero-escape `Name.canonicalCompare`.
 - **RDATA name boundaries**: Embedded domain names inside RDATA whose wire encoding overruns `rdlength` fail with `error.InvalidRData` without reading into subsequent records.
 
-Every message-level entry point also rejects compression pointers aimed at the 12-byte
-header, since no name can start there. That applies uniformly to `MessageParser`
-(`skipName` / `formatNameAt` / `nameEqualsAt`), to `Name.str()`, and to names inside
-RDATA (`parseRData` on CNAME/NS/MX/SOA/SRV) — a pointer rejected in an owner name cannot
-slip through by moving into RDATA. The generic helpers that take an arbitrary buffer
-rather than a whole message (`formatDnsName`, `NameIterator`, `NameCursor.init`) default
-to no such restriction; use `formatDnsNameInMessage`, `NameCursor.initInMessage`, or set
-`pointer_floor = dns.MESSAGE_POINTER_FLOOR` to opt in.
+Every message-level entry point enforces full DNS message bounds (`12 <= msg.len <= 65535` and `12 <= offset < msg.len`) and rejects compression pointers aimed at the 12-byte header, since no name can start there. That applies uniformly to `MessageParser` (`skipName` / `formatNameAt` / `nameEqualsAt`), `formatDnsNameInMessage`, `NameCursor.initInMessage`, `Name.str()`, `Name.canonicalCompare()`, and names inside RDATA (`parseRData` on CNAME/NS/MX/SOA/SRV). Both `NameCursor` and `NameIterator` are fused: calling `next()` again after `null` returns `null` without advancing `pos`. The generic helpers that take an arbitrary buffer rather than a whole message (`formatDnsName`, `NameIterator`, `NameCursor.init`) default to `pointer_floor = 0`; use `formatDnsNameInMessage`, `NameCursor.initInMessage`, or set `pointer_floor = dns.MESSAGE_POINTER_FLOOR` to opt into full-message bounds.
 
 ### Supported Record Types
 
@@ -349,22 +341,28 @@ to no such restriction; use `formatDnsNameInMessage`, `NameCursor.initInMessage`
 | A | IPv4 address | `addARecord()` |
 | AAAA | IPv6 address | `addAAAARecord()` |
 | CNAME | Canonical name | `addCNAMERecord()` |
+| DNAME | Subtree redirection (RFC 6672) | `addDNAMERecord()` |
 | MX | Mail exchange | `addMXRecord()` |
 | NS | Name server | `addNSRecord()` |
 | PTR | Pointer record | `addPTRRecord()` |
-| TXT | Text record | `addTXTRecord()` |
+| HINFO | Host information (RFC 1035 / RFC 8482) | `addHINFORecord()` |
+| TXT | Text record | `addTXTRecord()` / `addTXTRecordStrings()` |
 | SOA | Start of authority | `addSOARecord()` |
 | SRV | Service record | `addSRVRecord()` |
+| SSHFP | SSH public key fingerprint (RFC 4255) | `addSSHFPRecord()` |
+| TLSA | DANE TLS authentication (RFC 6698) | `addTLSARecord()` |
 | CAA | Certification authority authorization (RFC 8659) | `addCAARecord()` |
 | SVCB | Service binding (RFC 9460) | `addSVCBRecord()` |
 | HTTPS | HTTPS service binding (RFC 9460) | `addHTTPSRecord()` |
 | DNSKEY | DNS public key (RFC 4034) | `addDNSKEYRecord()` |
+| CDNSKEY | Child DNSKEY (RFC 7344) | `addCDNSKEYRecord()` |
 | DS | Delegation signer (RFC 4034) | `addDSRecord()` |
+| CDS | Child DS (RFC 7344) | `addCDSRecord()` |
 | RRSIG | Resource record signature (RFC 4034) | `addRRSIGRecord()` |
 | NSEC | Next secure record (RFC 4034) | `addNSECRecord()` |
 | NSEC3 | Hashed NSEC (RFC 5155) | `addNSEC3Record()` |
 | NSEC3PARAM | NSEC3 parameters (RFC 5155) | `addNSEC3PARAMRecord()` |
-| OPT | EDNS(0) | `addOptRecord()` |
+| OPT | EDNS(0) | `setEdns()` / `addOptRecord()` |
 
 Unknown or non-IN-class records can be served verbatim via `addRecordRaw()` (RFC 3597).
 
@@ -404,6 +402,10 @@ pub const Error = error{
 - **Implicit section lock after `addOptRecord` / `addOptRecordRaw`**: When called without a prior `setSection(.additional)`, appending further records afterward (e.g., TSIG via `addRecordRaw`) requires calling `try builder.setSection(.additional)` first to confirm Additional-section intent (or prefer `setEdns()`, which reserves `OPT` at the end without changing the active section).
 - **`RData` decoupled from `Type`**: `RData` is now `union(enum)` rather than `union(Type)` so `Type` can define pure QTYPEs and Meta-TYPEs (`ANY`, `AXFR`, `IXFR`, `TSIG`, `TKEY`); match `RData` tags directly rather than coercing `RData` to `Type`.
 - **`OPT` internal TLV overrun error**: When an EDNS option's `OPTION-LENGTH` exceeds `OPT.RDLENGTH`, `parseOptOptions` / `parseECS` / `parseCookie` / `Edns.fromOpt` / `findEdns` now return `error.InvalidRData` instead of `error.PacketTooShort` (reserving `PacketTooShort` for truncated packet or TCP-frame buffers).
+- **Fused name iterators & full-message offset bounds**: `NameCursor.next()` and `NameIterator.next()` are now fused after returning `null` (subsequent calls return `null` instead of reading past the root octet or returning `error.PacketTooShort`). Full-message name entry points (`formatDnsNameInMessage`, `NameCursor.initInMessage`, `Name.str`, `Name.canonicalCompare`, `MessageParser.formatNameAt` / `nameEqualsAt`, `skipName(..., MESSAGE_POINTER_FLOOR)`) enforce `12 <= msg.len <= 65535` (`PacketTooShort` / `MessageTooLong`) and `12 <= offset < msg.len` (`InvalidOffset`), rejecting offsets inside the 12-byte DNS header.
+- **`MessageParser` 64 KiB cap & `< 12B` `expectEnd`**: `MessageParser` now rejects buffers `> 65535` bytes with `error.MessageTooLong` (matching `Message.parse`), and calling `expectEnd()` on a buffer `< 12` bytes returns `error.PacketTooShort` rather than `error.TrailingBytes`.
+- **Non-data RR type/class classification (RFC 6895 / RFC 3597 §3)**: `parseRData` / `RData.parse` now return `error.InvalidType` (rather than `error.UnknownType`) for reserved types (`0`, `65535`) and QTYPE / Meta-TYPE numbers (`128..255`, such as `ANY`, `AXFR`, `IXFR`, `TSIG`, `TKEY`), reserving `error.UnknownType` strictly for unmodeled data RR types; `MessageParser.parseRData` also returns `error.InvalidClass` for reserved classes `0` and `65535` alongside `NONE(254)` and `ANY(255)`. `CDS`, `CDNSKEY`, `DNAME`, `HINFO`, `SSHFP`, and `TLSA` are now parsed into typed `RData` variants rather than returning `error.UnknownType`.
+- **Strict sender-side `COOKIE` validation & escaped-name compression in `Builder`**: `Builder` OPT encoding (`setEdns`, `updateEdns`, `addOptRecord`, `addOptRecordRaw`, `addRecordRaw(..., 41, ...)`) rejects duplicate `COOKIE` options and malformed trailing `COOKIE` options with `error.MalformedCookie` (RFC 7873 §4 / §5.1). Names containing `\` escapes are now compressed by `Builder` using wire-format suffix matching.
 
 ## Examples
 
@@ -437,19 +439,20 @@ zig test src/rdata.zig
 ### Core Types
 
 - `Header` - DNS message header (`packed struct(u96)`, host-endian `u16` fields; serialize via `Header.decode` / `Header.encode`)
-- `Message` - Message parsing wrapper
-- `Message.Builder` - Zero-allocation packet builder
-- `MessageParser` - Incremental packet parser
-- `NameIterator` - Zero-copy label iterator for a single name (not a packet cursor)
-- `ResourceData` - Union type for all RDATA formats
+- `Message` - Zero-copy UDP / TCP (`parseTcp`, `parseTcpFrame`) message wrapper with `sections()` and `findEdns()`
+- `SectionParser` - Header-bound strict four-section parser with `skip*()` helpers, cached `edns()`, and `expectEnd()`
+- `Message.Builder` - Zero-allocation UDP / TCP packet builder (`init`, `initTcp`, `reset`, `setEdns`, `flushEdns`, `addQuestionFrom`)
+- `MessageParser` - Low-level incremental packet cursor (`questions`, `resourceRecords`, `consumeEdns`, `findEdns`, `nameEqualsAt`, `formatNameAt`, `parseRData`)
+- `Edns` - Unified EDNS(0) parameters for parsing (`fromOpt`, `optionsIterator`) and building (`setEdns`, `addOptRecord`, `preservingOptions`, `withPreservedOptions`)
+- `Name`, `NameCursor`, `NameIterator` - Zero-copy wire name reference, unified pointer-following cursor, and label iterator
+- `RData` (`ResourceData`) - Tagged union of typed RDATA payloads (`TxtData`, `HinfoData`, `CaaData`, `SvcbData`, `SshfpData`, `TlsaData`, `DnskeyData`, `DsData`, `RrsigData`, `NsecData`, `Nsec3Data`, `Nsec3ParamData`, `TypeBitmap`)
+- `OptOptions`, `OptOption`, `OptOptionIterator`, `ECSData`, `CookieData` - EDNS option types and iterators
 
-### Enums
+### Enums & Helpers
 
-- `Type` - DNS resource record types (A, AAAA, NS, etc.)
-- `Class` - DNS classes (IN, CH, etc.)
-- `Opcode` - DNS operation codes
-- `Rcode` - DNS response codes
-- `OptionCode` - EDNS option codes (ECS, etc.)
+- `Type`, `Class`, `Opcode`, `Rcode`, `ExtendedRcode`, `OptionCode`, `SvcParamKey`, `Section`, `Error`
+- `formatDnsName`, `formatDnsNameInMessage`, `decodePresentationName`, `skipName`, `validateMessageOffset`
+- `canonicalCompare`, `canonicalCompareWire`, `keyTag`, `serialCompare`, `validateSvcParams`, `validateTypeBitmap`, `parseOptOptions`, `validateOptOptionsForEncode`, `parseECS`, `parseCookie`
 
 ## Performance
 
@@ -464,14 +467,14 @@ on your own hardware, these are not authoritative):
 | Operation | ~ns/op |
 |-----------|-------:|
 | Decode header | 0.6 |
-| Parse one question (uncompressed name) | 2.5 |
+| Parse one question (uncompressed name) | 4.7 |
 | Skip question + parse one answer (compressed owner) | 11 |
-| Iterate a qname (labels) | 6 |
-| Compare a compressed name (`nameEqualsAt`) | 14 |
-| Format a compressed name (dotted) | 18 |
-| Find OPT / `findEdns` (OPT+ECS+Cookie, one scan) | 17–26 |
-| Encode a query | 18 |
-| Encode a response with compression | 62 |
+| Iterate a qname (labels) | 7 |
+| Compare a compressed name (`nameEqualsAt`) | 11 |
+| Format a compressed name (dotted) | 17 |
+| Find OPT / `findEdns` (OPT+ECS+Cookie, one scan) | 16–25 |
+| Encode a query | 13 |
+| Encode a response with compression | 89 |
 
 Skipping a name now **follows and validates** its compression pointers instead of
 accepting "+2 bytes and done", so a fast-path server that only skips rejects the same
