@@ -1,17 +1,23 @@
 const std = @import("std");
 const mem = std.mem;
+const Header = @import("header.zig").Header;
 const ECSData = @import("types.zig").ECSData;
 const CookieData = @import("types.zig").CookieData;
+const ExtendedRcode = @import("types.zig").ExtendedRcode;
 const Type = @import("types.zig").Type;
 const Class = @import("types.zig").Class;
 const parseECS = @import("rdata.zig").parseECS;
 const parseCookie = @import("rdata.zig").parseCookie;
 const parseOptOptions = @import("rdata.zig").parseOptOptions;
+const validateOptOptionsForEncode = @import("rdata.zig").validateOptOptionsForEncode;
+const OptOptions = @import("rdata.zig").OptOptions;
+const OptOptionIterator = @import("rdata.zig").OptOptionIterator;
 const RData = @import("rdata.zig").RData;
 const NameCursor = @import("name.zig").NameCursor;
 const skipNameAt = @import("name.zig").skipName;
 const formatDnsNameInMessage = @import("name.zig").formatDnsNameInMessage;
 const decodePresentationName = @import("name.zig").decodePresentationName;
+const validateMessageOffset = @import("name.zig").validateMessageOffset;
 const POINTER_FLOOR = @import("name.zig").MESSAGE_POINTER_FLOOR;
 const Error = @import("errors.zig").Error;
 
@@ -52,6 +58,136 @@ pub const ResourceRecord = struct {
     }
 };
 
+/// EDNS(0) OPT 记录参数（RFC 6891 / 7871 / 7873 / 9824）。
+/// 注意：`options_raw` 为解析侧（`fromOpt` / `findEdns`）保存的只读原始 OPT RDATA 切片，
+/// 按 RFC 6891 §6.1.2 响应端不得盲目回显未知请求选项，故默认编码侧只写出显式指定的 `ecs`、`cookie` 与 `extra_options`；
+/// 若透明代理/转发器需保留非 ECS/COOKIE 的其余原始 TLV，可调用零拷贝的 `preservingOptions()` 或带缓冲拷贝的 `withPreservedOptions(out_buf)`。
+pub const EdnsParams = struct {
+    udp_payload_size: u16 = 1232, // 存于 OPT 记录的 CLASS 字段
+    extended_rcode: u8 = 0, // 扩展 RCODE 高 8 位（存于 TTL[31:24]）
+    version: u8 = 0, // EDNS 版本（存于 TTL[23:16]）
+    dnssec_ok: bool = false, // DO 标志（存于 TTL flags 最高位 0x8000）
+    preserve_raw_options: bool = false, // 置 true 时编码侧自动写出 options_raw 中除 ECS/COOKIE 外的其余原始 TLV
+    z_flags: u15 = 0, // 其余 15 位 EDNS 标志（RFC 6891 §6.1.4 Z 位 / RFC 9824 CO=0x4000），默认置 0
+    ecs: ?ECSData = null, // 若设置则写入 ECS 选项
+    cookie: ?CookieData = null, // 若设置则写入 COOKIE 选项（RFC 7873）
+    extra_options: []const u8 = "", // 构造时追加在 ECS/COOKIE 之后的预编码 TLV（如 EDE/NSID/Padding）
+    options_raw: []const u8 = "", // 解析时保留完整原始 OPT RDATA 切片，供 optionsIterator 零拷贝遍历
+
+    /// RFC 6891 §6.2.3: 请求方声明的 UDP 载荷小于 512 字节时，必须按 512 字节对待。
+    pub fn effectiveUdpPayloadSize(self: EdnsParams) u16 {
+        return @max(self.udp_payload_size, 512);
+    }
+
+    /// 合并 Header 低 4 位 RCODE 与 OPT 高 8 位 extended_rcode 为完整 12 位响应码（RFC 6891 §6.1.3）。
+    pub fn fullRcode(self: EdnsParams, header: Header) ExtendedRcode {
+        return ExtendedRcode.fromParts(header.rcode, self.extended_rcode);
+    }
+
+    /// 将 12 位扩展响应码（如 BADVERS=16、BADCOOKIE=23）拆分写入 Header.rcode 与 Edns.extended_rcode。
+    pub fn setFullRcode(self: *EdnsParams, header: *Header, rc: ExtendedRcode) void {
+        const parts = rc.split();
+        header.rcode = parts.header_rcode;
+        self.extended_rcode = parts.extended_rcode;
+    }
+
+    /// 遍历解析所得 OPT 记录中的全部原始 EDNS 选项 TLV（含 EDE/NSID/Padding 及未知选项）。
+    pub fn optionsIterator(self: EdnsParams) OptOptionIterator {
+        return .{ .raw = self.options_raw };
+    }
+
+    /// 返回在编码时自动原样保留 `options_raw` 中非 `ECS(8)` / `COOKIE(10)` 选项的副本（零拷贝、无需额外缓冲区）。
+    /// 适用于透明代理/转发器对已解析 `Edns` 修改 `ecs` / `cookie` 后直接传回 `Builder.setEdns` / `addOptRecord`（需保证原报文切片在 `finish` 前有效）。
+    pub fn preservingOptions(self: EdnsParams) EdnsParams {
+        var res = self;
+        res.preserve_raw_options = true;
+        return res;
+    }
+
+    /// 将 `options_raw` 中除已结构化的 `ECS(8)` 与 `COOKIE(10)` 之外的其余原始 TLV 过滤拷入 `out_buf`，
+    /// 返回已填入 `extra_options` 且清空 `options_raw` 的新 `Edns` 副本，供代理/转发器在释放原请求缓冲后重编码。
+    pub fn withPreservedOptions(self: EdnsParams, out_buf: []u8) Error!EdnsParams {
+        var res = self;
+        res.preserve_raw_options = false;
+        res.options_raw = "";
+        if (self.options_raw.len == 0) return res;
+        var it = self.optionsIterator();
+        var wpos: usize = 0;
+        while (try it.next()) |opt| {
+            if (opt.code == .ECS or opt.code == .COOKIE) continue;
+            const need = 4 + opt.data.len;
+            if (wpos + need > out_buf.len) return Error.BufferTooSmall;
+            mem.writeInt(u16, out_buf[wpos..][0..2], @backingInt(opt.code), .big);
+            mem.writeInt(u16, out_buf[wpos + 2 ..][0..2], @intCast(opt.data.len), .big);
+            @memcpy(out_buf[wpos + 4 ..][0..opt.data.len], opt.data);
+            wpos += need;
+        }
+        res.extra_options = out_buf[0..wpos];
+        return res;
+    }
+
+    /// 校验本 Edns 配置并返回编码整条 OPT 记录所需的线格式字节数（11 字节固定头 + RDATA）。
+    pub fn wireLen(self: EdnsParams) Error!usize {
+        var rdlen: usize = 0;
+        if (self.ecs) |ecs| {
+            const max_prefix: u8 = switch (ecs.family) {
+                1 => 32,
+                2 => 128,
+                else => return Error.MalformedECS,
+            };
+            if (ecs.source_prefix > max_prefix or ecs.scope_prefix > max_prefix) return Error.MalformedECS;
+            const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
+            if (ecs.address.len < addr_len) return Error.MalformedECS;
+            rdlen += 8 + addr_len;
+        }
+        if (self.cookie) |cookie| {
+            if (cookie.server.len != 0 and (cookie.server.len < 8 or cookie.server.len > 32)) return Error.MalformedCookie;
+            rdlen += 12 + cookie.server.len;
+        }
+        if (self.preserve_raw_options and self.options_raw.len > 0) {
+            var it = self.optionsIterator();
+            while (try it.next()) |opt| {
+                if (opt.code == .ECS or opt.code == .COOKIE) continue;
+                rdlen += 4 + opt.data.len;
+            }
+        }
+        if (self.extra_options.len > 0) {
+            const extra = try validateOptOptionsForEncode(self.extra_options);
+            if (self.ecs != null and extra.has_ecs) return Error.MalformedECS;
+            if (self.cookie != null and extra.has_cookie) return Error.MalformedCookie;
+            rdlen += self.extra_options.len;
+        }
+        if (rdlen > 0xFFFF) return Error.MessageTooLong;
+        return 11 + rdlen;
+    }
+
+    pub fn fromOptWithOptions(rr: ResourceRecord, options: OptOptions) EdnsParams {
+        return .{
+            .udp_payload_size = rr.class,
+            .extended_rcode = @truncate(rr.ttl >> 24),
+            .version = @truncate(rr.ttl >> 16),
+            .dnssec_ok = (rr.ttl & 0x8000) != 0,
+            .z_flags = @truncate(rr.ttl & 0x7FFF),
+            .ecs = options.ecs,
+            .cookie = options.cookie,
+            .options_raw = rr.rdata,
+        };
+    }
+
+    /// 从已解析的 OPT 记录解码 EDNS 参数（RFC 6891 §6.1.3）。
+    /// CLASS 字段承载 UDP 载荷大小；TTL 承载 扩展 RCODE 高 8 位 / 版本 / flags。
+    /// RDATA 中若含 ECS / COOKIE 选项则一并解出（RFC 7871 / 7873），并保留完整 options_raw。
+    pub fn fromOpt(rr: ResourceRecord) Error!EdnsParams {
+        if (rr.rtype != .OPT) return Error.InvalidType;
+        // RFC 6891 §6.1.2: OPT 的 owner name 必须为未压缩单字节根（0x00，线格式长度恰为 1）。
+        if (rr.name_end_pos -| rr.name_pos != 1) return Error.MalformedName;
+        const options = try parseOptOptions(rr.rdata);
+        return fromOptWithOptions(rr, options);
+    }
+};
+
+const TopEdns = EdnsParams;
+
 pub fn CountedIterator(comptime T: type) type {
     return struct {
         parser: *MessageParser,
@@ -84,6 +220,11 @@ pub const MessageParser = struct {
         return .{ .buffer = raw, .pos = 12 }; // Start after Header
     }
 
+    inline fn checkBufferBounds(self: *const MessageParser) Error!void {
+        if (self.buffer.len < 12) return error.PacketTooShort;
+        if (self.buffer.len > 0xFFFF) return error.MessageTooLong;
+    }
+
     /// Skips a DNS name (including compression pointers) without copying it.
     /// Crucial for jumping to the Type/Class fields.
     ///
@@ -96,7 +237,7 @@ pub const MessageParser = struct {
 
     /// Parses the next Question in the packet
     pub fn nextQuestion(self: *MessageParser) Error!?Question {
-        if (self.buffer.len < 12) return error.PacketTooShort;
+        try self.checkBufferBounds();
         if (self.pos >= self.buffer.len) return null;
 
         const name_pos = self.pos;
@@ -119,7 +260,7 @@ pub const MessageParser = struct {
 
     /// Parses the next Resource Record (Answer/Authority/Additional)
     pub fn nextRR(self: *MessageParser) Error!?ResourceRecord {
-        if (self.buffer.len < 12) return error.PacketTooShort;
+        try self.checkBufferBounds();
         if (self.pos >= self.buffer.len) return null;
 
         const name_pos = self.pos;
@@ -190,11 +331,12 @@ pub const MessageParser = struct {
         }
     }
 
-    /// 校验解析游标已精确抵达报文末尾，不存在未声明的尾随字节（防止走私记录或尾部垃圾）。
-    /// 注意：`findOptRecord` / `findECS` / `findCookie` / `findEdns` 均在副本上扫描（`*const MessageParser`），
-    /// 不会推进 `self.pos`；调用本方法前须先通过 `resourceRecords` / `skipResourceRecords` 消费完附加区，
-    /// 或直接使用会自动校验包尾的 `Message.findEdns()` / `SectionParser.expectEnd()`。
+    /// 校验报文长度合法（12..65535）且解析游标已精确抵达报文末尾，不存在未声明的尾随字节。
+    /// 注意：`findOptRecord` / `findECS` / `findCookie` / `findEdns` 在副本上扫描（`*const MessageParser`），
+    /// 不会推进 `self.pos`；如需扫描附加区 EDNS 并同时推进游标供 `expectEnd` 校验，请用 `consumeEdns`
+    /// 或整包严格入口 `Message.findEdns()` / `SectionParser.expectEnd()`。
     pub fn expectEnd(self: *const MessageParser) Error!void {
+        try self.checkBufferBounds();
         if (self.pos != self.buffer.len) return error.TrailingBytes;
     }
 
@@ -238,38 +380,49 @@ pub const MessageParser = struct {
         return null;
     }
 
-    /// `findEdns` 的结果：OPT 记录本身 + 其 RDATA 中已识别的选项。
-    /// EDNS 头部字段（UDP 载荷大小 / 版本 / 扩展 RCODE / DO）在 `opt` 的
-    /// CLASS 与 TTL 里，用 `dns.Edns.fromOpt(result.opt)` 可一次解出，
-    /// 与 Builder 侧的 `dns.Edns` 是同一个类型。
-    pub const Edns = struct { opt: ResourceRecord, ecs: ?ECSData, cookie: ?CookieData };
+    /// `findEdns` / `consumeEdns` 的结果：OPT 记录本身、已识别的 ECS / Cookie 以及单趟解出的完整 `dns.Edns`（`params`），
+    /// 无需再次调用 `dns.Edns.fromOpt` 重复遍历 OPT RDATA。
+    pub const Edns = struct {
+        opt: ResourceRecord,
+        ecs: ?ECSData,
+        cookie: ?CookieData,
+        params: TopEdns,
+    };
 
-    /// **严格入口**（RFC 6891 §6.1.1）：单趟扫描附加区，一次返回 OPT 记录及其
-    /// RDATA 中的 ECS 与 Cookie，避免 findOptRecord + findECS + findCookie 的三次扫描。
-    /// - 多于一个 OPT -> error.MultipleOptRecords（必须回 FORMERR）
-    /// - OPT 的 owner name 非根 -> error.MalformedName
-    /// - OPT RDATA 的 TLV 未恰好平铺 -> error.InvalidRData
-    pub fn findEdns(self: *const MessageParser, count: usize) !?Edns {
-        var scan = self.*;
+    /// **严格入口（推进游标）**（RFC 6891 §6.1.1）：单趟消费附加区 `count` 条记录并推进 `self.pos`（出错时回滚 `pos`），
+    /// 一次返回 OPT 记录及完整 `Edns` 参数，调用后可直接衔接 `expectEnd()` 而无需二次遍历附加区。
+    pub fn consumeEdns(self: *MessageParser, count: usize) Error!?Edns {
+        try self.checkBufferBounds();
+        const saved_pos = self.pos;
+        errdefer self.pos = saved_pos;
         var remaining = count;
         var found: ?Edns = null;
         while (remaining > 0) : (remaining -= 1) {
-            const rr = (try scan.nextRR()) orelse return error.PacketTooShort;
+            const rr = (try self.nextRR()) orelse return error.PacketTooShort;
             if (rr.rtype == .OPT) {
                 if (found != null) return error.MultipleOptRecords;
                 // RFC 6891 §6.1.1: OPT 的 owner name 必须为根（单个 0 字节）。
                 if (rr.name_pos >= self.buffer.len or self.buffer[rr.name_pos] != 0) return error.MalformedName;
-                // 选项只遍历一趟，ECS 与 Cookie 同时取出。
                 const options = try parseOptOptions(rr.rdata);
-                found = .{ .opt = rr, .ecs = options.ecs, .cookie = options.cookie };
+                found = .{
+                    .opt = rr,
+                    .ecs = options.ecs,
+                    .cookie = options.cookie,
+                    .params = TopEdns.fromOptWithOptions(rr, options),
+                };
             }
         }
         return found;
     }
 
+    /// **严格入口（只读副本扫描）**（RFC 6891 §6.1.1）：与 `consumeEdns` 同规则，但不改变 `self.pos`。
+    pub fn findEdns(self: *const MessageParser, count: usize) Error!?Edns {
+        var scan = self.*;
+        return scan.consumeEdns(count);
+    }
+
     pub fn nameEqualsAt(self: *const MessageParser, offset: usize, expected: []const u8) Error!bool {
-        if (self.buffer.len < 12) return error.PacketTooShort;
-        if (offset >= self.buffer.len) return error.InvalidOffset;
+        try validateMessageOffset(self.buffer, offset);
 
         var cur = NameCursor.initInMessage(self.buffer, offset);
 
@@ -349,8 +502,7 @@ pub const MessageParser = struct {
     /// 委托给 name.zig 的 `formatDnsNameInMessage`（基于统一的 `NameCursor`，
     /// 按完整报文语义拒绝指向 header 的压缩指针），保留入口 InvalidOffset 语义。
     pub fn formatNameAt(self: *const MessageParser, offset: usize, out_buf: []u8) Error![]const u8 {
-        if (self.buffer.len < 12) return error.PacketTooShort;
-        if (offset >= self.buffer.len) return error.InvalidOffset;
+        try validateMessageOffset(self.buffer, offset);
         return formatDnsNameInMessage(self.buffer, offset, out_buf);
     }
 
@@ -359,10 +511,11 @@ pub const MessageParser = struct {
     /// compression pointers without any pointer arithmetic or aliasing assumptions.
     ///
     /// - OPT（类型 41）不是普通 RR：返回 `error.UseEdns`，分流到 `findEdns` / `Edns.fromOpt`。
-    /// - QCLASS / 伪类 `ANY(255)` 与 `NONE(254)`（RFC 6895 §3.2 / RFC 2136）不承载常规数据 RDATA：返回 `error.InvalidClass`。
-    pub fn parseRData(self: *const MessageParser, rr: ResourceRecord) !RData {
+    /// - 保留类 `0` / `65535` 与伪类 `ANY(255)` / `NONE(254)`（RFC 6895 §3.2）不承载常规数据 RDATA：返回 `error.InvalidClass`。
+    pub fn parseRData(self: *const MessageParser, rr: ResourceRecord) Error!RData {
+        try self.checkBufferBounds();
         if (rr.rtype == .OPT) return error.UseEdns;
-        if (rr.class == @backingInt(Class.ANY) or rr.class == @backingInt(Class.NONE)) {
+        if (!Class.isDataClass(rr.class)) {
             return error.InvalidClass;
         }
         return RData.parse(rr.rtype, self.buffer, rr.rdata_offset, rr.rdlength);
@@ -1066,13 +1219,24 @@ test "MessageParser nameEqualsAt rejects cross-label dot spoofing and supports e
     try std.testing.expectError(error.PacketTooShort, dp.nameEqualsAt(12, "other.com"));
 }
 
-test "MessageParser rejects buffers shorter than 12-byte header" {
+test "MessageParser rejects buffers shorter than 12-byte header or larger than 65535" {
     var short = MessageParser.init("12345");
     try std.testing.expectError(error.PacketTooShort, short.nextQuestion());
     try std.testing.expectError(error.PacketTooShort, short.nextRR());
+    try std.testing.expectError(error.PacketTooShort, short.expectEnd());
     var out: [64]u8 = undefined;
     try std.testing.expectError(error.PacketTooShort, short.formatNameAt(0, &out));
     try std.testing.expectError(error.PacketTooShort, short.nameEqualsAt(0, "a"));
+
+    const huge = try std.testing.allocator.alloc(u8, 65536);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 0);
+    var big = MessageParser.init(huge);
+    try std.testing.expectError(error.MessageTooLong, big.nextQuestion());
+    try std.testing.expectError(error.MessageTooLong, big.nextRR());
+    try std.testing.expectError(error.MessageTooLong, big.expectEnd());
+    try std.testing.expectError(error.MessageTooLong, big.formatNameAt(12, &out));
+    try std.testing.expectError(error.MessageTooLong, big.nameEqualsAt(12, "."));
 }
 
 test "MessageParser enforces class checks, non-additional OPT rejection, and expectEnd" {
@@ -1123,6 +1287,14 @@ test "MessageParser enforces class checks, non-additional OPT rejection, and exp
         .rdata_offset = 23,
     };
     try std.testing.expectError(error.InvalidClass, p2.parseRData(none_rr));
+
+    for ([_]u16{ 0, 0xFFFF }) |reserved_class| {
+        var r_rr = none_rr;
+        r_rr.class = reserved_class;
+        try std.testing.expectError(error.InvalidClass, p2.parseRData(r_rr));
+    }
+    try std.testing.expectError(error.InvalidOffset, p2.formatNameAt(2, &packet));
+    try std.testing.expectError(error.InvalidOffset, p2.nameEqualsAt(4, "."));
 
     // 声明 0 条记录但末尾多了残尾字节 -> expectEnd 报 TrailingBytes
     const p_trail = MessageParser.init(packet[0..14]);

@@ -39,6 +39,15 @@ pub const Type = enum(u16) {
     ANY = 255, // 所有记录 (`*`, RFC 1035 / RFC 8482)
     CAA = 257, // 证书颁发机构授权 (RFC 8659)
     _,
+
+    /// 是否为常规数据 RR 类型（RFC 6895 §3.1 / RFC 3597 §3）。
+    /// 排除保留值 0 / 65535、EDNS 伪记录 OPT(41) 以及 QTYPE / Meta-TYPE 区间 128..255。
+    pub fn isDataType(self: Type) bool {
+        const raw = @backingInt(self);
+        if (raw == 0 or raw == 41 or raw == 0xFFFF) return false;
+        if (raw >= 128 and raw <= 255) return false;
+        return true;
+    }
 };
 
 /// EDNS(0) 选项码（RFC 6891 §6.1.2 / IANA DNS EDNS0 Option Codes）
@@ -80,6 +89,11 @@ pub const Class = enum(u16) {
     NONE = 254,
     ANY = 255,
     _,
+
+    /// 是否为常规数据记录 CLASS（RFC 6895 §3.2）：排除保留值 0 / 65535 与伪类 NONE(254) / ANY(255)。
+    pub fn isDataClass(raw: u16) bool {
+        return raw != 0 and raw != 254 and raw != 255 and raw != 0xFFFF;
+    }
 };
 
 /// DNS 操作码
@@ -203,4 +217,26 @@ test "serialCompare follows RFC 1982 wraparound semantics" {
     try std.testing.expectEqual(@as(?std.math.Order, .gt), serialCompare(0x00000010, 0xFFFFFFF0));
     // 相差恰为 2^31 时未定义
     try std.testing.expectEqual(@as(?std.math.Order, null), serialCompare(0, 0x80000000));
+}
+
+test "Type.isDataType and Class.isDataClass follow RFC 6895 and RFC 3597" {
+    try std.testing.expect(Type.A.isDataType());
+    try std.testing.expect(Type.CDS.isDataType());
+    try std.testing.expect(Type.CAA.isDataType());
+    try std.testing.expect((@as(Type, @fromBackingInt(65000))).isDataType());
+    try std.testing.expect(!(@as(Type, @fromBackingInt(0))).isDataType());
+    try std.testing.expect(!Type.OPT.isDataType());
+    try std.testing.expect(!(@as(Type, @fromBackingInt(128))).isDataType());
+    try std.testing.expect(!Type.TSIG.isDataType());
+    try std.testing.expect(!Type.AXFR.isDataType());
+    try std.testing.expect(!Type.ANY.isDataType());
+    try std.testing.expect(!(@as(Type, @fromBackingInt(0xFFFF))).isDataType());
+
+    try std.testing.expect(Class.isDataClass(1));
+    try std.testing.expect(Class.isDataClass(3));
+    try std.testing.expect(Class.isDataClass(100));
+    try std.testing.expect(!Class.isDataClass(0));
+    try std.testing.expect(!Class.isDataClass(254));
+    try std.testing.expect(!Class.isDataClass(255));
+    try std.testing.expect(!Class.isDataClass(0xFFFF));
 }

@@ -121,5 +121,9 @@ pub fn main() !void {
         i += 1;
     }
 
+    try secs.skipAuthorities();
+    try secs.skipAdditionals();
+    try secs.expectEnd();
+
     std.debug.print("\nTotal encoded packet size: {d} bytes\n", .{packet.len});
 }

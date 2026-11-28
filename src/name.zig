@@ -8,58 +8,108 @@ const MAX_NAME = 255;
 // 单个域名跟随压缩指针的总次数上限（含带标签后缀链，最多 127 层标签）。
 const MAX_POINTER_JUMPS = 128;
 
-/// 完整 DNS 报文中压缩指针目标的最小合法偏移：域名不可能起始于 12 字节 header 内，
-/// 指向 header 的指针是畸形输入。裸缓冲区（不是整个报文）用 0 表示不约束。
+/// 完整 DNS 报文中压缩指针目标与名字起点的最小合法偏移：域名不可能起始于 12 字节 header 内，
+/// 指向或起始于 header 的偏移均为畸形输入。裸缓冲区（不是整个报文）用 0 表示不约束。
 pub const MESSAGE_POINTER_FLOOR = 12;
 
-/// 域名遍历游标：所有「读出标签」的压缩指针逻辑的唯一实现。
+/// 校验完整 DNS 报文的缓冲区长度与域名起始偏移：
+/// - `msg.len < 12` -> `error.PacketTooShort`
+/// - `msg.len > 65535` -> `error.MessageTooLong`
+/// - `offset < 12` 或 `offset >= msg.len` -> `error.InvalidOffset`
+pub fn validateMessageOffset(msg: []const u8, offset: usize) Error!void {
+    if (msg.len < MESSAGE_POINTER_FLOOR) return error.PacketTooShort;
+    if (msg.len > 0xFFFF) return error.MessageTooLong;
+    if (offset < MESSAGE_POINTER_FLOOR or offset >= msg.len) return error.InvalidOffset;
+}
+
+/// 域名遍历游标：所有线格式域名遍历、跳过与 RDATA 名字推进的唯一状态机实现。
 /// 逐标签推进，跟随 0xC0 压缩指针，统一强制 RFC 上限（label≤63 / name≤255 含根）、
 /// 严格向前（更早偏移）跳转（RFC 1035 §4.1.4 prior occurrence）与指针跳转限次。
-/// 零拷贝——返回指向原缓冲区的标签切片。
-/// 只需跳过名字（不要标签）时用同规则但不返回切片的 `skipName`。
-///
-/// 语义：一个游标实例遍历「一个」完整域名——`total`（累计长度，用于 255 上限）、
-/// `origin`（当前名段起点，保证指针严格单调递减防前向跳转与成环）跨多次 `next()` 累积。
+/// 零拷贝——返回指向原缓冲区的标签切片；到达根结束符返回 `null` 后进入熔断状态，再次调用恒返回 `null`。
 pub const NameCursor = struct {
     buffer: []const u8,
     pos: usize,
     total: usize = 0,
     jumps: usize = 0,
     /// 当前正在展开的名字/后缀起始偏移；压缩指针必须满足 `target < origin`（RFC 1035 §4.1.4）。
-    origin: ?usize = null,
+    origin: usize = 0,
     /// 压缩指针目标的最小合法偏移，见 `MESSAGE_POINTER_FLOOR`。
     pointer_floor: usize = 0,
+    /// 首个压缩指针之前的线格式字节上限（配合 `has_wire_limit = true` 将 RDATA 内名字限制在本条 `rdlength` 内）。
+    wire_limit: usize = 0,
+    /// 线格式结束偏移：未压缩名为根 0x00 之后；压缩名为首个指针 2 字节之后。
+    wire_end: usize = 0,
+    has_wire_limit: bool = false,
+    has_wire_end: bool = false,
+    /// 是否允许压缩指针（RRSIG signer / NSEC next_domain / SVCB target / DNAME target 设为 false）。
+    allow_pointers: bool = true,
+    /// 供独立裸 RDATA 切片解析兼容起始偏移 <12（仍禁止压缩指针指向 <pointer_floor）。
+    allow_header_start: bool = false,
+    started: bool = false,
+    /// 熔断标志：读到根结束符返回 null 后置 true，后续调用恒返回 null 且不再推进 pos。
+    done: bool = false,
 
     /// 裸缓冲区：不约束最小指针目标（缓冲区不是一整个 DNS 报文时用），仍要求指向更早偏移。
     pub fn init(buffer: []const u8, offset: usize) NameCursor {
-        return .{ .buffer = buffer, .pos = offset, .origin = offset };
+        return .{ .buffer = buffer, .pos = offset };
     }
 
-    /// 完整 DNS 报文：指针不得指向 12 字节 header，且须指向更早偏移。
+    /// 完整 DNS 报文：要求 12 ≤ msg.len ≤ 65535 且 12 ≤ offset < msg.len，指针不得指向 header 且须指向更早偏移。
     pub fn initInMessage(msg: []const u8, offset: usize) NameCursor {
-        return .{ .buffer = msg, .pos = offset, .origin = offset, .pointer_floor = MESSAGE_POINTER_FLOOR };
+        return .{ .buffer = msg, .pos = offset, .pointer_floor = MESSAGE_POINTER_FLOOR };
     }
 
-    /// 推进到下一个标签，返回其字节切片；遇结束符返回 null。
-    /// 跟随压缩指针；对非法/越界/前向跳转/超长/成环输入返回相应错误（绝不 panic）。
-    pub fn next(self: *NameCursor) !?[]const u8 {
-        if (self.origin == null) self.origin = self.pos;
+    /// 编译期特化的步进核心：
+    /// - `skip_all = false`：逐标签返回切片（`NameCursor.next` / `NameIterator`）；
+    /// - `skip_all = true`：在单个寄存器循环内直跑至根 `0x00`（`skipName` / `RData.advanceName*`），零切片构造开销。
+    pub inline fn step(
+        self: *NameCursor,
+        comptime has_limit: bool,
+        comptime allow_ptrs: bool,
+        comptime skip_all: bool,
+    ) Error!(if (skip_all) void else ?[]const u8) {
+        if (self.done) return if (skip_all) {} else null;
+        if (!self.started) {
+            if (self.pointer_floor >= MESSAGE_POINTER_FLOOR and !self.allow_header_start) {
+                try validateMessageOffset(self.buffer, self.pos);
+            } else if (self.pos > self.buffer.len) {
+                return error.InvalidOffset;
+            }
+            self.origin = self.pos;
+            self.started = true;
+        }
         while (true) {
-            if (self.pos >= self.buffer.len) return error.PacketTooShort;
+            const bounded_wire = has_limit and !self.has_wire_end;
+            const limit = if (bounded_wire) self.wire_limit else self.buffer.len;
+            if (self.pos >= limit) {
+                return if (bounded_wire) error.InvalidRData else error.PacketTooShort;
+            }
 
             const len = self.buffer[self.pos];
             if (len == 0) {
+                if (!self.has_wire_end) {
+                    self.wire_end = self.pos + 1;
+                    self.has_wire_end = true;
+                }
                 self.pos += 1;
-                return null; // 结束符
+                self.done = true;
+                return if (skip_all) {} else null; // 结束符
             }
 
             // 压缩指针 (0xC0)：RFC 1035 §4.1.4 要求指向更早出现的位置（offset < origin）。
             if (len & 0xC0 == 0xC0) {
-                if (self.pos + 1 >= self.buffer.len) return error.PacketTooShort;
+                if (!allow_ptrs) return error.MalformedName;
+                if (self.pos + 2 > limit) {
+                    return if (bounded_wire) error.InvalidRData else error.PacketTooShort;
+                }
                 const offset = (@as(usize, len & 0x3F) << 8) | self.buffer[self.pos + 1];
                 if (offset < self.pointer_floor or offset >= self.buffer.len) return error.InvalidOffset;
-                if (offset >= self.origin.? or self.jumps >= MAX_POINTER_JUMPS) {
+                if (offset >= self.origin or self.jumps >= MAX_POINTER_JUMPS) {
                     return error.MalformedName;
+                }
+                if (!self.has_wire_end) {
+                    self.wire_end = self.pos + 2;
+                    self.has_wire_end = true;
                 }
                 self.jumps += 1;
                 self.origin = offset;
@@ -69,16 +119,27 @@ pub const NameCursor = struct {
 
             if (len > MAX_LABEL) return error.LabelTooLong;
             const start = self.pos + 1;
-            if (start + len > self.buffer.len) return error.PacketTooShort;
+            if (start + len > limit) {
+                return if (bounded_wire) error.InvalidRData else error.PacketTooShort;
+            }
 
             self.total += 1 + len;
-            // RFC 1035 §2.3.4 的 255 上限「含根结束符」：已累计的标签字节再加 1 字节
-            // 根终止符即为线格式总长，故边界是 total+1（否则 256 字节的名字会被放行，
-            // 而 Builder.validateName 以同一规则拒绝，形成解析/构造不一致）。
             if (self.total + 1 > MAX_NAME) return error.NameTooLong;
 
             self.pos = start + len;
-            return self.buffer[start .. start + len];
+            if (!skip_all) return self.buffer[start .. start + len];
+        }
+    }
+
+    /// 推进到下一个标签，返回其字节切片；遇结束符返回 null（熔断幂等）。
+    /// 跟随压缩指针；对非法/越界/前向跳转/超长/成环输入返回相应错误（绝不 panic）。
+    pub inline fn next(self: *NameCursor) Error!?[]const u8 {
+        if (!self.has_wire_limit and self.allow_pointers) {
+            return self.step(false, true, false);
+        } else if (self.allow_pointers) {
+            return self.step(true, true, false);
+        } else {
+            return self.step(true, false, false);
         }
     }
 };
@@ -87,44 +148,15 @@ pub const NameCursor = struct {
 /// 未压缩名为根结束符之后；压缩名为首个压缩指针的 2 字节之后（**不是**指针目标之后）——
 /// 也就是下一个字段（type/class 等）的起点。
 ///
-/// 全程按 `NameCursor` 的规则校验展开结果：标签 ≤63、整名 ≤255（含根）、
-/// 指针越界、禁止前向跳转与成环。跳过名字的快路径（`MessageParser.skipName` / RDATA 内推进）
-/// 必须走这里，否则「只跳过不展开」的服务端会放行 NameCursor 本会拒绝的名字。
-///
-/// `pointer_floor`：压缩指针目标的最小合法偏移，完整报文传 `MESSAGE_POINTER_FLOOR`，
-/// 裸缓冲区传 0；与 `NameCursor.pointer_floor` 同义。
-pub fn skipName(buffer: []const u8, start: usize, pointer_floor: usize) !usize {
-    var pos = start;
-    var origin = start;
-    var total: usize = 1; // 根结束符计入 255（RFC 1035 §2.3.4）
-    var jumps: usize = 0;
-    var wire_end: ?usize = null; // 线格式止于首个指针；在此之前即整名末尾
-    while (true) {
-        if (pos >= buffer.len) return error.PacketTooShort;
-        const len = buffer[pos];
-        if (len == 0) return wire_end orelse pos + 1;
-
-        if (len & 0xC0 == 0xC0) { // 压缩指针：跟随以校验展开结果
-            if (pos + 2 > buffer.len) return error.PacketTooShort;
-            const target = (@as(usize, len & 0x3F) << 8) | buffer[pos + 1];
-            if (target < pointer_floor or target >= buffer.len) return error.InvalidOffset;
-            // RFC 1035 §4.1.4: 指针只能指向更早偏移（target < origin），天然消除成环与前向越区引用。
-            if (target >= origin or jumps >= MAX_POINTER_JUMPS) {
-                return error.MalformedName;
-            }
-            jumps += 1;
-            if (wire_end == null) wire_end = pos + 2;
-            origin = target;
-            pos = target;
-            continue;
-        }
-
-        if (len > MAX_LABEL) return error.LabelTooLong;
-        if (pos + 1 + len > buffer.len) return error.PacketTooShort;
-        total += 1 + len;
-        if (total > MAX_NAME) return error.NameTooLong;
-        pos += 1 + len;
-    }
+/// 直接驱动统一的 `NameCursor.step(false, true, true)` 单循环完成展开校验，兼具单源一致性与寄存器级速度。
+pub inline fn skipName(buffer: []const u8, start: usize, pointer_floor: usize) Error!usize {
+    var cur = NameCursor{
+        .buffer = buffer,
+        .pos = start,
+        .pointer_floor = pointer_floor,
+    };
+    try cur.step(false, true, true);
+    return cur.wire_end;
 }
 
 pub const DecodedPresentationName = struct {
@@ -145,14 +177,15 @@ pub fn decodePresentationName(
         return .{ .wire_len = 1, .n_labels = 0 };
     }
 
-    // 快路径：无反斜杠转义（占绝大多数真实域名）
-    if (mem.indexOfScalar(u8, name, '\\') == null) {
+    // 快路径：单趟扫描，若未遇反斜杠转义（占绝大多数真实域名）直接输出，免去预扫描 indexOfScalar
+    fast: {
         const s = if (name.len > 1 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
         var wpos: usize = 0;
         var n_labels: usize = 0;
         var label_start: usize = 0;
 
         for (s, 0..) |b, idx| {
+            if (b == '\\') break :fast;
             if (b == '.') {
                 const llen = idx - label_start;
                 if (llen == 0) return Error.MalformedName;
@@ -421,26 +454,51 @@ pub const NameIterator = struct {
     /// 与 `skipName` 一致，因此可安全用于续读其后的 type/class。
     pos: usize,
     /// 压缩指针目标的最小合法偏移。`buffer` 是完整报文时置为
-    /// `MESSAGE_POINTER_FLOOR`，可一并拒绝指向 header 的指针；默认 0（不约束）。
+    /// `MESSAGE_POINTER_FLOOR`，可一并拒绝指向/起始于 header 的偏移；默认 0（不约束）。
     pointer_floor: usize = 0,
-    cursor: ?NameCursor = null,
-    /// 线格式已在首个压缩指针处结束，`pos` 不再随游标推进。
+    cur_pos: usize = 0,
+    origin: usize = 0,
+    total: u16 = 0,
+    jumps: u8 = 0,
+    started: bool = false,
+    /// 线格式已在首个压缩指针或根结束符处结束，`pos` 不再随游标推进。
     wire_done: bool = false,
+    /// 熔断标志：返回 null 后恒保持完成状态，不再越界读取后续字段字节。
+    done: bool = false,
 
-    pub fn next(self: *NameIterator) !?[]const u8 {
-        if (self.cursor == null) self.cursor = .{
+    pub fn next(self: *NameIterator) Error!?[]const u8 {
+        if (self.done) return null;
+        if (!self.started) {
+            if (self.pointer_floor >= MESSAGE_POINTER_FLOOR) {
+                try validateMessageOffset(self.buffer, self.pos);
+            } else if (self.pos > self.buffer.len) {
+                return error.InvalidOffset;
+            }
+            self.cur_pos = self.pos;
+            self.origin = self.pos;
+            self.started = true;
+        }
+        var cur = NameCursor{
             .buffer = self.buffer,
-            .pos = self.pos,
+            .pos = self.cur_pos,
+            .total = self.total,
+            .jumps = self.jumps,
+            .origin = self.origin,
             .pointer_floor = self.pointer_floor,
+            .wire_end = self.pos,
+            .has_wire_end = self.wire_done,
+            .started = true,
+            .done = self.done,
         };
-        const cur = &self.cursor.?;
-        const before = cur.pos;
-        const jumps_before = cur.jumps;
-        const label = try cur.next();
+        const label = try cur.step(false, true, false);
+        self.cur_pos = cur.pos;
+        self.origin = cur.origin;
+        self.total = @intCast(cur.total);
+        self.jumps = @intCast(cur.jumps);
+        self.done = cur.done;
         if (!self.wire_done) {
-            if (cur.jumps > jumps_before) {
-                // 首次跳转发生在进入本次 next 时的游标位置：该处是 2 字节指针。
-                self.pos = before + 2;
+            if (cur.has_wire_end) {
+                self.pos = cur.wire_end;
                 self.wire_done = true;
             } else {
                 self.pos = cur.pos;
@@ -621,8 +679,10 @@ pub const Name = struct {
 };
 
 test "Name.str resolves uncompressed name" {
+    var msg: [32]u8 = @splat(0);
     const domain = "\x03www\x07example\x03com\x00";
-    const name = Name{ .buffer = domain, .offset = 0 };
+    @memcpy(msg[12..][0..domain.len], domain);
+    const name = Name{ .buffer = msg[0 .. 12 + domain.len], .offset = 12 };
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("www.example.com", try name.str(&buf));
 }
@@ -1000,4 +1060,44 @@ test "NameCursor and skipName reject forward compression pointers and >128 point
     }
     try std.testing.expectError(error.MalformedName, formatDnsNameInMessage(chain[0..off], prev, &out));
     try std.testing.expectError(error.MalformedName, skipName(chain[0..off], prev, MESSAGE_POINTER_FLOOR));
+}
+
+test "NameCursor and NameIterator remain fused after null and enforce message offset bounds" {
+    // 1. 独立切片耗尽后再次调用 next() 恒返回 null，不得误报 PacketTooShort
+    var iter = NameIterator{ .buffer = "\x07example\x03com\x00", .pos = 0 };
+    try std.testing.expectEqualStrings("example", (try iter.next()).?);
+    try std.testing.expectEqualStrings("com", (try iter.next()).?);
+    try std.testing.expect((try iter.next()) == null);
+    try std.testing.expectEqual(@as(usize, 13), iter.pos);
+    try std.testing.expect((try iter.next()) == null);
+    try std.testing.expectEqual(@as(usize, 13), iter.pos);
+
+    // 2. 完整查询包中耗尽后再次调用 next() 不得越界读入 QTYPE/QCLASS 或篡改 pos
+    const pkt = [_]u8{
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07, 'e',  'x',  'a',  'm',  'p',  'l',  'e',  0x03, 'c',  'o',  'm',
+        0x00, 0x00, 0x01, 0x00, 0x01,
+    };
+    var pkt_iter = NameIterator{ .buffer = &pkt, .pos = 12, .pointer_floor = MESSAGE_POINTER_FLOOR };
+    while (try pkt_iter.next()) |_| {}
+    try std.testing.expectEqual(@as(usize, 25), pkt_iter.pos);
+    try std.testing.expect((try pkt_iter.next()) == null);
+    try std.testing.expect((try pkt_iter.next()) == null);
+    try std.testing.expectEqual(@as(usize, 25), pkt_iter.pos);
+
+    var cur = NameCursor.initInMessage(&pkt, 12);
+    while (try cur.next()) |_| {}
+    try std.testing.expect((try cur.next()) == null);
+    try std.testing.expect((try cur.next()) == null);
+
+    // 3. 报文级入口统一拒绝 msg.len < 12、offset < 12（Header 内部）与 offset >= msg.len
+    var out: [64]u8 = undefined;
+    try std.testing.expectError(error.PacketTooShort, formatDnsNameInMessage("\x03com\x00", 0, &out));
+    try std.testing.expectError(error.PacketTooShort, (Name{ .buffer = "\x03com\x00", .offset = 0 }).str(&out));
+    try std.testing.expectError(error.InvalidOffset, formatDnsNameInMessage(&pkt, 2, &out));
+    try std.testing.expectError(error.InvalidOffset, (Name{ .buffer = &pkt, .offset = 2 }).str(&out));
+    try std.testing.expectError(error.InvalidOffset, formatDnsNameInMessage(&pkt, 100, &out));
+    try std.testing.expectError(error.InvalidOffset, (Name{ .buffer = &pkt, .offset = 100 }).str(&out));
+    try std.testing.expectError(error.InvalidOffset, skipName(&pkt, 2, MESSAGE_POINTER_FLOOR));
+    try std.testing.expectError(error.InvalidOffset, skipName(&pkt, 100, MESSAGE_POINTER_FLOOR));
 }
