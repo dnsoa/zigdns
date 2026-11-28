@@ -219,8 +219,8 @@ pub const Message = struct {
         opt_added: bool, // RFC 6891 §6.1.1: 一个报文至多一个 OPT 记录
         implicit_opt_section: bool, // addOptRecord 隐式跳到 .additional 后的保护锁，防后续误写回答变 NODATA
         tsig_added: bool, // RFC 8945 §5.1: TSIG 必须是附加区最后一条记录，其后禁止再追加任何记录
-        reserved_edns: ?Edns, // setEdns 预留待 finish 自动落盘到附加区末尾的 OPT 配置（支持 TC=1 截断保留 OPT）
-        reserved_bytes: usize, // 为 reserved_edns 预留的尾部字节数
+        // setEdns 预留字节数（0 表示无预留；>0 时完整 OPT 记录已冻结编码于 buf[buf.len - reserved_bytes .. buf.len]）
+        reserved_bytes: u16,
         qd: u16,
         an: u16,
         ns: u16,
@@ -254,7 +254,6 @@ pub const Message = struct {
                 .opt_added = false,
                 .implicit_opt_section = false,
                 .tsig_added = false,
-                .reserved_edns = null,
                 .reserved_bytes = 0,
                 .qd = 0,
                 .an = 0,
@@ -286,7 +285,6 @@ pub const Message = struct {
             self.opt_added = false;
             self.implicit_opt_section = false;
             self.tsig_added = false;
-            self.reserved_edns = null;
             self.reserved_bytes = 0;
             self.qd = 0;
             self.an = 0;
@@ -629,13 +627,19 @@ pub const Message = struct {
         pub fn addRecordRaw(self: *Builder, name: []const u8, rtype: u16, class: u16, ttl: u32, rdata: []const u8) !void {
             if (rdata.len > 0xFFFF) return Error.MessageTooLong;
             if (self.tsig_added) return Error.InvalidRecordOrder;
-            const saved_edns = self.reserved_edns;
             const saved_res_bytes = self.reserved_bytes;
             const saved_ar = self.ar;
             const snap = self.snapshot();
             errdefer {
+                if (saved_res_bytes != 0 and self.reserved_bytes == 0) {
+                    const opt_len: usize = saved_res_bytes;
+                    mem.copyBackwards(
+                        u8,
+                        self.buf[self.buf.len - opt_len .. self.buf.len],
+                        self.buf[snap.pos..][0..opt_len],
+                    );
+                }
                 self.restore(snap);
-                self.reserved_edns = saved_edns;
                 self.reserved_bytes = saved_res_bytes;
                 self.ar = saved_ar;
             }
@@ -1055,8 +1059,9 @@ pub const Message = struct {
             self.qd += 1;
         }
 
-        /// 预留 EDNS(0) OPT 尾部空间并在 finish/finishTcp（或显式 `flushEdns` / 追加 `TSIG` 前）自动写入附加区（RFC 6891 §6.1.1 / §7）。
+        /// 预留 EDNS(0) OPT 尾部空间并立即将 OPT 冻结编码至缓冲区尾部，在 finish/finishTcp（或显式 `flushEdns` / 追加 `TSIG` 前）移入附加区（RFC 6891 §6.1.1 / §7）。
         /// - 不改变当前分区：可在写 Question/Answer/Authority 前后任意时刻调用，不会导致后续回答误入附加区；
+        /// - 生命周期安全：`edns` 引用的外部切片在 `setEdns` 返回时即已完成校验与冻结，后续即使覆写原请求缓冲也不会导致收尾崩溃或内容被篡改；
         /// - 截断安全：当回答区写满返回 `error.BufferTooSmall` 并置 `TC=1` 时，已预留的 OPT 空间不受侵占，
         ///   收尾时仍能按 RFC 6891 §7 在截断响应中完整发出 OPT 记录。
         pub fn setEdns(self: *Builder, edns: Edns) !void {
@@ -1064,100 +1069,109 @@ pub const Message = struct {
             if (self.opt_added) return Error.MultipleOptRecords;
             const opt_len = try edns.wireLen();
             try self.ensureCapacity(opt_len);
+            try encodeOptRecord(self.buf[self.buf.len - opt_len .. self.buf.len], edns);
             self.opt_added = true;
-            self.reserved_edns = edns;
-            self.reserved_bytes = opt_len;
+            self.reserved_bytes = @intCast(opt_len);
         }
 
         /// 更新由 `setEdns` 预留但尚未落盘的 EDNS 参数（如查询后回填 ECS scope_prefix 或 BADCOOKIE）。
         pub fn updateEdns(self: *Builder, edns: Edns) !void {
-            if (self.reserved_edns == null) return Error.InvalidRecordOrder;
+            if (self.reserved_bytes == 0) return Error.InvalidRecordOrder;
             const opt_len = try edns.wireLen();
             if (opt_len > self.buf.len -| self.pos) return Error.BufferTooSmall;
-            self.reserved_edns = edns;
-            self.reserved_bytes = opt_len;
+            try encodeOptRecord(self.buf[self.buf.len - opt_len .. self.buf.len], edns);
+            self.reserved_bytes = @intCast(opt_len);
         }
 
         /// 将 `setEdns` 预留的 OPT 记录立即落盘至附加区（例如在计算 RFC 8945 TSIG 摘要并追加尾置 TSIG 记录之前调用）。
         /// 若调用前尚未显式 `setSection(.additional)`，将与 `addOptRecord` 一样开启隐式附加区保护锁。
         pub fn flushEdns(self: *Builder) void {
-            if (self.reserved_edns) |edns| {
+            if (self.reserved_bytes != 0) {
+                const opt_len: usize = self.reserved_bytes;
                 const explicit_additional = (self.section == .additional) and !self.implicit_opt_section;
-                self.reserved_edns = null;
                 self.reserved_bytes = 0;
                 self.section = .additional;
                 self.implicit_opt_section = !explicit_additional;
-                self.writeOptRecordUnchecked(edns);
+                const tail_start = self.buf.len - opt_len;
+                if (self.pos != tail_start) {
+                    mem.copyForwards(u8, self.buf[self.pos..][0..opt_len], self.buf[tail_start..self.buf.len]);
+                }
+                self.pos += opt_len;
                 self.ar += 1;
             }
         }
 
-        fn writeOptRecordUnchecked(self: *Builder, edns: Edns) void {
-            self.buf[self.pos] = 0; // OPT 的 owner name 必须为单字节根
-            self.pos += 1;
-            mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(Type.OPT), .big);
-            self.pos += 2;
-            mem.writeInt(u16, self.buf[self.pos..][0..2], edns.udp_payload_size, .big);
-            self.pos += 2;
+        fn encodeOptRecord(dest: []u8, edns: Edns) Error!void {
+            if (dest.len < 11 or dest.len - 11 > 0xFFFF) return Error.InvalidRData;
+            dest[0] = 0; // OPT 的 owner name 必须为单字节根
+            mem.writeInt(u16, dest[1..3], @backingInt(Type.OPT), .big);
+            mem.writeInt(u16, dest[3..5], edns.udp_payload_size, .big);
             const flags: u32 = (if (edns.dnssec_ok) @as(u32, 0x8000) else 0) | @as(u32, edns.z_flags);
             const ttl = (@as(u32, edns.extended_rcode) << 24) |
                 (@as(u32, edns.version) << 16) | flags;
-            mem.writeInt(u32, self.buf[self.pos..][0..4], ttl, .big);
-            self.pos += 4;
+            mem.writeInt(u32, dest[5..9], ttl, .big);
+            const rdlen: u16 = @intCast(dest.len - 11);
+            mem.writeInt(u16, dest[9..11], rdlen, .big);
 
-            const rdlen_pos = self.pos;
-            self.pos += 2; // 占位 RDLength
+            var pos: usize = 11;
             if (edns.ecs) |ecs| {
                 const addr_len = (@as(usize, ecs.source_prefix) + 7) / 8;
-                mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(OptionCode.ECS), .big);
-                mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], @intCast(4 + addr_len), .big);
-                mem.writeInt(u16, self.buf[self.pos + 4 ..][0..2], ecs.family, .big);
-                self.buf[self.pos + 6] = ecs.source_prefix;
-                self.buf[self.pos + 7] = ecs.scope_prefix;
-                self.pos += 8;
-                @memcpy(self.buf[self.pos..][0..addr_len], ecs.address[0..addr_len]);
+                if (ecs.address.len < addr_len or pos + 8 + addr_len > dest.len) return Error.MalformedECS;
+                mem.writeInt(u16, dest[pos..][0..2], @backingInt(OptionCode.ECS), .big);
+                mem.writeInt(u16, dest[pos + 2 ..][0..2], @intCast(4 + addr_len), .big);
+                mem.writeInt(u16, dest[pos + 4 ..][0..2], ecs.family, .big);
+                dest[pos + 6] = ecs.source_prefix;
+                dest[pos + 7] = ecs.scope_prefix;
+                pos += 8;
+                @memcpy(dest[pos..][0..addr_len], ecs.address[0..addr_len]);
                 if (addr_len > 0) {
                     const rem: u3 = @intCast(ecs.source_prefix % 8);
-                    if (rem != 0) self.buf[self.pos + addr_len - 1] &= @as(u8, 0xFF) << @intCast(8 - @as(u4, rem));
+                    if (rem != 0) dest[pos + addr_len - 1] &= @as(u8, 0xFF) << @intCast(8 - @as(u4, rem));
                 }
-                self.pos += addr_len;
+                pos += addr_len;
             }
             if (edns.cookie) |cookie| {
                 const opt_len = 8 + cookie.server.len;
-                mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(OptionCode.COOKIE), .big);
-                mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], @intCast(opt_len), .big);
-                self.pos += 4;
-                @memcpy(self.buf[self.pos..][0..8], &cookie.client);
-                self.pos += 8;
-                @memcpy(self.buf[self.pos..][0..cookie.server.len], cookie.server);
-                self.pos += cookie.server.len;
+                if (pos + 4 + opt_len > dest.len) return Error.MalformedCookie;
+                mem.writeInt(u16, dest[pos..][0..2], @backingInt(OptionCode.COOKIE), .big);
+                mem.writeInt(u16, dest[pos + 2 ..][0..2], @intCast(opt_len), .big);
+                pos += 4;
+                @memcpy(dest[pos..][0..8], &cookie.client);
+                pos += 8;
+                @memcpy(dest[pos..][0..cookie.server.len], cookie.server);
+                pos += cookie.server.len;
             }
             if (edns.preserve_raw_options and edns.options_raw.len > 0) {
                 var it = edns.optionsIterator();
-                while (it.next() catch unreachable) |opt| {
+                while (try it.next()) |opt| {
                     if (opt.code == .ECS or opt.code == .COOKIE) continue;
-                    mem.writeInt(u16, self.buf[self.pos..][0..2], @backingInt(opt.code), .big);
-                    mem.writeInt(u16, self.buf[self.pos + 2 ..][0..2], @intCast(opt.data.len), .big);
-                    self.pos += 4;
-                    @memcpy(self.buf[self.pos..][0..opt.data.len], opt.data);
-                    self.pos += opt.data.len;
+                    if (pos + 4 + opt.data.len > dest.len) return Error.InvalidRData;
+                    mem.writeInt(u16, dest[pos..][0..2], @backingInt(opt.code), .big);
+                    mem.writeInt(u16, dest[pos + 2 ..][0..2], @intCast(opt.data.len), .big);
+                    pos += 4;
+                    @memcpy(dest[pos..][0..opt.data.len], opt.data);
+                    pos += opt.data.len;
                 }
             }
             if (edns.extra_options.len > 0) {
-                @memcpy(self.buf[self.pos..][0..edns.extra_options.len], edns.extra_options);
-                self.pos += edns.extra_options.len;
+                if (pos + edns.extra_options.len > dest.len) return Error.InvalidRData;
+                @memcpy(dest[pos..][0..edns.extra_options.len], edns.extra_options);
+                pos += edns.extra_options.len;
             }
-            const rdlen = @as(u16, @intCast(self.pos - rdlen_pos - 2));
-            mem.writeInt(u16, self.buf[rdlen_pos..][0..2], rdlen, .big);
+            if (pos != dest.len) return Error.InvalidRData;
         }
 
         fn flushReservedEdns(self: *Builder) bool {
-            if (self.reserved_edns) |edns| {
-                self.reserved_edns = null;
+            if (self.reserved_bytes != 0) {
+                const opt_len: usize = self.reserved_bytes;
                 self.reserved_bytes = 0;
                 self.section = .additional;
                 self.implicit_opt_section = false;
-                self.writeOptRecordUnchecked(edns);
+                const tail_start = self.buf.len - opt_len;
+                if (self.pos != tail_start) {
+                    mem.copyForwards(u8, self.buf[self.pos..][0..opt_len], self.buf[tail_start..self.buf.len]);
+                }
+                self.pos += opt_len;
                 self.ar += 1;
                 return true;
             }
@@ -1175,11 +1189,12 @@ pub const Message = struct {
             if (self.opt_added) return Error.MultipleOptRecords;
             const opt_len = try edns.wireLen();
             try self.ensureCapacity(opt_len);
+            try encodeOptRecord(self.buf[self.pos..][0..opt_len], edns);
             const explicit_additional = (self.section == .additional) and !self.implicit_opt_section;
             self.opt_added = true;
             try self.setSection(.additional);
             self.implicit_opt_section = !explicit_additional;
-            self.writeOptRecordUnchecked(edns);
+            self.pos += opt_len;
             self.countRecord();
         }
 
@@ -1238,14 +1253,18 @@ pub const Message = struct {
             if (self.first_unindexed_pos == 0) return;
             const start: usize = self.first_unindexed_pos;
             self.first_unindexed_pos = 0;
+            if (start >= self.pos) return;
             var end = start;
             var offsets: [128]u8 = undefined;
             var n_labels: usize = 0;
-            while (self.buf[end] != 0) {
+            while (end < self.pos and self.buf[end] != 0) {
+                const len: usize = self.buf[end];
+                if (len > 63 or end + 1 + len >= self.pos or n_labels == offsets.len or end - start > std.math.maxInt(u8)) return;
                 offsets[n_labels] = @intCast(end - start);
                 n_labels += 1;
-                end += 1 + self.buf[end];
+                end += 1 + len;
             }
+            if (end >= self.pos or self.buf[end] != 0) return;
             const wire_no_root = self.buf[start..end];
             for (offsets[0..n_labels]) |off| {
                 const pos = start + off;
@@ -3142,4 +3161,81 @@ test "Edns.preservingOptions forwards non-ECS/COOKIE TLVs zero-copy without dupl
     try std.testing.expectEqual(OptionCode.PADDING, pad.code);
     try std.testing.expectEqual(@as(usize, 2), pad.data.len);
     try std.testing.expect((try it.next()) == null);
+}
+
+test "setEdns freezes preservingOptions at call time (safe against request buffer reuse and TSIG rollback)" {
+    // 1. 构造带 ECS + COOKIE + NSID 的请求报文并解析 Edns
+    var qbuf: [256]u8 = undefined;
+    var qb = try Message.Builder.init(&qbuf);
+    try qb.addQuestion("example.com", .A, 1);
+    try qb.setEdns(.{
+        .udp_payload_size = 1232,
+        .ecs = .{ .family = 1, .source_prefix = 24, .scope_prefix = 0, .address = &[_]u8{ 198, 51, 100 } },
+        .cookie = .{ .client = .{ 1, 2, 3, 4, 5, 6, 7, 8 }, .server = &.{} },
+        .extra_options = "\x00\x03\x00\x04ns99",
+    });
+    const qpkt = qb.finish(.{ .id = 0x88 });
+    const parsed_edns = (try (try Message.parse(qpkt)).findEdns()).?;
+
+    // 2. 用紧凑缓冲构造响应：setEdns 后立即将原请求缓冲 qbuf 全量覆写为畸形字节 0xFF
+    var rbuf: [96]u8 = undefined;
+    var rb = try Message.Builder.init(&rbuf);
+    try rb.addQuestion("example.com", .A, 1);
+    var fwd = parsed_edns.preservingOptions();
+    fwd.ecs.?.scope_prefix = 24;
+    try rb.setEdns(fwd);
+
+    // 模拟单收包缓冲被下一条请求覆写（若延迟在 finish/flushEdns 遍历 options_raw 将触发错误或崩溃）
+    @memset(&qbuf, 0xFF);
+
+    // 若在覆写之后才调用 setEdns，应优雅返回 error.InvalidRData（绝不触发 unreachable）
+    var bad_buf: [128]u8 = undefined;
+    var bad_b = try Message.Builder.init(&bad_buf);
+    try std.testing.expectError(error.InvalidRData, bad_b.setEdns(fwd));
+
+    // 3. 测试附加区写入超大 TSIG 触发临时 flushEdns + BufferTooSmall 回滚（含尾部重叠区恢复）
+    try rb.setSection(.additional);
+    const huge_tsig: [48]u8 = @splat(0xAA);
+    try std.testing.expectError(
+        error.BufferTooSmall,
+        rb.addRecordRaw("tsig-key.example.com", @backingInt(Type.TSIG), 255, 0, &huge_tsig),
+    );
+
+    // 回滚后直接 finish，已冻结的 OPT（含 NSID="ns99"）仍完整无损
+    const rpkt = rb.finish(.{ .id = 0x88, .qr = 1 });
+    const out_edns = (try (try Message.parse(rpkt)).findEdns()).?;
+    try std.testing.expectEqual(@as(u8, 24), out_edns.ecs.?.scope_prefix);
+    var it = out_edns.optionsIterator();
+    try std.testing.expectEqual(OptionCode.ECS, (try it.next()).?.code);
+    try std.testing.expectEqual(OptionCode.COOKIE, (try it.next()).?.code);
+    const nsid = (try it.next()).?;
+    try std.testing.expectEqual(OptionCode.NSID, nsid.code);
+    try std.testing.expectEqualStrings("ns99", nsid.data);
+    try std.testing.expect((try it.next()) == null);
+}
+
+test "withPreservedOptions retains pre-existing extra_options and flushFirstUnindexed bounds-checks corrupted bytes" {
+    // 1. 先向 extra_options 写入 EDE，再调 withPreservedOptions 合并原包 NSID，两侧 TLV 均保留
+    var qbuf: [256]u8 = undefined;
+    var qb = try Message.Builder.init(&qbuf);
+    try qb.addQuestion("example.com", .A, 1);
+    try qb.setEdns(.{
+        .ecs = .{ .family = 1, .source_prefix = 24, .scope_prefix = 0, .address = &[_]u8{ 192, 0, 2 } },
+        .extra_options = "\x00\x03\x00\x02n1",
+    });
+    const qpkt = qb.finish(.{ .id = 1 });
+    var edns = (try (try Message.parse(qpkt)).findEdns()).?;
+    edns.extra_options = "\x00\x0f\x00\x02\x00\x17"; // EDE: Network Error
+
+    var obuf: [64]u8 = undefined;
+    const merged = try edns.withPreservedOptions(&obuf);
+    try std.testing.expectEqualStrings("\x00\x03\x00\x02n1\x00\x0f\x00\x02\x00\x17", merged.extra_options);
+
+    // 2. flushFirstUnindexed 面对异常无根终止/超界长度字节时安全退化，不越界
+    var bbuf: [128]u8 = @splat(0x3F); // 全 63，无 0x00 根结束符
+    var b = try Message.Builder.init(&bbuf);
+    try b.addQuestion("example.com", .A, 1);
+    // 人为破坏已写首名的长度字节使其跨过 b.pos，验证第二次写名触发 flushFirstUnindexed 安全返回
+    b.buf[12] = 63;
+    try b.addARecord("www.example.com", 60, .{ 1, 2, 3, 4 });
 }

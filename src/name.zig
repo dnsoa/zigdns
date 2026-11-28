@@ -134,12 +134,12 @@ pub const NameCursor = struct {
     /// 推进到下一个标签，返回其字节切片；遇结束符返回 null（熔断幂等）。
     /// 跟随压缩指针；对非法/越界/前向跳转/超长/成环输入返回相应错误（绝不 panic）。
     pub inline fn next(self: *NameCursor) Error!?[]const u8 {
-        if (!self.has_wire_limit and self.allow_pointers) {
+        if (self.allow_pointers) {
+            if (self.has_wire_limit) return self.step(true, true, false);
             return self.step(false, true, false);
-        } else if (self.allow_pointers) {
-            return self.step(true, true, false);
         } else {
-            return self.step(true, false, false);
+            if (self.has_wire_limit) return self.step(true, false, false);
+            return self.step(false, false, false);
         }
     }
 };
@@ -1100,4 +1100,24 @@ test "NameCursor and NameIterator remain fused after null and enforce message of
     try std.testing.expectError(error.InvalidOffset, (Name{ .buffer = &pkt, .offset = 100 }).str(&out));
     try std.testing.expectError(error.InvalidOffset, skipName(&pkt, 2, MESSAGE_POINTER_FLOOR));
     try std.testing.expectError(error.InvalidOffset, skipName(&pkt, 100, MESSAGE_POINTER_FLOOR));
+}
+
+test "NameCursor.next works with allow_pointers = false without wire_limit" {
+    var cur = NameCursor.init("\x07example\x03com\x00", 0);
+    cur.allow_pointers = false;
+    try std.testing.expectEqualStrings("example", (try cur.next()).?);
+    try std.testing.expectEqualStrings("com", (try cur.next()).?);
+    try std.testing.expect((try cur.next()) == null);
+    try std.testing.expect((try cur.next()) == null);
+    try std.testing.expectEqual(@as(usize, 13), cur.wire_end);
+
+    // 裸缓冲区上禁止压缩指针时：遇指针报 MalformedName，半截输入报 PacketTooShort（而非 InvalidRData）
+    var ptr_cur = NameCursor.init("\x07example\x00\x03www\xc0\x00", 9);
+    ptr_cur.allow_pointers = false;
+    try std.testing.expectEqualStrings("www", (try ptr_cur.next()).?);
+    try std.testing.expectError(error.MalformedName, ptr_cur.next());
+
+    var trunc_cur = NameCursor.init("\x07exa", 0);
+    trunc_cur.allow_pointers = false;
+    try std.testing.expectError(error.PacketTooShort, trunc_cur.next());
 }

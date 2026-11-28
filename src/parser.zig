@@ -96,31 +96,46 @@ pub const EdnsParams = struct {
         return .{ .raw = self.options_raw };
     }
 
-    /// 返回在编码时自动原样保留 `options_raw` 中非 `ECS(8)` / `COOKIE(10)` 选项的副本（零拷贝、无需额外缓冲区）。
-    /// 适用于透明代理/转发器对已解析 `Edns` 修改 `ecs` / `cookie` 后直接传回 `Builder.setEdns` / `addOptRecord`（需保证原报文切片在 `finish` 前有效）。
+    /// 返回在编码时自动原样保留 `options_raw` 中非 `ECS(8)` / `COOKIE(10)` 选项的副本（无需额外缓冲区）。
+    /// 传入 `Builder.setEdns` / `updateEdns` / `addOptRecord` 时会立即校验并冻结写出到 `Builder` 缓冲区（无延迟 `unreachable` 风险；
+    /// 若需在调用 `Builder` 之前提前释放或覆写原请求缓冲，请改用 `withPreservedOptions(out_buf)`）。
     pub fn preservingOptions(self: EdnsParams) EdnsParams {
         var res = self;
         res.preserve_raw_options = true;
         return res;
     }
 
-    /// 将 `options_raw` 中除已结构化的 `ECS(8)` 与 `COOKIE(10)` 之外的其余原始 TLV 过滤拷入 `out_buf`，
+    /// 将 `options_raw` 中除已结构化的 `ECS(8)` 与 `COOKIE(10)` 之外的其余原始 TLV（连同已设置的 `extra_options`）合并拷入 `out_buf`，
     /// 返回已填入 `extra_options` 且清空 `options_raw` 的新 `Edns` 副本，供代理/转发器在释放原请求缓冲后重编码。
     pub fn withPreservedOptions(self: EdnsParams, out_buf: []u8) Error!EdnsParams {
         var res = self;
         res.preserve_raw_options = false;
         res.options_raw = "";
-        if (self.options_raw.len == 0) return res;
-        var it = self.optionsIterator();
+        if (self.options_raw.len == 0 and self.extra_options.len == 0) return res;
         var wpos: usize = 0;
-        while (try it.next()) |opt| {
-            if (opt.code == .ECS or opt.code == .COOKIE) continue;
-            const need = 4 + opt.data.len;
-            if (wpos + need > out_buf.len) return Error.BufferTooSmall;
-            mem.writeInt(u16, out_buf[wpos..][0..2], @backingInt(opt.code), .big);
-            mem.writeInt(u16, out_buf[wpos + 2 ..][0..2], @intCast(opt.data.len), .big);
-            @memcpy(out_buf[wpos + 4 ..][0..opt.data.len], opt.data);
-            wpos += need;
+        if (self.options_raw.len > 0) {
+            var it = self.optionsIterator();
+            while (try it.next()) |opt| {
+                if (opt.code == .ECS or opt.code == .COOKIE) continue;
+                const need = 4 + opt.data.len;
+                if (wpos + need > out_buf.len) return Error.BufferTooSmall;
+                mem.writeInt(u16, out_buf[wpos..][0..2], @backingInt(opt.code), .big);
+                mem.writeInt(u16, out_buf[wpos + 2 ..][0..2], @intCast(opt.data.len), .big);
+                @memcpy(out_buf[wpos + 4 ..][0..opt.data.len], opt.data);
+                wpos += need;
+            }
+        }
+        if (self.extra_options.len > 0) {
+            if (wpos + self.extra_options.len > out_buf.len) return Error.BufferTooSmall;
+            if (wpos != 0 or out_buf.ptr != self.extra_options.ptr) {
+                mem.copyForwards(u8, out_buf[wpos..][0..self.extra_options.len], self.extra_options);
+            }
+            wpos += self.extra_options.len;
+        }
+        if (wpos > 0) {
+            const extra = try validateOptOptionsForEncode(out_buf[0..wpos]);
+            if (self.ecs != null and extra.has_ecs) return Error.MalformedECS;
+            if (self.cookie != null and extra.has_cookie) return Error.MalformedCookie;
         }
         res.extra_options = out_buf[0..wpos];
         return res;
